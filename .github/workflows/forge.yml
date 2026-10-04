@@ -1,0 +1,174 @@
+name: forge
+
+# On-push + nightly verification heartbeat. Fail-closed: a red job blocks
+# promotion and does not publish, tag, or merge. The next heartbeat still runs.
+# Quarantine: mock provider only; no twine, no gh release, no live payment rails.
+
+on:
+  push:
+    branches:
+      - permit-cleanup-20261004
+      - "permit-forge-*"
+      - main
+  schedule:
+    # 06:00 UTC nightly (~00:00 MDT). Same job as push; default branch is the schedule ref.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# Each push keeps a full run. run_id keeps groups from colliding; cancel stays off.
+concurrency:
+  group: forge-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ github.sha }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  forge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          # This repo has no requirements.txt; setup-python errors without a dependency path.
+          cache-dependency-path: pyproject.toml
+
+      - name: Build wheel (no isolation)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip build "setuptools>=77"
+          python -m build --wheel --no-isolation
+          ls -lh dist/*.whl
+          python -m hashlib --help >/dev/null 2>&1 || true
+          wheels=(dist/*.whl)
+          if [[ ${#wheels[@]} -ne 1 ]]; then
+            echo "expected exactly one dist/*.whl, found ${#wheels[@]}: ${wheels[*]}"
+            exit 1
+          fi
+          sha256sum dist/*.whl | tee dist/SHA256SUMS
+          sha256sum -c dist/SHA256SUMS
+          echo "Baseline name: permit_authority_demo-0.1.0-cleanup-verified.whl"
+          echo "No baseline sha256 is pinned in this repo. Hash drift is warning-only and is not a job failure."
+          cat dist/SHA256SUMS
+
+      - name: Fresh venv install (no index, no deps)
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/forge-venv
+          /tmp/forge-venv/bin/python -m pip install --no-index --no-deps dist/*.whl
+          /tmp/forge-venv/bin/python -m pip list
+          /tmp/forge-venv/bin/permit --help
+
+      - name: pytest
+        run: |
+          set -euo pipefail
+          python -m pip install pytest
+          python -m pytest --collect-only -q 2>&1 | tee collect-only.out
+          python - <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          text = Path("collect-only.out").read_text()
+          match = re.search(r"(\d+) tests collected", text)
+          count = int(match.group(1)) if match else -1
+          print(f"COLLECT CONTRACT: {count} tests collected")
+          if count != 127:
+              sys.exit("expected 127 tests collected")
+          PY
+          python -m pytest -q --junitxml=junit.xml 2>&1 | tee pytest-q.out
+          python - <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          text = Path("pytest-q.out").read_text()
+          summary = ""
+          for line in reversed(text.splitlines()):
+              if re.search(r"\bpassed\b", line):
+                  summary = line
+                  break
+          passed = re.search(r"(\d+) passed", summary)
+          failed = re.search(r"(\d+) failed", summary)
+          errors = re.search(r"(\d+) error", summary)
+          n_passed = int(passed.group(1)) if passed else 0
+          n_failed = int(failed.group(1)) if failed else 0
+          n_errors = int(errors.group(1)) if errors else 0
+          print(f"PYTEST CONTRACT: {summary!r} passed={n_passed} failed={n_failed} errors={n_errors}")
+          if n_passed != 127 or n_failed != 0 or n_errors != 0:
+              sys.exit("expected 127 passed, 0 failed, 0 errors")
+          PY
+
+      - name: Fault injection
+        run: |
+          set -euo pipefail
+          test -f tests/test_unconfirmed_cleanup.py
+          python -m pytest -q tests/test_unconfirmed_cleanup.py -v
+
+      - name: Installed CLI demos outside checkout
+        run: |
+          set -euo pipefail
+          root="$PWD"
+          mkdir -p "$root/forge-demos"
+          (cd /tmp && /tmp/forge-venv/bin/permit demo) 2>&1 | tee "$root/forge-demos/demo.out"
+          (cd /tmp && /tmp/forge-venv/bin/permit demo-recovery) 2>&1 | tee "$root/forge-demos/demo-recovery.out"
+          c12=$(grep -c "LEDGER VERIFIED: 12" "$root/forge-demos/demo.out" || true)
+          c6=$(grep -c "LEDGER VERIFIED: 6" "$root/forge-demos/demo-recovery.out" || true)
+          echo "demo LEDGER VERIFIED: 12 count=${c12}"
+          echo "demo-recovery LEDGER VERIFIED: 6 count=${c6}"
+          test "$c12" -eq 1
+          test "$c6" -eq 1
+          grep -q "OFFLINE MOCK ONLY" "$root/forge-demos/demo.out"
+          grep -q "NO DUPLICATE MOCK CAPTURE" "$root/forge-demos/demo-recovery.out"
+
+      - name: Nightly tag
+        id: nightly
+        if: github.event_name == 'schedule'
+        run: echo "tag=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload forge-wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-wheel
+          path: |
+            dist/*.whl
+            dist/SHA256SUMS
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload forge-junit
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-junit
+          path: junit.xml
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload forge-demos
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-demos
+          path: forge-demos/*.out
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload nightly bundle
+        if: github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-${{ steps.nightly.outputs.tag }}
+          path: |
+            dist/*.whl
+            dist/SHA256SUMS
+            junit.xml
+            forge-demos/*.out
+          retention-days: 14
+          if-no-files-found: error
