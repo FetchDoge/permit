@@ -79,11 +79,28 @@ one running process, and the mock provider records whether a duplicate request w
 made. These tests establish simulated behavior only; they do not prove behavior of
 a live payment provider.
 
-Cleanup has an important unresolved boundary: if voiding an
-authorized-but-unregistered provider hold fails, current flow paths can release the
-permit's cap reservation before provider cleanup is confirmed. Operators therefore
-must not interpret a released cap or an e-stop report as proof that every external
-hold was cleaned up. Broader cleanup and convergence guarantees are not made.
+An unregistered provider hold releases cap only when `paypal.void` returns
+that same provider auth id with status `VOIDED`. A timeout, exception, missing
+result, mismatched id, `PENDING` status, or any other status keeps the
+reservation and stores the permit auth id plus the provider auth id on the
+in-memory outstanding entry (`cleanup_pending`). `SpendPipeline.retry_cleanup`
+retries that same identity and does not call `authorize`, `authorize_order`,
+or `capture`. After a confirmed void the retry is a no-op and the cap has
+been released once. `resume_operation` on a cleanup-pending identity takes
+that retry path. After confirmation, a later resume leaves the identity
+deleted and does not authorize a new hold.
+
+`estop` still unpacks as `(receipt, voided)`. Confirmed voids are listed in
+`voided`. `EstopResult.unresolved` lists cleanup that remains open: an
+outstanding hold with no provider id, an unconfirmed unregistered void, a
+registered escrow in `CLEANUP_PENDING`, and a registered void that returned
+false while the reservation remains. `UNKNOWN` capture uncertainty stays in
+`unknown_open`.
+
+That pending-void identity exists only in the current process. A restart
+drops it together with the rest of the in-memory permit state. This behavior
+is a same-process mock guarantee, not durable recovery and not a production
+safety claim.
 
 ## Explicit limitations
 
@@ -93,7 +110,8 @@ hold was cleaned up. Broader cleanup and convergence guarantees are not made.
 - There is no multi-process coordination or safety guarantee.
 - There is no production safety or security guarantee and no live-rail validation.
 - Captured payments are not refunded; refunds are out of scope.
-- Provider cleanup may remain uncertain after a void failure, as described above.
+- Unconfirmed void identities and their reservations live only in this process.
+  Restart drops them; there is no durable cleanup queue.
 - `UNKNOWN -> CAPTURED` in the recovery demo is same-process reconciliation against
   mock state, not durable crash recovery.
 
