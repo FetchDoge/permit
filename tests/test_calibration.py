@@ -395,7 +395,7 @@ def _scenarios(store):
     child = store.delegate(parent.permit_id, "agent-2", 1_000, ["m1"], later).permit
     attempt(child.permit_id, 100, "m1")                   # allowed via carve
     store.estop(parent.permit_id)
-    attempt(child.permit_id, 100, "m1")                   # ancestor_revoked
+    attempt(child.permit_id, 100, "m1")                   # revoked (e-stop cascades, #22)
     return out
 
 
@@ -426,7 +426,7 @@ def test_zero_score_spend_gets_identical_authority_decision(monkeypatch):
     assert reasons <= KNOWN_CHECK_REASONS
     assert {"allowed", "over_remaining_cap", "merchant_not_allowed",
             "invalid_amount", "unknown_permit", "expired", "revoked",
-            "tightened_cap_exceeded", "ancestor_revoked"} <= reasons
+            "tightened_cap_exceeded"} <= reasons
 
 
 def test_zero_score_recorded_on_allowed_receipt_and_spend_still_allowed():

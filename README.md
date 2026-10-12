@@ -39,18 +39,20 @@ python -m pytest -q        # full suite: mock rail, no credentials, no network
 python demo.py             # end-to-end mock demo, ends with the ledger chain check
 ```
 
-More demos:
+More demos (in `demos/`; `trace.py` is the canonical evidence path —
+it asserts the real gate and doubles as the run's evidence log):
 
 ```bash
-python demo_sla_escrow.py        # offline: agent-to-agent SLA escrow, acceptance-signed capture, forged signature refused
+python demos/demo_sla_escrow.py        # offline: agent-to-agent SLA escrow, acceptance-signed capture, forged signature refused
 python server.py                 # the service at http://127.0.0.1:8741
 python trace.py                  # with server.py running: allow, block, delegate, cascade revoke, chain check
-python demo_six_beat.py          # LLM agent: grant → capture → over-cap block → delegate + cascade → tampered evidence → timeout/reconcile
-python demo_delegation.py --fast # LLM agents: buyer and researcher, five beats, live dashboard
-python demo_approval.py --fast   # LLM agent: auto-allow, approve, deny, fail-closed
+python demos/demo_six_beat.py          # LLM agent: grant → capture → over-cap block → delegate + cascade → tampered evidence → timeout/reconcile
+python demos/demo_delegation.py --fast # LLM agents: buyer and researcher, five beats, live dashboard
+python demos/demo_approval.py --fast   # LLM agent: auto-allow, approve, deny, fail-closed
+python demos/demo_admission.py         # offline: runaway loop refused at budget exhaustion, concurrent overspend cannot exceed cap
 ```
 
-The three LLM demos call the runner set by `PERMIT_GROK_CLI`. There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl`. The file is gitignored, so a fresh clone has no transcript until you record one.
+The three LLM demos call the runner set by `PERMIT_GROK_CLI`. There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demos/demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl`. The file is gitignored, so a fresh clone has no transcript until you record one.
 
 ## How it fails
 
@@ -100,10 +102,10 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 ## Evidence
 
-- **170 tests pass:** `python -m pytest -q`, run 2026-10-07 on `main` at `dc0f3a5`. CI runs the same suite plus `python demo.py` on every push.
+- **187 tests pass:** `python -m pytest -q`, run 2026-10-09 on the admission-gating branch (184 on main at 39a7a0c + 3 new). CI runs the same suite plus `python demo.py` on every push.
 - **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (15 receipts)` (run 2026-10-07 at `dc0f3a5`).
 - **Mock rail vs sandbox, kept separate:**
-  - `demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_GROK_CLI` or a recorded transcript.
+  - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_GROK_CLI` or a recorded transcript.
   - The Oct 2 sandbox spike made real REST calls (OAuth, order, authorize, capture, void) against PayPal sandbox and verified merchant identity. Its report left the tree in `3f88feb`. Read it with `git show 3f88feb^:spike-report.md`.
   - `docs/sandbox-runbook.md` is the scripted procedure for an integrated six-beat sandbox run. That run is not yet recorded.
 

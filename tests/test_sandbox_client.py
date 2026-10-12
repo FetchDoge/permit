@@ -69,12 +69,15 @@ def test_order_status_reports_api_state():
 
 
 def test_authorize_order_on_approved_order():
-    c = make_client([(201, AUTH_BODY)])
+    c = make_client([(201, AUTH_BODY), (200, AUTH_BODY)])
     auth = c.authorize_order("ORDER123", 3000, "merchant_x")
     assert auth.auth_id == "AUTH999"
     assert auth.amount_cents == 3000
     assert auth.merchant_id == "merchant_x"
-    assert c._calls == [("POST", "/v2/checkout/orders/ORDER123/authorize")]
+    assert c._calls == [
+        ("POST", "/v2/checkout/orders/ORDER123/authorize"),
+        ("GET", "/v2/checkout/orders/ORDER123"),
+    ]
 
 
 def test_authorize_order_merchant_mismatch():
@@ -170,3 +173,36 @@ def test_void_tolerates_empty_204_body():
     void = c.void("AUTH999")
     assert void.auth_id == "AUTH999"
     assert void.status == "VOIDED"
+
+
+def test_authorize_order_already_authorized_recovers_via_get():
+    """P0 (live 2026-10-05): when the payer's browser completes the
+    authorization itself (normal hermes flow for intent=AUTHORIZE), POST
+    /authorize answers 422 ORDER_ALREADY_AUTHORIZED. authorize_order()
+    must recover idempotently from the order instead of crashing."""
+    already = {
+        "name": "UNPROCESSABLE_ENTITY",
+        "details": [{"issue": "ORDER_ALREADY_AUTHORIZED"}],
+    }
+    c = make_client([(422, already), (200, AUTH_BODY)])
+    auth = c.authorize_order("ORDER123", 3000, "merchant_x")
+    assert auth.auth_id == "AUTH999"
+    assert auth.amount_cents == 3000
+    assert c._calls == [
+        ("POST", "/v2/checkout/orders/ORDER123/authorize"),
+        ("GET", "/v2/checkout/orders/ORDER123"),
+    ]
+
+
+def test_authorize_order_binds_trust_against_get_when_post_omits_payee():
+    """P0 (live 2026-10-05): the POST /authorize response can omit
+    payee on some flows, which used to trip _bind_trust into a false
+    MerchantMismatch. Trust is now bound against the GET order response,
+    the source of truth."""
+    import copy
+
+    post_body = copy.deepcopy(AUTH_BODY)
+    del post_body["purchase_units"][0]["payee"]
+    c = make_client([(201, post_body), (200, AUTH_BODY)])
+    auth = c.authorize_order("ORDER123", 3000, "merchant_x")
+    assert auth.auth_id == "AUTH999"

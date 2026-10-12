@@ -4,6 +4,8 @@ import base64
 import hashlib
 import json
 import threading
+import time
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -15,6 +17,8 @@ from settlement.verifier import ReleaseVerifier
 from permit.flow import SpendPipeline
 from permit.ledger import Ledger
 from permit.permit import PermitStore
+
+TEST_TOKEN = "test-token-not-a-secret"
 
 
 @pytest.fixture()
@@ -31,6 +35,10 @@ def live_server(monkeypatch):
     monkeypatch.setattr(server, "verifier", verifier)
     monkeypatch.setattr(server, "flow", flow)
     monkeypatch.setattr(server, "MOCK_MODE", True)
+    monkeypatch.setenv("PERMIT_API_TOKEN", TEST_TOKEN)
+    # Clean slate for the pending-ops registry between tests.
+    monkeypatch.setattr(server, "PENDING_OPS", {})
+    monkeypatch.setattr(server, "_PENDING_META", {})
     srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -39,12 +47,18 @@ def live_server(monkeypatch):
     srv.shutdown()
 
 
-def call(base, method, path, body=None):
+def call(base, method, path, body=None, token=TEST_TOKEN):
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
     r = urllib.request.Request(base + path, data=data, method=method,
-                               headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(r, timeout=10) as resp:
-        return resp.status, json.loads(resp.read().decode())
+                               headers=headers)
+    try:
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
 
 
 def test_issue_check_spend_release(live_server):
@@ -112,12 +126,14 @@ def test_ledger_chain_verifies(live_server):
     assert led["receipts"][0]["event"] == "GRANTED"
 
 
-def call_expect_error(base, method, path, body, want_status):
+def call_expect_error(base, method, path, body, want_status, token=TEST_TOKEN):
     """Like call(), but for routes that must answer with an HTTP error."""
-    import urllib.error
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
     r = urllib.request.Request(base + path, data=data, method=method,
-                               headers={"Content-Type": "application/json"})
+                               headers=headers)
     try:
         with urllib.request.urlopen(r, timeout=10):
             raise AssertionError(f"expected HTTP {want_status}, got 2xx")
@@ -283,6 +299,94 @@ def test_delegate_cannot_oversubscribe_parent(live_server):
         400,
     )
     assert "over_parent_remaining" in err["error"]
+
+
+def test_mutating_routes_require_bearer_token(live_server):
+    """Audit item 6: no token / wrong token -> 401 on every POST route."""
+    base, _ = live_server
+    body = {"agent_id": "a", "cap_cents": 1000, "allowlist": ["m"],
+            "expiry_hours": 1}
+    for tok in (None, "wrong-token"):
+        status, err = call(base, "POST", "/api/permits", body, token=tok)
+        assert status == 401, f"token={tok!r}: got {status}"
+        assert "unauthorized" in err["error"]
+    # GET routes stay open (read-only).
+    status, _ = call(base, "GET", "/api/ledger", token=None)
+    assert status == 200
+
+
+def _needs_approval_exc(order_id="ord_1", url="https://approve/1"):
+    """Duck-typed NeedsPayerApproval: flow matches on the class name."""
+    cls = type("NeedsPayerApproval", (Exception,), {})
+    exc = cls(f"order {order_id} needs payer approval")
+    exc.order_id = order_id
+    exc.approval_url = url
+    return exc
+
+
+@pytest.fixture()
+def approval_server(live_server, monkeypatch):
+    """live_server whose PayPal client demands payer approval on authorize."""
+    base, paypal = live_server
+    def _raise(amount_cents, merchant_id, idempotency_key=None):
+        raise _needs_approval_exc()
+    monkeypatch.setattr(paypal, "authorize", _raise)
+    return base, paypal
+
+
+def test_expired_pending_op_releases_reservation(approval_server):
+    """Audit item 5: a TTL-expired payer-approval op is reaped fail-closed."""
+    base, paypal = approval_server
+
+    _, grant = call(base, "POST", "/api/permits",
+                    {"agent_id": "a", "cap_cents": 10000,
+                     "allowlist": ["m"], "expiry_hours": 1})
+    pid = grant["permit_id"]
+    _, spend = call(base, "POST", f"/api/permits/{pid}/spend",
+                    {"amount_cents": 3000, "merchant_id": "m",
+                     "predicate": "delivery_hash",
+                     "artifact_hash": "ab" * 32})
+    assert spend["status"] == "approval_required"
+    op_id = spend["operation_id"]
+
+    # Reservation is held.
+    _, state = call(base, "GET", f"/api/permits/{pid}")
+    assert state["reserved_cents"] == 3000
+
+    # Age the operation past the TTL.
+    server._PENDING_META[op_id] = time.monotonic() - 16 * 60
+
+    # Resume on an expired op: 410, and the reservation is released.
+    status, err = call(base, "POST", f"/api/operations/{op_id}/resume", {})
+    assert status == 410, f"got {status}: {err}"
+    _, state = call(base, "GET", f"/api/permits/{pid}")
+    assert state["reserved_cents"] == 0
+    # Expiry is receipted.
+    _, led = call(base, "GET", "/api/ledger")
+    events = [r["event"] for r in led["receipts"]]
+    assert "OPERATION_EXPIRED" in events
+
+
+def test_sweep_reaps_without_resume_hit(approval_server):
+    """The background sweep path releases reservations on its own."""
+    base, paypal = approval_server
+
+    _, grant = call(base, "POST", "/api/permits",
+                    {"agent_id": "a", "cap_cents": 10000,
+                     "allowlist": ["m"], "expiry_hours": 1})
+    pid = grant["permit_id"]
+    _, spend = call(base, "POST", f"/api/permits/{pid}/spend",
+                    {"amount_cents": 2000, "merchant_id": "m",
+                     "predicate": "delivery_hash",
+                     "artifact_hash": "cd" * 32})
+    op_id = spend["operation_id"]
+    server._PENDING_META[op_id] = time.monotonic() - 16 * 60
+
+    reaped = server.sweep_expired_pending()
+    assert reaped == 1
+    assert op_id not in server.PENDING_OPS
+    _, state = call(base, "GET", f"/api/permits/{pid}")
+    assert state["reserved_cents"] == 0
 
 
 def test_advisory_calibration_visible_read_only_and_spend_unblocked(live_server):

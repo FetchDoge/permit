@@ -248,9 +248,13 @@ def test_tighten_actor_recorded():
 
 
 def test_tighten_route():
-    import json, threading, urllib.request
+    import json, os, threading, urllib.request
     from http.server import ThreadingHTTPServer
     import server as srv
+
+    os.environ["PERMIT_API_TOKEN"] = "test-tighten-token"
+    token_headers = {"Content-Type": "application/json",
+                     "Authorization": "Bearer test-tighten-token"}
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
     port = httpd.server_address[1]
@@ -261,7 +265,7 @@ def test_tighten_route():
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}{path}",
                 data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
+                headers=token_headers,
                 method="POST",
             )
             try:

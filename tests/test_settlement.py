@@ -272,3 +272,95 @@ def test_p1_5_capture_pending_stays_unknown_obligation_retained():
     # The UNKNOWN escrow refuses further capture attempts outright.
     r2 = verifier.verify_and_capture("esc_1", Evidence(delivered_bytes=artifact))
     assert r2.reason == "unknown_reconcile_first"
+
+
+def test_slow_capture_does_not_stall_other_escrow_ops():
+    """Lock rework: a slow provider capture must not block void() on a
+    different escrow, nor register(). Proves the verifier lock is
+    released during provider I/O."""
+    import threading
+    import time
+
+    from settlement.paypal_client import PayPalTimeout
+
+    verifier, paypal, permits, escrow1, artifact = _setup(PredicateType.D)
+    # Second escrow on the same permit.
+    check = permits.check(escrow1.permit_id, 1000, "merchant_1")
+    assert check.allowed
+    auth2 = check.receipt.payload["auth_id"]
+    pp_auth2 = paypal.authorize(1000, "merchant_1")
+    escrow2 = Escrow(
+        escrow_id="esc_2",
+        permit_id=escrow1.permit_id,
+        auth_id=auth2,
+        paypal_auth_id=pp_auth2.auth_id,
+        amount_cents=1000,
+        merchant_id="merchant_1",
+        predicate_type=PredicateType.D,
+        artifact_hash=escrow1.artifact_hash,
+    )
+    verifier.register(escrow2)
+
+    # Make capture slow.
+    orig_capture = paypal.capture
+    def slow_capture(*a, **k):
+        time.sleep(2.0)
+        return orig_capture(*a, **k)
+    paypal.capture = slow_capture
+
+    results = {}
+    def do_capture():
+        results["cap"] = verifier.verify_and_capture(
+            "esc_1", Evidence(delivered_bytes=artifact)
+        )
+    t = threading.Thread(target=do_capture)
+    start = time.monotonic()
+    t.start()
+    # Wait until esc_1 is in CAPTURING (lock released, I/O in flight).
+    for _ in range(100):
+        if escrow1.state == "CAPTURING":
+            break
+        time.sleep(0.02)
+    assert escrow1.state == "CAPTURING"
+    # void() on the OTHER escrow must not wait for the slow capture.
+    assert verifier.void("esc_2") is True
+    void_elapsed = time.monotonic() - start
+    assert void_elapsed < 1.0, f"void stalled on slow capture: {void_elapsed:.2f}s"
+    assert escrow2.state == "VOIDED"
+    t.join()
+    assert results["cap"].released
+    assert escrow1.state == "CAPTURED"
+
+
+def test_concurrent_capture_same_escrow_single_flight():
+    """Two racing verify_and_capture calls: one drives, the other
+    short-circuits with release_in_flight (no double capture)."""
+    import threading
+    import time
+
+    verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
+    orig_capture = paypal.capture
+    def slow_capture(*a, **k):
+        time.sleep(1.0)
+        return orig_capture(*a, **k)
+    paypal.capture = slow_capture
+
+    results = []
+    def do_capture():
+        results.append(
+            verifier.verify_and_capture("esc_1", Evidence(delivered_bytes=artifact))
+        )
+    t1 = threading.Thread(target=do_capture)
+    t2 = threading.Thread(target=do_capture)
+    t1.start()
+    # Ensure t1 is in CAPTURING before t2 starts.
+    for _ in range(100):
+        if escrow.state == "CAPTURING":
+            break
+        time.sleep(0.02)
+    t2.start()
+    t1.join()
+    t2.join()
+    assert len(paypal.capture_calls) == 1, "double capture!"
+    reasons = sorted(r.reason for r in results)
+    assert reasons == ["release_in_flight", "released"], reasons

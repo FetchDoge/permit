@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -45,10 +46,15 @@ PORT = _free_port()
 BASE = f"http://127.0.0.1:{PORT}"
 
 
+TRACE_TOKEN = "trace-token-not-a-secret"
+
+
 def req(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
-    r = urllib.request.Request(BASE + path, data=data, method=method,
-                               headers={"Content-Type": "application/json"})
+    r = urllib.request.Request(
+        BASE + path, data=data, method=method,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {TRACE_TOKEN}"})
     with urllib.request.urlopen(r, timeout=10) as resp:
         return resp.status, json.loads(resp.read().decode())
 
@@ -58,9 +64,11 @@ def show(tag, obj):
 
 
 def main():
+    env = dict(os.environ, PERMIT_API_TOKEN=TRACE_TOKEN)
     srv = subprocess.Popen(
         [sys.executable, str(HERE / "server.py"), "--port", str(PORT)],
         cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env=env,
     )
     try:
         # wait for the listener; also verify the child is still alive so a

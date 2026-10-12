@@ -261,12 +261,26 @@ class SandboxPayPalClient(PayPalClient):
             for d in (auth_body or {}).get("details", [])
         ):
             raise NeedsPayerApproval(order_id, self._approval_url(order_id))
-        assert status in (200, 201), f"authorize failed: {status} {auth_body}"
+        if status == 422 and any(
+            d.get("issue") == "ORDER_ALREADY_AUTHORIZED"
+            for d in (auth_body or {}).get("details", [])
+        ):
+            # The payer's browser completed the authorization itself (the
+            # normal hermes flow for intent=AUTHORIZE). Recover
+            # idempotently from the order instead of failing.
+            pass
+        else:
+            assert status in (200, 201), f"authorize failed: {status} {auth_body}"
 
-        self._bind_trust(auth_body, amount_cents)
+        # Trust-bind against the GET order response: it is the source of
+        # truth and carries the full purchase-unit shape (the POST
+        # /authorize response omits payee on some flows, which used to
+        # trip _bind_trust into a false MerchantMismatch).
+        _, order = self._http("GET", f"/v2/checkout/orders/{order_id}")
+        self._bind_trust(order, amount_cents)
 
         # The authorization lives in purchase_units[0].payments.authorizations[0].
-        pu = auth_body["purchase_units"][0]
+        pu = order["purchase_units"][0]
         auth = pu["payments"]["authorizations"][0]
         return Authorization(
             auth_id=auth["id"],

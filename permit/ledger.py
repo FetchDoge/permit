@@ -60,6 +60,10 @@ class Ledger:
     def __init__(self):
         self._lock = threading.Lock()
         self._receipts: list[Receipt] = []
+        # Index: auth_id -> ALLOWED receipt. Maintained on append; the
+        # ledger is append-only (entries are never removed), so the index
+        # cannot go stale. Replaces the old O(n) scan per lookup.
+        self._allowed_by_auth: dict[str, Receipt] = {}
 
     def append(self, event_type: str, payload: dict) -> Receipt:
         with self._lock:
@@ -72,7 +76,17 @@ class Ledger:
                 timestamp=_utcnow_iso(),
             )
             self._receipts.append(receipt)
+            # auth_ids are unique per check() (uuid4), so no overwrite risk.
+            if event_type == "ALLOWED":
+                auth_id = payload.get("auth_id")
+                if isinstance(auth_id, str):
+                    self._allowed_by_auth[auth_id] = receipt
             return receipt
+
+    def allowed_receipt(self, auth_id: str) -> Receipt | None:
+        """The ALLOWED receipt for an auth_id, if any. O(1)."""
+        with self._lock:
+            return self._allowed_by_auth.get(auth_id)
 
     def __len__(self) -> int:
         return len(self._receipts)
@@ -89,8 +103,11 @@ class Ledger:
         with self._lock:
             receipts = list(self._receipts)
         expected_prev = GENESIS_HASH
-        for r in receipts:
-            if r.seq != receipts.index(r):
+        # enumerate, not receipts.index(r): index() is O(n) per receipt,
+        # which made verification O(n^2) — and this runs before every
+        # capture. Position in the list IS the expected seq.
+        for expected_seq, r in enumerate(receipts):
+            if r.seq != expected_seq:
                 return False, f"sequence gap at seq {r.seq}"
             if r.prev_hash != expected_prev:
                 return False, f"prev_hash mismatch at seq {r.seq}"

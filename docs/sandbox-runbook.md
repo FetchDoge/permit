@@ -1,6 +1,6 @@
 # Permit — sandbox runbook: integrated beat run on the real rail
 
-Status: documented procedure. The automated, camera-ready beats (demo_six_beat.py)
+Status: documented procedure. The automated, camera-ready beats (demos/demo_six_beat.py)
 run in **mock mode** (mock PayPal rail: no PayPal network, no PayPal
 credentials). The agent's reasoning is live (Grok CLI) unless
 `--replay demo_transcript.jsonl` is used — that is the fully offline,

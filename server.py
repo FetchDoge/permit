@@ -40,15 +40,18 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from permit.flow import ApprovalRequired, SpendPipeline
 from permit.ledger import Ledger
-from permit.permit import PermitStore, UnknownPermit
+from permit.permit import PermitStore, UnknownAuthId, UnknownPermit
 from settlement.paypal_client import MockPayPalClient
 from settlement.verifier import (
     Evidence,
@@ -74,6 +77,121 @@ import uuid as _uuid
 
 PENDING_OPS: dict[str, ApprovalRequired] = {}
 PENDING_OPS_LOCK = threading.Lock()
+# operation_id -> monotonic timestamp of retention. A payer-approval
+# operation holds a REAL cap reservation; without a TTL an abandoned
+# browser flow would hold it forever. 15 minutes, matching the
+# principal-approval path's ttl_minutes.
+_PENDING_META: dict[str, float] = {}
+_PENDING_OPS_TTL_S = 15 * 60
+
+
+def _pending_put(operation_id: str, appr: ApprovalRequired) -> None:
+    """Retain an operation with its retention timestamp (under lock)."""
+    with PENDING_OPS_LOCK:
+        PENDING_OPS[operation_id] = appr
+        _PENDING_META[operation_id] = time.monotonic()
+
+
+def _pending_expired(operation_id: str) -> bool:
+    """True when the operation is missing or past its TTL (fail closed)."""
+    with PENDING_OPS_LOCK:
+        if operation_id not in PENDING_OPS:
+            return True
+        return time.monotonic() - _PENDING_META.get(operation_id, 0) > _PENDING_OPS_TTL_S
+
+
+def sweep_expired_pending() -> int:
+    """
+    Reap TTL-expired payer-approval operations: void the PayPal hold
+    best-effort, release the cap reservation, receipt the expiry.
+    Returns the number of operations reaped.
+    """
+    cutoff = time.monotonic() - _PENDING_OPS_TTL_S
+    expired: list[tuple[str, ApprovalRequired]] = []
+    with PENDING_OPS_LOCK:
+        for oid in [o for o, ts in _PENDING_META.items() if ts <= cutoff]:
+            appr = PENDING_OPS.pop(oid, None)
+            _PENDING_META.pop(oid, None)
+            if appr is not None:
+                expired.append((oid, appr))
+    for oid, appr in expired:
+        try:
+            paypal.void(appr.order_id)
+        except Exception:
+            pass  # best-effort; the order expires provider-side anyway
+        try:
+            permits.settle_void(appr.permit_id, appr.auth_id)
+        except (UnknownPermit, UnknownAuthId):
+            pass  # reservation already gone; still receipt the expiry
+        ledger.append(
+            "OPERATION_EXPIRED",
+            {
+                "operation_id": oid,
+                "permit_id": appr.permit_id,
+                "auth_id": appr.auth_id,
+                "order_id": appr.order_id,
+                "amount_cents": appr.amount_cents,
+                "merchant_id": appr.merchant_id,
+                "reason": "payer_approval_ttl_expired",
+            },
+        )
+    return len(expired)
+
+
+def _sweeper() -> None:
+    """Background reaper for expired pending operations (daemon)."""
+    while True:
+        time.sleep(60)
+        try:
+            sweep_expired_pending()
+        except Exception:
+            pass
+
+
+def _authorized(handler: BaseHTTPRequestHandler) -> bool:
+    """
+    Bearer-token gate for mutating routes. Fail closed: when
+    PERMIT_API_TOKEN is unset, every mutating call is denied — an
+    unauthenticated payment authority is not a payment authority.
+    """
+    token = os.environ.get("PERMIT_API_TOKEN", "")
+    auth = handler.headers.get("Authorization", "")
+    if not token or not auth.startswith("Bearer "):
+        return False
+    presented = auth[len("Bearer "):].strip()
+    if not presented:
+        return False
+    return hmac.compare_digest(presented, token)
+
+
+# ---------------------------------------------------------------- logging
+
+import logging
+
+
+class _JsonFormatter(logging.Formatter):
+    """Single-line JSON per record: the operational log."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname.lower(),
+            "component": "permit-server",
+            "msg": record.getMessage(),
+        })
+
+
+def _configure_logging() -> logging.Logger:
+    handler = logging.StreamHandler()
+    handler.setFormatter(_JsonFormatter())
+    log = logging.getLogger("permit")
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    return log
+
+
+log = _configure_logging()
 
 
 def receipt_summary(r):
@@ -148,6 +266,10 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not_found")
 
     def do_POST(self):
+        # Every mutating route requires the bearer token. No classifier,
+        # no exceptions: a single gate means no route is forgotten.
+        if not _authorized(self):
+            return self._error(401, "unauthorized: bearer token required")
         body = self._read_json()
 
         # issue permit
@@ -222,8 +344,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Buyer approval needed: the cap reservation stays held and
                 # the operation is retained for resume. 202, not an error.
                 operation_id = f"op_{_uuid.uuid4().hex[:12]}"
-                with PENDING_OPS_LOCK:
-                    PENDING_OPS[operation_id] = appr
+                _pending_put(operation_id, appr)
                 return self._send(202, {
                     "status": "approval_required",
                     "operation_id": operation_id,
@@ -245,12 +366,17 @@ class Handler(BaseHTTPRequestHandler):
                 appr = PENDING_OPS.get(operation_id)
             if appr is None:
                 return self._error(404, "unknown_operation")
+            if _pending_expired(operation_id):
+                # TTL lapsed: reap now so the reservation is released
+                # before we answer. 410, not 404 — it existed.
+                sweep_expired_pending()
+                return self._error(410, "operation_expired")
             try:
                 attempt = flow.resume_operation(appr)
             except ApprovalRequired as still:
-                # Still not approved — keep the operation retained.
-                with PENDING_OPS_LOCK:
-                    PENDING_OPS[operation_id] = still
+                # Still not approved — keep the operation retained,
+                # with a fresh retention timestamp.
+                _pending_put(operation_id, still)
                 return self._send(202, {
                     "status": "approval_required",
                     "operation_id": operation_id,
@@ -260,6 +386,7 @@ class Handler(BaseHTTPRequestHandler):
                 })
             with PENDING_OPS_LOCK:
                 PENDING_OPS.pop(operation_id, None)
+                _PENDING_META.pop(operation_id, None)
             return self._send(200, {
                 "allowed": attempt.allowed, "reason": attempt.reason,
                 "escrow_id": attempt.escrow_id,
@@ -270,7 +397,7 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             try:
                 receipt, voided = flow.estop(m.group(1))
-            except AssertionError:
+            except UnknownPermit:
                 return self._error(404, "unknown_permit")
             return self._send(200, {
                 "revoked": True, "voided_escrows": voided,
@@ -373,9 +500,12 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------- main
 
 def main():
-    global paypal, verifier, flow, MOCK_MODE
+    global paypal, verifier, flow, MOCK_MODE, ledger, permits
     ap = argparse.ArgumentParser(description="Permit service")
     ap.add_argument("--port", type=int, default=8741)
+    ap.add_argument("--db", type=str, default=None,
+                    help="SQLite path for the durable receipt ledger;"
+                         " default is in-memory (no persistence)")
     ap.add_argument("--sandbox", action="store_true",
                     help="use the real sandbox rail (needs env creds + interactive payer approval)")
     args = ap.parse_args()
@@ -390,18 +520,37 @@ def main():
         paypal = SandboxPayPalClient(client_id, client_secret,
                                      merchant_account_id=merchant_id)
         MOCK_MODE = False
-        print("permit: sandbox rail armed"
-              + (f" (merchant bound to {merchant_id})" if merchant_id
-                 else " (WARNING: no PERMIT_PAYPAL_MERCHANT_ID — merchant binding disabled)"))
+        log.info("sandbox rail armed"
+                 + (f" (merchant bound to {merchant_id})" if merchant_id
+                    else " (WARNING: no PERMIT_PAYPAL_MERCHANT_ID — merchant binding disabled)"))
     else:
         paypal = MockPayPalClient()
-        print("permit: mock rail (no network, no credentials)")
+        log.info("mock rail (no network, no credentials)")
 
     verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
 
+    if args.db:
+        # Durable mode: open (verifying) the SQLite ledger, then fold the
+        # restored chain into the permit store. SqliteLedger.__init__
+        # raises instead of serving a corrupt chain — fail closed.
+        from permit.sqlite_ledger import SqliteLedger, fold_receipts
+        db_ledger = SqliteLedger(args.db)
+        folded = fold_receipts(db_ledger.receipts())
+        folded.ledger = db_ledger
+        ledger, permits = db_ledger, folded
+        verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
+        flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
+        log.info(f"durable ledger at {args.db}"
+                 f" ({len(ledger)} receipts restored)")
+
+    # Reap TTL-expired payer-approval operations (daemon; 60s cadence).
+    # /resume also reaps on hit, so an expired op never captures.
+    sweeper = threading.Thread(target=_sweeper, daemon=True)
+    sweeper.start()
+
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"permit: listening on 127.0.0.1:{args.port}")
+    log.info(f"listening on 127.0.0.1:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

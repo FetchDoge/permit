@@ -8,11 +8,11 @@ The live proof the judge must see, in one command, is: grant → allowed capture
 
 ## Functional demo
 
-**Status: ready.** A judge can run it from a fresh checkout. Python 3.10 or newer. No pip install, no API key, no `.env`, no network. Measured on this tree: `python3 demo_six_beat.py --fast` reaches `VERIFIED` in about half a minute (the LLM agent calls dominate); the receipt chain is deterministic. The cascade is included.
+**Status: ready.** A judge can run it from a fresh checkout. Python 3.10 or newer. No pip install, no API key, no `.env`, no network. Measured on this tree: `python3 demos/demo_six_beat.py --fast` reaches `VERIFIED` in about half a minute (the LLM agent calls dominate); the receipt chain is deterministic. The cascade is included.
 
 | What the judge does | Where it lives | What it shows |
 | --- | --- | --- |
-| `python3 demo_six_beat.py --hold`, then open the printed URL | `demo_six_beat.py`, `dashboard/index.html`, `dashboard/server.py` | The six beats on the mock rail, including a $15 carved sub-permit and a parent revoke cascade. The page stays up until Ctrl+C. |
+| `python3 demos/demo_six_beat.py --hold`, then open the printed URL | `demos/demo_six_beat.py`, `dashboard/index.html`, `dashboard/server.py` | The six beats on the mock rail, including a $15 carved sub-permit and a parent revoke cascade. The page stays up until Ctrl+C. |
 | `python3 demo.py` | `demo.py` | Allow, block, delegate, cascade, chain verified. Exits. |
 | `python3 trace.py` | `trace.py`, `server.py` | The same gate over HTTP, including `POST /api/permits/<id>/delegate` and `POST /api/permits/<id>/revoke-cascade`. Starts its own server on port 8741. Do not leave `server.py` running on that port. |
 | Read the boundary | `docs/sandbox-runbook.md` | What the gate stops, and the sandbox procedure. Threat model and lifecycle docs are still to write. |
@@ -35,7 +35,7 @@ Storyboard, same arc:
 | --- | --- |
 | 0:00 | The problem. An agent with a wallet can overspend, pay the wrong merchant, or ignore a stop. A budget in a prompt is not a control. |
 | 0:20 | The gate. Cap, allowlist, expiry, not revoked. A sub-permit is carved from the parent's remaining cap — siblings can't overspend it. Hold with `AUTHORIZE`. Capture once, only if the hash matches. The cap returns only when the void is confirmed. |
-| 0:45 | Live proof, on screen. `python3 demo_six_beat.py --hold`. $30 captures. $60 is blocked and PayPal is not called. A $15 sub-permit is carved. Revoke on the parent cascades: child revoked, hold voided, carve released. Tampered bytes are refused. A dropped capture stays `UNKNOWN`, then reconcile records the one capture. |
+| 0:45 | Live proof, on screen. `python3 demos/demo_six_beat.py --hold`. $30 captures. $60 is blocked and PayPal is not called. A $15 sub-permit is carved. Revoke on the parent cascades: child revoked, hold voided, carve released. Tampered bytes are refused. A dropped capture stays `UNKNOWN`, then reconcile records the one capture. |
 | 2:20 | What's next, in one sentence. These beats on PayPal's sandbox are the written procedure, not this recording. This recording is the mock rail. |
 | 2:35 | `VERIFIED` means the receipt list in this process is internally intact. It is not a PayPal signature and it is not durable. |
 
@@ -61,7 +61,7 @@ The recording has to say the camera run is the mock. It must not say the six bea
 | --- | --- | --- |
 | PayPal developer platform, sandbox | `settlement/sandbox_client.py`, `python3 server.py --sandbox`, `docs/sandbox-runbook.md` | Partial. The six beats have not been run as one sandbox session. |
 | AI in the product, not beside it | The spender in the demo beats is the agent. It has no PayPal credentials. The gate is the only way it spends. | Met. |
-| Working prototype a judge can run | `python3 demo_six_beat.py --hold` | Met on the mock rail. Includes carved sub-permits and the revoke cascade. |
+| Working prototype a judge can run | `python3 demos/demo_six_beat.py --hold` | Met on the mock rail. Includes carved sub-permits and the revoke cascade. |
 | Documentation a judge can grade | README, sandbox runbook, this checklist | Partial. Threat model and lifecycle docs still to write. |
 | English | All of the above | Met. |
 | New or significantly updated during Oct 1–Nov 12 | Initial commit Oct 2, 2026 | Met in this history. Say so on the form. |

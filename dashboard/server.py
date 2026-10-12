@@ -33,25 +33,7 @@ class Dashboard:
     # -- state ------------------------------------------------------------
 
     def state(self) -> dict:
-        permits = []
-        if self.permits:
-            for p in self.permits._permits.values():
-                eff_cap = p.cap_cents
-                if (p.tighten_cap_cents is not None
-                        and p.tighten_cap_cents < eff_cap):
-                    eff_cap = p.tighten_cap_cents
-                permits.append({
-                    "permit_id": p.permit_id,
-                    "agent_id": p.agent_id,
-                    "cap_cents": p.cap_cents,
-                    "effective_cap_cents": eff_cap,
-                    "reserved_cents": p.reserved_cents,
-                    "captured_cents": p.captured_cents,
-                    "remaining_cents": p.remaining_cents(),
-                    "revoked": p.revoked,
-                    "allowlist": list(p.allowlist),
-                    "parent_id": p.parent_id,
-                })
+        permits = self.permits.permits_snapshot() if self.permits else []
         receipts = []
         if self.ledger:
             for r in self.ledger.receipts():
@@ -62,18 +44,7 @@ class Dashboard:
                     "timestamp": r.timestamp,
                     "hash": r.hash[:12],
                 })
-        escrows = []
-        if self.verifier:
-            for e in self.verifier._escrows.values():
-                escrows.append({
-                    "escrow_id": e.escrow_id,
-                    "permit_id": e.permit_id,
-                    "amount_cents": e.amount_cents,
-                    "merchant_id": e.merchant_id,
-                    "predicate": e.predicate_type.value,
-                    "state": e.state,
-                    "paypal_auth_id": e.paypal_auth_id,
-                })
+        escrows = self.verifier.escrows_snapshot() if self.verifier else []
         chain_ok, chain_reason = self.ledger.verify_chain() if self.ledger else (True, "")
         approvals = []
         if self.permits:
