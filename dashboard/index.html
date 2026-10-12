@@ -106,12 +106,22 @@ const cents = c => "$" + (c/100).toFixed(2);
 const esc = s => String(s).replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
+// Advisory calibration score (Sol 6.1): display only, never blocks a spend.
+function calib(p){
+  const c = p.calibration;
+  if(!c) return "";
+  if(typeof c.S !== "number") return " · S n/a (advisory)";
+  return ` · S ${c.S.toFixed(2)} ${esc(c.verdict||"")} τ ${Number(c.tau).toFixed(2)} (advisory)`;
+}
+
 function receiptDetail(r){
   const p = r.payload || {};
   switch(r.event){
     case "GRANTED": return `cap ${cents(p.cap_cents)} · ${esc(p.agent_id)}`;
-    case "ALLOWED": return `${cents(p.amount_cents)} · ${esc(p.merchant_id||"")}`;
-    case "BLOCKED": return `${cents(p.amount_cents||0)} · ${esc(p.reason||"")}`;
+    case "ALLOWED": return `${cents(p.amount_cents)} · ${esc(p.merchant_id||"")}${calib(p)}`;
+    case "BLOCKED": return `${cents(p.amount_cents||0)} · ${esc(p.reason||"")}${calib(p)}`;
+    case "TAU_RAISED": return `advisory τ ${esc(p.from)} → ${esc(p.to)} · ${esc(p.actor||"")}`;
+    case "TAU_REFUSED": return `advisory τ ${esc(p.requested_tau)} refused · ${esc(p.reason||"")}`;
     case "AUTHORIZED": return `${cents(p.amount_cents)} · paypal ${esc((p.paypal_auth_id||"").slice(0,14))}…`;
     case "CAPTURED": return `${cents(p.amount_cents)} · capture ${esc((p.paypal_capture_id||"").slice(0,14))}…`;
     case "REFUSED": return esc(p.reason||"");

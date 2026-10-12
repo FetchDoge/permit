@@ -246,6 +246,8 @@ class Handler(BaseHTTPRequestHandler):
                 "remaining_cents": p.remaining_cents(),
                 "in_flight": len(p.in_flight),
                 "parent_id": p.parent_id,
+                # Advisory only (Sol 6.1): never an authority clause.
+                "calibration_tau": p.calibration_tau,
             })
         if self.path == "/api/ledger":
             ok, reason = ledger.verify_chain()
