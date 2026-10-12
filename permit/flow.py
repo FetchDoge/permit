@@ -35,6 +35,7 @@ class name), never imported.
 from __future__ import annotations
 
 import inspect
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -43,6 +44,8 @@ from datetime import datetime, timezone
 from .ledger import Ledger, Receipt
 from .permit import PermitStore
 from settlement.verifier import Escrow, PredicateType
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -355,12 +358,22 @@ class SpendPipeline:
             reason = None
 
         if reason is not None:
-            # Void the PayPal hold best-effort; cleanup of the provider
-            # hold itself is the settlement layer's job, so ignore errors.
+            # Fail closed: void must succeed before the reservation is
+            # released. A void failure logs and re-raises so the cap stays
+            # encumbered and no silent best-effort drop can free budget
+            # while a provider hold may still be live.
             try:
                 self.paypal.void(paypal_auth_id)
             except Exception:
-                pass
+                logger.exception(
+                    "void failed during post-authorize cleanup "
+                    "(permit_id=%s auth_id=%s paypal_auth_id=%s); "
+                    "reservation retained",
+                    permit_id,
+                    auth_id,
+                    paypal_auth_id,
+                )
+                raise
             self.permits.settle_void(permit_id, auth_id)
             self._drop_outstanding(auth_id)
             return SpendAttempt(
@@ -462,7 +475,15 @@ class SpendPipeline:
             try:
                 self.paypal.void(paypal_auth_id)
             except Exception:
-                pass
+                logger.exception(
+                    "void failed during register_escrow cleanup "
+                    "(permit_id=%s auth_id=%s paypal_auth_id=%s); "
+                    "reservation retained",
+                    permit_id,
+                    auth_id,
+                    paypal_auth_id,
+                )
+                raise
             if permit is not None:
                 self.permits.settle_void(permit_id, auth_id)
             raise RuntimeError("permit revoked/expired during registration")
@@ -572,7 +593,15 @@ class SpendPipeline:
             try:
                 self.paypal.void(entry["paypal_auth_id"])
             except Exception:
-                pass  # best-effort; provider-hold cleanup is settlement's job
+                logger.exception(
+                    "void failed during outstanding-hold cleanup "
+                    "(permit_id=%s auth_id=%s paypal_auth_id=%s); "
+                    "reservation retained",
+                    permit_id,
+                    auth_id,
+                    entry.get("paypal_auth_id"),
+                )
+                raise
             self.permits.settle_void(permit_id, auth_id)
             self._drop_outstanding(auth_id)
             voided.append(auth_id)

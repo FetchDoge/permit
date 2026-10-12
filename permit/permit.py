@@ -1052,18 +1052,26 @@ class PermitStore:
             permit.reserved_cents += amount_cents
             auth_id = f"auth_{uuid.uuid4().hex[:12]}"
             permit.in_flight[auth_id] = amount_cents
-            receipt = self.ledger.append(
-                "ALLOWED",
-                {
-                    "permit_id": permit.permit_id,
-                    "agent_id": permit.agent_id,
-                    "amount_cents": amount_cents,
-                    "merchant_id": merchant_id,
-                    "auth_id": auth_id,
-                    "remaining_cents": permit.remaining_cents(),
-                    "calibration": calibration,
-                },
-            )
+            try:
+                receipt = self.ledger.append(
+                    "ALLOWED",
+                    {
+                        "permit_id": permit.permit_id,
+                        "agent_id": permit.agent_id,
+                        "amount_cents": amount_cents,
+                        "merchant_id": merchant_id,
+                        "auth_id": auth_id,
+                        "remaining_cents": permit.remaining_cents(),
+                        "calibration": calibration,
+                    },
+                )
+            except Exception:
+                # Fail closed: a ledger write failure must not leave a
+                # phantom reservation without an ALLOWED receipt, and must
+                # never look like a successful spend.
+                permit.reserved_cents -= amount_cents
+                permit.in_flight.pop(auth_id, None)
+                raise
             return CheckResult(True, "allowed", receipt)
 
     def _rollup_capture(self, permit: Permit, amount_cents: int) -> None:
