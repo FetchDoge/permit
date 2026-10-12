@@ -102,7 +102,7 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 ## Evidence
 
-- **187 tests pass:** `python -m pytest -q`, run 2026-10-09 on the admission-gating branch (184 on main at 39a7a0c + 3 new). CI runs the same suite plus `python demo.py` on every push.
+- **212 tests pass:** `python -m pytest -q`, run 2026-10-12 on the M3 agent-loop branch (209 on main at 3632636 + 3 new). CI runs the same suite plus `python demo.py` on every push.
 - **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (15 receipts)` (run 2026-10-07 at `dc0f3a5`).
 - **Mock rail vs sandbox, kept separate:**
   - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_GROK_CLI` or a recorded transcript.
