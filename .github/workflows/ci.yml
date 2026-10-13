@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# CodeQL actions/missing-workflow-permissions (medium): explicit token scope
+# instead of the implicit read/write default. contents:read for checkout;
+# actions:write for the coverage artifact upload on py3.12.
+permissions:
+  contents: read
+  actions: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

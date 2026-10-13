@@ -2,7 +2,9 @@
 REA F7: durable per-escrow retry rate-limit counters, outside the hash chain.
 
 The receipt log stays append-only (at most one rate_limited tally receipt per
-escrow per window). Live over-limit counts live here so a crash can keep them.
+escrow per window). Live counters live here so crashes and multi-writer
+processes share one source of truth. At most one OPEN window (tally_flushed=0)
+per escrow — enforced by a UNIQUE partial index on SQLite.
 """
 
 from __future__ import annotations
@@ -23,8 +25,32 @@ class RetryRateRow:
     tally_flushed: bool
 
 
+_DDL_RETRY_RATE = """
+CREATE TABLE IF NOT EXISTS retry_rate_windows (
+  escrow_id      TEXT    NOT NULL,
+  window_id      TEXT    NOT NULL,
+  window_start   REAL    NOT NULL,
+  individual     INTEGER NOT NULL DEFAULT 0,
+  rate_limited   INTEGER NOT NULL DEFAULT 0,
+  covered_reason TEXT    NOT NULL DEFAULT '',
+  tally_flushed  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (escrow_id, window_id)
+)
+"""
+
+# Cross-process: exactly one open window per escrow.
+_DDL_ONE_OPEN = """
+CREATE UNIQUE INDEX IF NOT EXISTS retry_rate_one_open_window
+ON retry_rate_windows (escrow_id)
+WHERE tally_flushed = 0
+"""
+
+
 class InMemoryRetryRateStore:
-    """Process-local side store (not durable across process death)."""
+    """
+    Process-local side store (not durable across process death).
+    Still enforces one open window per escrow under a lock.
+    """
 
     def __init__(self) -> None:
         self._rows: dict[tuple[str, str], RetryRateRow] = {}
@@ -41,6 +67,17 @@ class InMemoryRetryRateStore:
 
     def upsert(self, row: RetryRateRow) -> None:
         with self._lock_for(row.escrow_id):
+            if not row.tally_flushed:
+                for (eid, wid), existing in list(self._rows.items()):
+                    if (
+                        eid == row.escrow_id
+                        and not existing.tally_flushed
+                        and wid != row.window_id
+                    ):
+                        raise RuntimeError(
+                            "in-memory retry rate: second open window for "
+                            f"escrow_id={row.escrow_id!r}"
+                        )
             self._rows[(row.escrow_id, row.window_id)] = RetryRateRow(
                 escrow_id=row.escrow_id,
                 window_id=row.window_id,
@@ -50,6 +87,21 @@ class InMemoryRetryRateStore:
                 covered_reason=row.covered_reason,
                 tally_flushed=row.tally_flushed,
             )
+
+    def get_open(self, escrow_id: str) -> RetryRateRow | None:
+        with self._lock_for(escrow_id):
+            for (eid, _wid), row in self._rows.items():
+                if eid == escrow_id and not row.tally_flushed:
+                    return RetryRateRow(
+                        escrow_id=row.escrow_id,
+                        window_id=row.window_id,
+                        window_start=row.window_start,
+                        individual=row.individual,
+                        rate_limited=row.rate_limited,
+                        covered_reason=row.covered_reason,
+                        tally_flushed=row.tally_flushed,
+                    )
+            return None
 
     def load_all(self) -> list[RetryRateRow]:
         with self._guard:
@@ -72,31 +124,24 @@ class InMemoryRetryRateStore:
             self._rows.pop((escrow_id, window_id), None)
 
 
-_DDL_RETRY_RATE = """
-CREATE TABLE IF NOT EXISTS retry_rate_windows (
-  escrow_id      TEXT    NOT NULL,
-  window_id      TEXT    NOT NULL,
-  window_start   REAL    NOT NULL,
-  individual     INTEGER NOT NULL DEFAULT 0,
-  rate_limited   INTEGER NOT NULL DEFAULT 0,
-  covered_reason TEXT    NOT NULL DEFAULT '',
-  tally_flushed  INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (escrow_id, window_id)
-)
-"""
-
-
 class SqliteRetryRateStore:
     """
-    SQLite side table on a dedicated connection (not the receipt-log lock).
-    Outside the hash chain; written on every counter update (durable).
+    SQLite side table — source of truth for open-window counters.
+    Prefer the same connection as the receipt log so denial+increment can
+    share one BEGIN IMMEDIATE transaction (see SqliteLedger.record_terminal_retry).
     """
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        lock: threading.Lock | None = None,
+    ) -> None:
         self._conn = conn
-        self._lock = threading.Lock()
+        self._lock = lock if lock is not None else threading.Lock()
         with self._lock:
             self._conn.execute(_DDL_RETRY_RATE)
+            self._conn.execute(_DDL_ONE_OPEN)
 
     def upsert(self, row: RetryRateRow) -> None:
         with self._lock:
@@ -130,6 +175,27 @@ class SqliteRetryRateStore:
                 except Exception:
                     pass
                 raise
+
+    def get_open(self, escrow_id: str) -> RetryRateRow | None:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT escrow_id, window_id, window_start, individual,"
+                " rate_limited, covered_reason, tally_flushed"
+                " FROM retry_rate_windows"
+                " WHERE escrow_id = ? AND tally_flushed = 0",
+                (escrow_id,),
+            ).fetchone()
+        if r is None:
+            return None
+        return RetryRateRow(
+            escrow_id=r[0],
+            window_id=r[1],
+            window_start=float(r[2]),
+            individual=int(r[3]),
+            rate_limited=int(r[4]),
+            covered_reason=r[5] or "",
+            tally_flushed=bool(r[6]),
+        )
 
     def load_all(self) -> list[RetryRateRow]:
         with self._lock:
