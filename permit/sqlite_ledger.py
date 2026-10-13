@@ -842,114 +842,112 @@ class SqliteLedger:
                     self._cache_receipt_unlocked(denial)
                     return already_reason, denial
 
-                # Over-limit: drop the ensure snapshot before taking the
-                # sidecar flock. Lock order is always flock → SQL write txn
-                # on a *fresh* connection so we never compare the sidecar to
-                # a stale WAL snapshot held on self._conn.
+                # Over-limit: drop the ensure snapshot, release self._lock,
+                # then flock → fresh write conn. Holding the ledger lock
+                # across flock/SQL would block other escrows (bar 4).
                 self._conn.execute("COMMIT")
                 for r in cached:
                     self._cache_receipt_unlocked(r)
                 cached.clear()
-                with high_water_lock(escrow_id, wid) as hwlock:
-                    wconn = sqlite3.connect(
-                        self._path,
-                        isolation_level=None,
-                        check_same_thread=False,
-                    )
-                    try:
-                        wconn.execute("PRAGMA busy_timeout=30000")
-                        wconn.execute("BEGIN IMMEDIATE")
-                        open2 = wconn.execute(
-                            "SELECT rate_limited, rate_mac, prev_rate_mac"
-                            " FROM retry_rate_windows"
-                            " WHERE escrow_id = ? AND window_id = ?"
-                            " AND tally_flushed = 0",
-                            (escrow_id, wid),
-                        ).fetchone()
-                        if open2 is None:
-                            wconn.execute("ROLLBACK")
-                            raise RuntimeError(
-                                "open window disappeared under high-water "
-                                f"lock escrow_id={escrow_id!r} "
-                                f"window_id={wid!r}"
-                            )
-                        rlim2 = int(open2[0])
-                        cur_mac2 = open2[1] or ""
-                        prev_mac2 = open2[2] or ""
-                        hwlock.check(rlim2)
-                        anchor_row = wconn.execute(
-                            "SELECT hash FROM receipts"
-                            " WHERE event_type = 'REFUSED'"
-                            " AND refusal_kind = 'already'"
-                            " AND escrow_id = ? AND window_id = ?"
-                            " ORDER BY seq DESC LIMIT 1",
-                            (escrow_id, wid),
-                        ).fetchone()
-                        anchor = anchor_row[0] if anchor_row else None
-                        verify_rate_limited_mac(
-                            anchor,
-                            escrow_id,
-                            wid,
-                            rlim2,
-                            cur_mac2,
-                            prev_mac=prev_mac2,
-                            high_water=rlim2,
-                            check_sidecar=False,
-                        )
-                        new_rl = rlim2 + 1
-                        new_mac = rate_limited_mac(
-                            anchor,
-                            escrow_id,
-                            wid,
-                            new_rl,
-                            prev_mac=cur_mac2,
-                            high_water=new_rl,
-                        )
-                        cur = wconn.execute(
-                            "UPDATE retry_rate_windows"
-                            " SET rate_limited = ?,"
-                            " rate_mac = ?,"
-                            " prev_rate_mac = ?,"
-                            " covered_reason = ?"
-                            " WHERE escrow_id = ? AND window_id = ?"
-                            " AND tally_flushed = 0"
-                            " AND rate_limited = ?"
-                            " RETURNING rate_limited",
-                            (
-                                new_rl,
-                                new_mac,
-                                cur_mac2,
-                                already_reason,
-                                escrow_id,
-                                wid,
-                                rlim2,
-                            ),
-                        ).fetchone()
-                        if cur is None:
-                            wconn.execute("ROLLBACK")
-                            raise sqlite3.OperationalError(
-                                "database is locked"
-                            )
-                        wconn.execute("COMMIT")
-                        # SQL durable first; raise sidecar under the same
-                        # flock. Crash here leaves sidecar exactly one
-                        # behind — next honest step reconciles.
-                        hwlock.set(int(cur[0]))
-                    except Exception:
-                        try:
-                            wconn.execute("ROLLBACK")
-                        except Exception:
-                            pass
-                        raise
-                    finally:
-                        wconn.close()
-                return "rate_limited", None
             except Exception:
                 try:
                     self._conn.execute("ROLLBACK")
                 except Exception:
                     pass
                 raise
+            # Fall through outside self._lock.
+        return self._increment_rate_limited_unlocked(
+            escrow_id, wid, already_reason
+        )
+
+    def _increment_rate_limited_unlocked(
+        self,
+        escrow_id: str,
+        wid: str,
+        already_reason: str,
+    ) -> tuple[str, Receipt | None]:
+        """
+        Over-limit increment. Lock order: per-window flock → ledger lock →
+        BEGIN IMMEDIATE → UPDATE → COMMIT → raise sidecar. Flock is per
+        (escrow, window), so a flood on escrow A does not wait on B's flock;
+        the ledger lock is held only for the short SQL write (bar 4).
+        """
+        with high_water_lock(escrow_id, wid) as hwlock:
+            with self._lock:
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    open2 = self._conn.execute(
+                        "SELECT rate_limited, rate_mac, prev_rate_mac"
+                        " FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?"
+                        " AND tally_flushed = 0",
+                        (escrow_id, wid),
+                    ).fetchone()
+                    if open2 is None:
+                        self._conn.execute("ROLLBACK")
+                        raise RuntimeError(
+                            "open window disappeared under high-water "
+                            f"lock escrow_id={escrow_id!r} "
+                            f"window_id={wid!r}"
+                        )
+                    rlim2 = int(open2[0])
+                    cur_mac2 = open2[1] or ""
+                    prev_mac2 = open2[2] or ""
+                    hwlock.check(rlim2)
+                    anchor = self._latest_denial_hash_unlocked(escrow_id, wid)
+                    verify_rate_limited_mac(
+                        anchor,
+                        escrow_id,
+                        wid,
+                        rlim2,
+                        cur_mac2,
+                        prev_mac=prev_mac2,
+                        high_water=rlim2,
+                        check_sidecar=False,
+                    )
+                    new_rl = rlim2 + 1
+                    new_mac = rate_limited_mac(
+                        anchor,
+                        escrow_id,
+                        wid,
+                        new_rl,
+                        prev_mac=cur_mac2,
+                        high_water=new_rl,
+                    )
+                    cur = self._conn.execute(
+                        "UPDATE retry_rate_windows"
+                        " SET rate_limited = ?,"
+                        " rate_mac = ?,"
+                        " prev_rate_mac = ?,"
+                        " covered_reason = ?"
+                        " WHERE escrow_id = ? AND window_id = ?"
+                        " AND tally_flushed = 0"
+                        " AND rate_limited = ?"
+                        " RETURNING rate_limited",
+                        (
+                            new_rl,
+                            new_mac,
+                            cur_mac2,
+                            already_reason,
+                            escrow_id,
+                            wid,
+                            rlim2,
+                        ),
+                    ).fetchone()
+                    if cur is None:
+                        self._conn.execute("ROLLBACK")
+                        raise sqlite3.OperationalError("database is locked")
+                    self._conn.execute("COMMIT")
+                    committed = int(cur[0])
+                except Exception:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+            # Sidecar after SQL commit; still under flock.
+            hwlock.set(committed)
+        return "rate_limited", None
 
     def _ensure_open_window_unlocked(
         self,

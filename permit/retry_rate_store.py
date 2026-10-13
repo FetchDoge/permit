@@ -57,6 +57,10 @@ _DEMO_MAC_KEY = b"demo-retry-rate-mac-key-NOT-FOR-PRODUCTION!!"  # 42 bytes
 
 _mac_key_cache: bytes | None = None
 _hw_path_cache: str | None = None
+# Process-local high-water cache (keyed by escrow|window). Speeds same-process
+# threaded checks; flock + file remain authoritative across processes.
+_hw_mem: dict[str, int] = {}
+_hw_mem_guard = threading.Lock()
 
 
 class RetryRateIntegrityError(RuntimeError):
@@ -147,6 +151,8 @@ def clear_retry_rate_mac_key_cache() -> None:
     global _mac_key_cache, _hw_path_cache
     _mac_key_cache = None
     _hw_path_cache = None
+    with _hw_mem_guard:
+        _hw_mem.clear()
 
 
 def retry_rate_hw_path(*, refresh: bool = False) -> str:
@@ -261,6 +267,11 @@ def _write_hw_int_unlocked(fh, value: int) -> None:
 
 def get_high_water(escrow_id: str, window_id: str) -> int:
     """Read the sidecar high-water for (escrow, window). Missing → 0."""
+    mk = _hw_map_key(escrow_id, window_id)
+    with _hw_mem_guard:
+        cached = _hw_mem.get(mk)
+        if cached is not None:
+            return cached
     path = _hw_entry_path(escrow_id, window_id)
     if not os.path.exists(path):
         return 0
@@ -269,10 +280,16 @@ def get_high_water(escrow_id: str, window_id: str) -> int:
         if fcntl is not None:
             fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
         try:
-            return _read_hw_int_unlocked(fh)
+            val = _read_hw_int_unlocked(fh)
         finally:
             if fcntl is not None:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    with _hw_mem_guard:
+        cur = _hw_mem.get(mk, 0)
+        if val > cur:
+            _hw_mem[mk] = val
+            return val
+        return cur
 
 
 def set_high_water(escrow_id: str, window_id: str, value: int) -> int:
@@ -297,6 +314,13 @@ def set_high_water(escrow_id: str, window_id: str, value: int) -> int:
         finally:
             if fcntl is not None:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    with _hw_mem_guard:
+        mk = _hw_map_key(escrow_id, window_id)
+        prev = _hw_mem.get(mk, 0)
+        if cur > prev:
+            _hw_mem[mk] = cur
+        else:
+            cur = prev
     return cur
 
 
@@ -488,7 +512,14 @@ class high_water_lock:
 
     def get(self) -> int:
         assert self._fh is not None
-        return _read_hw_int_unlocked(self._fh)
+        file_val = _read_hw_int_unlocked(self._fh)
+        with _hw_mem_guard:
+            mk = _hw_map_key(self.escrow_id, self.window_id)
+            mem = _hw_mem.get(mk, 0)
+            if file_val > mem:
+                _hw_mem[mk] = file_val
+                return file_val
+            return max(file_val, mem)
 
     def set(self, value: int) -> int:
         assert self._fh is not None
@@ -500,6 +531,13 @@ class high_water_lock:
         mode = os.stat(self._path).st_mode & 0o777
         if mode & 0o077:
             os.chmod(self._path, 0o600)
+        with _hw_mem_guard:
+            mk = _hw_map_key(self.escrow_id, self.window_id)
+            prev = _hw_mem.get(mk, 0)
+            if cur > prev:
+                _hw_mem[mk] = cur
+            else:
+                cur = max(cur, prev)
         return cur
 
     def check(self, db_count: int) -> int:

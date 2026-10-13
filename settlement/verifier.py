@@ -893,6 +893,9 @@ class ReleaseVerifier:
                     open_row.rate_limited,
                     open_row.rate_mac,
                     prev_mac=open_row.prev_rate_mac,
+                    # Sidecar checked on over-limit increment / tally;
+                    # skip file I/O on the individual-denial hot path (bar 4).
+                    check_sidecar=False,
                 )
                 if open_row.individual != expected:
                     raise RetryRateIntegrityError(
@@ -972,32 +975,34 @@ class ReleaseVerifier:
                 state.rate_limited,
                 side_mac,
                 prev_mac=side_prev,
+                check_sidecar=False,
             )
             prev_for_new = side_mac
-            state.rate_limited += 1
-            new_mac = rate_limited_mac(
-                anchor,
-                escrow_id,
-                state.window_id,
-                state.rate_limited,
-                prev_mac=prev_for_new,
-                high_water=int(state.rate_limited),
-            )
-            self._persist_rate_window(
-                escrow_id,
-                state,
-                rate_mac=new_mac,
-                prev_rate_mac=prev_for_new,
-            )
-            # Re-read after persist so HW never tracks a clobbered-away count.
-            side_now = self._rate_store.get_open(escrow_id)
-            hw_val = (
-                int(side_now.rate_limited)
-                if side_now is not None
-                and side_now.window_id == state.window_id
-                else int(state.rate_limited)
-            )
             with high_water_lock(escrow_id, state.window_id) as hwlock:
+                hwlock.check(int(state.rate_limited))
+                state.rate_limited += 1
+                new_mac = rate_limited_mac(
+                    anchor,
+                    escrow_id,
+                    state.window_id,
+                    state.rate_limited,
+                    prev_mac=prev_for_new,
+                    high_water=int(state.rate_limited),
+                )
+                self._persist_rate_window(
+                    escrow_id,
+                    state,
+                    rate_mac=new_mac,
+                    prev_rate_mac=prev_for_new,
+                )
+                # Re-read after persist so HW never tracks a clobbered-away count.
+                side_now = self._rate_store.get_open(escrow_id)
+                hw_val = (
+                    int(side_now.rate_limited)
+                    if side_now is not None
+                    and side_now.window_id == state.window_id
+                    else int(state.rate_limited)
+                )
                 hwlock.set(hw_val)
             return VerifyResult(False, "rate_limited")
 
