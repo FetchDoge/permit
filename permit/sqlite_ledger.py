@@ -19,6 +19,7 @@ import sqlite3
 import threading
 
 from .ledger import GENESIS_HASH, Receipt, _canonical, _utcnow_iso
+from .retry_rate_store import SqliteRetryRateStore
 
 
 _DDL_TABLE = """
@@ -137,6 +138,22 @@ class SqliteLedger:
                 raise RuntimeError(
                     "restored chain failed verification: %s" % (detail,)
                 )
+            # F7 side store: outside the hash chain. File-backed ledgers use a
+            # dedicated connection so rate upserts do not contend with receipt
+            # appends (WAL). :memory: cannot share pages across connections, so
+            # it keeps an in-process store (still crash-volatile either way).
+            if path == ":memory:":
+                from .retry_rate_store import InMemoryRetryRateStore
+
+                self._rate_conn = None
+                self.retry_rate_store = InMemoryRetryRateStore()
+            else:
+                self._rate_conn = sqlite3.connect(
+                    path, isolation_level=None, check_same_thread=False
+                )
+                self._rate_conn.execute("PRAGMA journal_mode=WAL")
+                self._rate_conn.execute("PRAGMA synchronous=FULL")
+                self.retry_rate_store = SqliteRetryRateStore(self._rate_conn)
         except Exception:
             self._conn.close()
             raise
@@ -269,6 +286,9 @@ class SqliteLedger:
         """Close the database connection. The instance must not be used after."""
         with self._lock:
             self._conn.close()
+            rate_conn = getattr(self, "_rate_conn", None)
+            if rate_conn is not None:
+                rate_conn.close()
 
 
 def fold_receipts(receipts: list[Receipt]) -> "PermitStore":

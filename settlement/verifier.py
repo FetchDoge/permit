@@ -47,20 +47,23 @@ from typing import Callable
 
 from permit.ledger import Ledger, Receipt
 from permit.permit import PermitStore
+from permit.retry_rate_store import (
+    InMemoryRetryRateStore,
+    RetryRateRow,
+)
 
 from .paypal_client import PayPalClient, PayPalTimeout, Capture
 
 # REA F7: per-escrow retry denial rate limit.
 #   N = max individual F6 denial receipts per escrow per window
 #   W = window length (seconds, wall clock)
-#   B = tally batch: append-only rate_limited tally every B over-limit
-#       retries (plus flush of any remainder on window close / explicit
-#       flush). Earlier receipt hashes never change. On crash, at most
-#       B-1 over-limit retries may lack a durable tally (the unflushed
-#       in-memory remainder). Configurable on ReleaseVerifier(...).
+# Over-limit counts live in a side store outside the hash chain (SqliteLedger
+# table, durable on each increment). Exactly one combined rate_limited tally
+# receipt is appended per escrow per window — on window close, clean
+# shutdown (flush_retry_rate_limits), or restart rebuild of an expired
+# window. Earlier receipt hashes never change. Log growth ≤ N+1 per window.
 DEFAULT_RETRY_RATE_LIMIT_N = 100
 DEFAULT_RETRY_RATE_LIMIT_W = 60.0  # seconds
-DEFAULT_RETRY_TALLY_BATCH = 100
 
 
 class PredicateType(str, Enum):
@@ -73,11 +76,11 @@ class _RetryRateWindow:
     """Per-escrow window for F6 retry denials (F7 rate limit)."""
 
     window_id: str
-    window_start: float  # wall-clock seconds (time.time)
+    window_start: float  # wall-clock seconds
     individual: int = 0
     rate_limited: int = 0  # total over-limit retries this window
-    unflushed: int = 0  # over-limits since last durable tally
     last_already_reason: str = ""
+    tally_flushed: bool = False
 
 
 @dataclass
@@ -159,7 +162,6 @@ class ReleaseVerifier:
         *,
         retry_rate_limit_n: int = DEFAULT_RETRY_RATE_LIMIT_N,
         retry_rate_limit_w: float = DEFAULT_RETRY_RATE_LIMIT_W,
-        retry_tally_batch: int = DEFAULT_RETRY_TALLY_BATCH,
         clock: Callable[[], float] | None = None,
         # Deprecated alias kept for call-site compat; prefer `clock`.
         monotonic: Callable[[], float] | None = None,
@@ -174,21 +176,21 @@ class ReleaseVerifier:
             raise ValueError("retry_rate_limit_n must be >= 0")
         if retry_rate_limit_w <= 0:
             raise ValueError("retry_rate_limit_w must be > 0")
-        if retry_tally_batch < 1:
-            raise ValueError("retry_tally_batch must be >= 1")
         self.retry_rate_limit_n = retry_rate_limit_n
         self.retry_rate_limit_w = retry_rate_limit_w
-        self.retry_tally_batch = retry_tally_batch
-        # Wall clock for window boundaries (survives restart semantics).
         self._clock = clock or monotonic or time.time
-        # escrow_id -> hash of first original REFUSED (else escrow VOIDED).
         self._original_refusal_by_escrow: dict[str, str] = {}
-        # escrow_id -> current rate-limit window state (F7).
         self._retry_rate_windows: dict[str, _RetryRateWindow] = {}
-        # Per-escrow locks for rate-limit counting; ledger lock only on append.
         self._rate_locks: dict[str, threading.Lock] = {}
         self._rate_locks_guard = threading.Lock()
-        self._rebuild_retry_state_from_ledger()
+        # Terminal escrow_id -> already_refused/already_voided. Written when
+        # an escrow first becomes REFUSED/VOIDED; read lock-free so a flood
+        # of retries on one escrow never contends on self._lock.
+        self._terminal_reasons: dict[str, str] = {}
+        # Side store outside the hash chain (Sqlite table when available).
+        store = getattr(self.ledger, "retry_rate_store", None)
+        self._rate_store = store if store is not None else InMemoryRetryRateStore()
+        self._rebuild_retry_state()
 
     def register(self, escrow: Escrow) -> Receipt:
         """Register an escrow hold. Returns the AUTHORIZED receipt."""
@@ -219,71 +221,64 @@ class ReleaseVerifier:
                 self._rate_locks[escrow_id] = lock
             return lock
 
-    def _rebuild_retry_state_from_ledger(self) -> None:
-        """
-        Rebuild original_refusal_id index and in-window rate-limit counters
-        from the append-only ledger (restart / crash recovery).
-        """
+    def _persist_rate_window(self, escrow_id: str, state: _RetryRateWindow) -> None:
+        """Write window counters to the side store (durable on Sqlite)."""
+        self._rate_store.upsert(
+            RetryRateRow(
+                escrow_id=escrow_id,
+                window_id=state.window_id,
+                window_start=state.window_start,
+                individual=state.individual,
+                rate_limited=state.rate_limited,
+                covered_reason=state.last_already_reason,
+                tally_flushed=state.tally_flushed,
+            )
+        )
+
+    def _rebuild_original_refusals_from_ledger(self) -> None:
         originals: dict[str, str] = {}
-        # escrow_id -> window_id -> accumulated state from durable receipts
-        by_window: dict[str, dict[str, _RetryRateWindow]] = {}
         for r in self.ledger.receipts():
             eid = r.payload.get("escrow_id")
-            if not isinstance(eid, str):
+            if not isinstance(eid, str) or eid in originals:
                 continue
             if r.event_type == "REFUSED":
                 reason = r.payload.get("reason", "")
                 if reason == "rate_limited":
-                    wid = r.payload.get("window_id")
-                    wstart = r.payload.get("window_start")
-                    cnt = r.payload.get("count", 0)
-                    if not isinstance(wid, str) or not isinstance(wstart, (int, float)):
-                        continue
-                    try:
-                        count = int(cnt)
-                    except (TypeError, ValueError):
-                        continue
-                    buckets = by_window.setdefault(eid, {})
-                    st = buckets.get(wid)
-                    if st is None:
-                        st = _RetryRateWindow(
-                            window_id=wid, window_start=float(wstart)
-                        )
-                        buckets[wid] = st
-                    st.rate_limited += count
-                    covered = r.payload.get("covered_reason")
-                    if isinstance(covered, str) and covered:
-                        st.last_already_reason = covered
-                elif isinstance(reason, str) and reason.startswith("already_"):
-                    wid = r.payload.get("window_id")
-                    wstart = r.payload.get("window_start")
-                    if not isinstance(wid, str) or not isinstance(wstart, (int, float)):
-                        continue
-                    buckets = by_window.setdefault(eid, {})
-                    st = buckets.get(wid)
-                    if st is None:
-                        st = _RetryRateWindow(
-                            window_id=wid, window_start=float(wstart)
-                        )
-                        buckets[wid] = st
-                    st.individual += 1
-                    st.last_already_reason = reason
-                else:
-                    if eid not in originals:
-                        originals[eid] = r.hash
-            elif r.event_type == "VOIDED" and eid not in originals:
+                    continue
+                if isinstance(reason, str) and reason.startswith("already_"):
+                    continue
                 originals[eid] = r.hash
-
+            elif r.event_type == "VOIDED":
+                originals[eid] = r.hash
         self._original_refusal_by_escrow = originals
+
+    def _rebuild_retry_state(self) -> None:
+        """
+        Rebuild original_refusal_id from the ledger and rate-limit windows
+        from the side store. Expired windows with an unflushed over-limit
+        count get exactly one tally receipt appended (restart materialization).
+        Still-open windows restore counters into memory (no reset).
+        """
+        self._rebuild_original_refusals_from_ledger()
         now = self._clock()
         restored: dict[str, _RetryRateWindow] = {}
-        for eid, buckets in by_window.items():
-            # Prefer the latest still-open window; otherwise leave unset
-            # (a new window opens on the next retry).
-            latest = max(buckets.values(), key=lambda s: s.window_start)
-            if (now - latest.window_start) < self.retry_rate_limit_w:
-                latest.unflushed = 0  # durable tallies already on the ledger
-                restored[eid] = latest
+        for row in self._rate_store.load_all():
+            state = _RetryRateWindow(
+                window_id=row.window_id,
+                window_start=row.window_start,
+                individual=row.individual,
+                rate_limited=row.rate_limited,
+                last_already_reason=row.covered_reason,
+                tally_flushed=row.tally_flushed,
+            )
+            expired = (now - state.window_start) >= self.retry_rate_limit_w
+            if not state.tally_flushed and state.rate_limited > 0 and expired:
+                self._append_window_tally(row.escrow_id, state)
+                state.tally_flushed = True
+                self._persist_rate_window(row.escrow_id, state)
+                continue
+            if not expired and not state.tally_flushed:
+                restored[row.escrow_id] = state
         self._retry_rate_windows = restored
 
     def escrows_snapshot(self) -> list[dict]:
@@ -316,27 +311,43 @@ class ReleaseVerifier:
         else escrow-level VOIDED). O(1) via index — no log scan (REA F7)."""
         return self._original_refusal_by_escrow.get(escrow_id)
 
-    def _flush_unflushed_tally(self, escrow_id: str, state: _RetryRateWindow) -> None:
-        """Append one durable tally for state.unflushed; clears unflushed."""
-        if state.unflushed <= 0:
-            return
-        self._append_rate_limited_tally(
-            escrow_id,
-            count=state.unflushed,
-            window_id=state.window_id,
-            window_start=state.window_start,
-            already_reason=state.last_already_reason,
+    def _append_window_tally(
+        self, escrow_id: str, state: _RetryRateWindow
+    ) -> Receipt | None:
+        """Append the single combined tally for this window (once)."""
+        if state.tally_flushed or state.rate_limited <= 0:
+            return None
+        original = self._original_refusal_id(escrow_id)
+        return self.ledger.append(
+            "REFUSED",
+            {
+                "escrow_id": escrow_id,
+                "reason": "rate_limited",
+                "count": state.rate_limited,
+                "window_id": state.window_id,
+                "window_start": state.window_start,
+                "covered_reason": state.last_already_reason,
+                "receipt_id": f"rl_{uuid.uuid4().hex}",
+                "original_refusal_id": original,
+            },
         )
-        state.unflushed = 0
+
+    def _close_rate_window(self, escrow_id: str, state: _RetryRateWindow) -> None:
+        """Append at most one tally for the window and mark it flushed."""
+        if not state.tally_flushed and state.rate_limited > 0:
+            self._append_window_tally(escrow_id, state)
+        state.tally_flushed = True
+        self._persist_rate_window(escrow_id, state)
 
     def _retry_rate_window_locked(
         self, escrow_id: str, now: float
     ) -> _RetryRateWindow:
-        """Active window for escrow_id; flushes and rolls when W has elapsed.
+        """Active window for escrow_id; closes and rolls when W has elapsed.
         Caller holds the per-escrow rate lock."""
         state = self._retry_rate_windows.get(escrow_id)
         if state is not None and (now - state.window_start) >= self.retry_rate_limit_w:
-            self._flush_unflushed_tally(escrow_id, state)
+            self._close_rate_window(escrow_id, state)
+            self._retry_rate_windows.pop(escrow_id, None)
             state = None
         if state is None:
             state = _RetryRateWindow(
@@ -344,31 +355,8 @@ class ReleaseVerifier:
                 window_start=now,
             )
             self._retry_rate_windows[escrow_id] = state
+            self._persist_rate_window(escrow_id, state)
         return state
-
-    def _append_rate_limited_tally(
-        self,
-        escrow_id: str,
-        count: int,
-        window_id: str,
-        window_start: float,
-        already_reason: str,
-    ) -> Receipt:
-        """Append-only tally: covers `count` over-limit retries since last tally."""
-        original = self._original_refusal_id(escrow_id)
-        return self.ledger.append(
-            "REFUSED",
-            {
-                "escrow_id": escrow_id,
-                "reason": "rate_limited",
-                "count": count,
-                "window_id": window_id,
-                "window_start": window_start,
-                "covered_reason": already_reason,
-                "receipt_id": f"rl_{uuid.uuid4().hex}",
-                "original_refusal_id": original,
-            },
-        )
 
     def _append_retry_denial(
         self,
@@ -393,8 +381,8 @@ class ReleaseVerifier:
 
     def flush_retry_rate_limits(self, escrow_id: str | None = None) -> None:
         """
-        Flush unflushed over-limit tallies (window close / crash / tests).
-        If escrow_id is None, flush every escrow with a pending remainder.
+        Clean-shutdown / test flush: append the one per-window tally for any
+        open window with a pending over-limit count, then clear the window.
         """
         if escrow_id is not None:
             targets = [escrow_id]
@@ -403,18 +391,17 @@ class ReleaseVerifier:
                 targets = list(self._retry_rate_windows.keys())
         for eid in targets:
             with self._rate_lock_for(eid):
-                state = self._retry_rate_windows.get(eid)
+                state = self._retry_rate_windows.pop(eid, None)
                 if state is not None:
-                    self._flush_unflushed_tally(eid, state)
+                    self._close_rate_window(eid, state)
 
     def _handle_terminal_retry(self, escrow_id: str, already_reason: str) -> VerifyResult:
         """
         REA F6 + F7: refused retry on VOIDED/REFUSED. Up to N individual
-        denial receipts per window W; further retries return rate_limited and
-        are covered by append-only tally receipts (sum of counts == covered
-        retries after flush). Does not hold the global verifier lock; uses a
-        per-escrow rate lock and takes the ledger lock only for append.
-        Never captures or changes escrow state.
+        denial receipts per window W; further retries return rate_limited.
+        Over-limit counts go to the side store (not the receipt log) until
+        the single per-window tally is appended on close/flush/restart.
+        Per-escrow rate lock only; ledger lock only for append.
         """
         with self._rate_lock_for(escrow_id):
             now = self._clock()
@@ -423,6 +410,7 @@ class ReleaseVerifier:
 
             if state.individual < self.retry_rate_limit_n:
                 state.individual += 1
+                self._persist_rate_window(escrow_id, state)
                 self._append_retry_denial(
                     escrow_id,
                     already_reason,
@@ -432,9 +420,7 @@ class ReleaseVerifier:
                 return VerifyResult(False, already_reason)
 
             state.rate_limited += 1
-            state.unflushed += 1
-            if state.unflushed >= self.retry_tally_batch:
-                self._flush_unflushed_tally(escrow_id, state)
+            self._persist_rate_window(escrow_id, state)
             return VerifyResult(False, "rate_limited")
 
     def _predicate_passes(self, escrow: Escrow, evidence: Evidence) -> tuple[bool, str]:
@@ -497,6 +483,11 @@ class ReleaseVerifier:
         void(), reconcile(), register(), and other captures proceed
         while the I/O is in flight.
         """
+        # Lock-free terminal short-circuit: flooded retries never take _lock.
+        terminal_cached = self._terminal_reasons.get(escrow_id)
+        if terminal_cached is not None:
+            return self._handle_terminal_retry(escrow_id, terminal_cached)
+
         # ---- Phase 1: decide. Verifier lock held, no provider I/O. ----
         terminal_retry_reason: str | None = None
         with self._lock:
@@ -515,6 +506,7 @@ class ReleaseVerifier:
                 # F6/F7 rate-limit path runs outside the global verifier lock
                 # (per-escrow counter lock + ledger append only).
                 terminal_retry_reason = f"already_{escrow.state.lower()}"
+                self._terminal_reasons[escrow_id] = terminal_retry_reason
             # Indeterminate states need an explicit operator step first:
             # reconcile() for UNKNOWN, retry_cleanup() for CLEANUP_PENDING.
             elif escrow.state == "UNKNOWN":
@@ -654,6 +646,10 @@ class ReleaseVerifier:
                     final_state = "VOIDED"
                 if void_ok:
                     escrow.state = final_state
+                    if final_state in ("REFUSED", "VOIDED"):
+                        self._terminal_reasons[escrow_id] = (
+                            f"already_{final_state.lower()}"
+                        )
                     if self.permits.get(permit_id) is not None:
                         # settle_void appends the VOIDED receipt (shared ledger).
                         self.permits.settle_void(permit_id, auth_id)
@@ -707,6 +703,7 @@ class ReleaseVerifier:
             _, capture, void_ok = outcome
             if void_ok:
                 escrow.state = "VOIDED"
+                self._terminal_reasons[escrow_id] = "already_voided"
                 self.permits.settle_void(permit_id, auth_id)
             else:
                 escrow.state = "CLEANUP_PENDING"
@@ -778,6 +775,7 @@ class ReleaseVerifier:
             except PayPalTimeout:
                 return ReconcileResult(False, "still_unknown")
             escrow.state = "VOIDED"
+            self._terminal_reasons[escrow_id] = "already_voided"
             receipt = self.permits.settle_void(escrow.permit_id, escrow.auth_id)
             return ReconcileResult(True, "voided", receipt=receipt)
 
@@ -796,6 +794,7 @@ class ReleaseVerifier:
             except PayPalTimeout:
                 return False
             escrow.state = "VOIDED"
+            self._terminal_reasons[escrow_id] = "already_voided"
             self.permits.settle_void(escrow.permit_id, escrow.auth_id)
             return True
 
@@ -830,6 +829,7 @@ class ReleaseVerifier:
             if escrow is None or escrow.state != "VOIDING":
                 return False
             escrow.state = "VOIDED"
+            self._terminal_reasons[escrow_id] = "already_voided"
             self.permits.settle_void(permit_id, auth_id)
             void_receipt = self.ledger.append("VOIDED", {"escrow_id": escrow_id})
             self._remember_original_refusal(escrow_id, void_receipt.hash)

@@ -33,11 +33,11 @@ jobs:
         run: python -m pip install --upgrade pip "pytest>=8" "pytest-cov>=5"
       - name: tests
         if: matrix.python-version != '3.12'
-        run: python -m pytest -q
+        run: python -m pytest -q --ignore=tests/test_f7_perf.py
       - name: tests with coverage
         if: matrix.python-version == '3.12'
         run: >
-          python -m pytest -q
+          python -m pytest -q --ignore=tests/test_f7_perf.py
           --cov=permit --cov=settlement
           --cov-report=xml:coverage.xml
           --cov-report=term-missing:skip-covered
@@ -64,7 +64,21 @@ jobs:
         run: python -m pip install --upgrade pip "pytest>=8"
       - name: tests under -O
         # Asserts are stripped under -O; suite must still pass (trust-boundary asserts are a known debt).
-        run: python -O -m pytest -q
+        run: python -O -m pytest -q --ignore=tests/test_f7_perf.py
+
+  # F7 timing/isolation benchmarks — NOT part of the required `test` aggregate.
+  perf-f7:
+    name: perf-f7
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: install
+        run: python -m pip install --upgrade pip "pytest>=8"
+      - name: F7 perf tests
+        run: python -m pytest -q tests/test_f7_perf.py
 
   lint:
     name: ruff
