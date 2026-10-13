@@ -7,8 +7,11 @@ on:
     branches: [main]
 
 # Pin the default token (CodeQL actions/missing-workflow-permissions).
-# Top-level: contents: read only. Only the CodeQL job adds
-# security-events: write. No actions: write anywhere.
+# Top-level: contents: read only. No actions: write anywhere.
+# Code scanning uses GitHub's default CodeQL setup (separate from this
+# workflow) — an advanced CodeQL job here would conflict with default setup
+# ("analyses from advanced configurations cannot be processed when the
+# default setup is enabled"). Default setup owns security-events.
 permissions:
   contents: read
 
