@@ -154,6 +154,11 @@ class ReleaseVerifier:
             },
         )
 
+    def get_escrow(self, escrow_id: str) -> Escrow | None:
+        """Read-only lookup of one escrow by id."""
+        with self._lock:
+            return self._escrows.get(escrow_id)
+
     def escrows_snapshot(self) -> list[dict]:
         """
         Read-only projection of all escrows for dashboards and operators.

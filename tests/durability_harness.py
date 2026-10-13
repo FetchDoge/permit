@@ -56,13 +56,17 @@ def test_reload_preserves_ledger_chain(tmp_path: Path):
     flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest)
     ok, reason = ledger.verify_chain()
     assert ok, reason
-    # Reload
+    n = len(ledger)
+    # Reload (must release writer lock first)
     from permit.durability import DurableLedger
+    from harness.durability_harness import _close_ledger
 
+    _close_ledger(ledger)
     ledger2 = DurableLedger(durable_dir=tmp_path)
     ok2, reason2 = ledger2.verify_chain()
     assert ok2, reason2
-    assert len(ledger2) == len(ledger), f"ledger len {len(ledger2)} != {len(ledger)}"
+    assert len(ledger2) == n, f"ledger len {len(ledger2)} != {n}"
+    _close_ledger(ledger2)
 
 
 def test_no_duplicate_authorize_on_resume(tmp_path: Path):
@@ -103,7 +107,10 @@ def test_fresh_process_resume_via_reloaded_state(tmp_path: Path):
     _, digest = _artifact()
     attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest)
     escrow_id = attempt.escrow_id
-    # Simulate restart: new objects, same dir
+    # Simulate restart: new objects, same dir (release writer lock first)
+    from harness.durability_harness import _close_ledger
+
+    _close_ledger(ledger)
     ledger2, permits2, paypal2, verifier2, flow2 = _build(tmp_path)
     permit2 = permits2.get(permit.permit_id)
     assert permit2 is not None

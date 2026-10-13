@@ -44,6 +44,13 @@ def _build(durable_dir: Path):
     return ledger, permits, paypal, verifier, flow
 
 
+def _close_ledger(ledger) -> None:
+    """Release the exclusive durable writer lock (required before reload/fork)."""
+    close = getattr(ledger, "close", None)
+    if callable(close):
+        close()
+
+
 def _grant(permits: DurablePermitStore):
     permit, _ = permits.grant(
         agent_id="durability_agent",
@@ -70,6 +77,9 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
     ledger, permits, paypal, verifier, flow = _build(durable_dir)
     permit = _grant(permits)
     permit_id = permit.permit_id
+    # Release writer lock before fork/reload so the child (and the post-kill
+    # fresh instances) can acquire exclusive ownership of durable_dir.
+    _close_ledger(ledger)
 
     # Use multiprocessing with fork for SIGKILL
     ctx = multiprocessing.get_context("fork") if "fork" in multiprocessing.get_all_start_methods() else multiprocessing.get_context()
@@ -244,7 +254,7 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
 
     time.sleep(0.2)  # let fs finish
 
-    # Fresh process reload: new objects from same dir
+    # Fresh process reload: new objects from same dir (lock free after kill).
     ledger2, permits2, paypal2, verifier2, flow2 = _build(durable_dir)
     permit2 = permits2.get(permit_id)
 
