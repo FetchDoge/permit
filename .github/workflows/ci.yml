@@ -82,7 +82,8 @@ jobs:
       - name: install
         run: python -m pip install --upgrade pip "pytest>=8"
       - name: F7 perf tests
-        run: python -m pytest -q tests/test_f7_perf.py
+        # -s so hostile ratio medians print on green runs (not only on failure).
+        run: python -m pytest -q -s tests/test_f7_perf.py
 
   lint:
     name: ruff
