@@ -38,20 +38,41 @@ from __future__ import annotations
 import hashlib
 import hmac
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Callable
 
 from permit.ledger import Ledger, Receipt
 from permit.permit import PermitStore
 
 from .paypal_client import PayPalClient, PayPalTimeout, Capture
 
+# REA F7: per-escrow retry denial rate limit. At most N individual denial
+# receipts per window of W seconds, then one aggregated rate-limited receipt
+# whose count equals the over-limit retries it covers. Configurable via
+# ReleaseVerifier(retry_rate_limit_n=..., retry_rate_limit_w=...).
+DEFAULT_RETRY_RATE_LIMIT_N = 100
+DEFAULT_RETRY_RATE_LIMIT_W = 60.0  # seconds
+
 
 class PredicateType(str, Enum):
     D = "delivery_hash"
     A = "acceptance_signature"
+
+
+@dataclass
+class _RetryRateWindow:
+    """Per-escrow sliding window for F6 retry denials (F7 rate limit)."""
+
+    window_start: float
+    individual: int = 0
+    rate_limited: int = 0
+    aggregate_seq: int | None = None
+    aggregate_payload: dict | None = None
+    last_already_reason: str = ""
 
 
 @dataclass
@@ -130,6 +151,10 @@ class ReleaseVerifier:
         paypal: PayPalClient,
         permits: PermitStore,
         ledger: Ledger | None = None,
+        *,
+        retry_rate_limit_n: int = DEFAULT_RETRY_RATE_LIMIT_N,
+        retry_rate_limit_w: float = DEFAULT_RETRY_RATE_LIMIT_W,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         self.paypal = paypal
         self.permits = permits
@@ -137,6 +162,17 @@ class ReleaseVerifier:
         self.ledger = ledger if ledger is not None else Ledger()
         self._escrows: dict[str, Escrow] = {}
         self._lock = threading.Lock()
+        if retry_rate_limit_n < 0:
+            raise ValueError("retry_rate_limit_n must be >= 0")
+        if retry_rate_limit_w <= 0:
+            raise ValueError("retry_rate_limit_w must be > 0")
+        self.retry_rate_limit_n = retry_rate_limit_n
+        self.retry_rate_limit_w = retry_rate_limit_w
+        self._monotonic = monotonic
+        # escrow_id -> hash of first original REFUSED (else escrow VOIDED).
+        self._original_refusal_by_escrow: dict[str, str] = {}
+        # escrow_id -> current rate-limit window state (F7).
+        self._retry_rate_windows: dict[str, _RetryRateWindow] = {}
 
     def register(self, escrow: Escrow) -> Receipt:
         """Register an escrow hold. Returns the AUTHORIZED receipt."""
@@ -153,6 +189,11 @@ class ReleaseVerifier:
                 "artifact_hash": escrow.artifact_hash,
             },
         )
+
+    def _remember_original_refusal(self, escrow_id: str, receipt_hash: str) -> None:
+        """Index the first terminal denial for escrow_id (O(1) retry lookup)."""
+        if escrow_id not in self._original_refusal_by_escrow:
+            self._original_refusal_by_escrow[escrow_id] = receipt_hash
 
     def escrows_snapshot(self) -> list[dict]:
         """
@@ -181,21 +222,47 @@ class ReleaseVerifier:
 
     def _original_refusal_id(self, escrow_id: str) -> str | None:
         """Hash of the first terminal denial for this escrow (original REFUSED,
-        else escrow-level VOIDED). Retry denials reference this id."""
-        original_refused: str | None = None
-        original_voided: str | None = None
-        for r in self.ledger.receipts():
-            if r.payload.get("escrow_id") != escrow_id:
-                continue
-            if r.event_type == "REFUSED":
-                reason = r.payload.get("reason", "")
-                if isinstance(reason, str) and reason.startswith("already_"):
-                    continue
-                if original_refused is None:
-                    original_refused = r.hash
-            elif r.event_type == "VOIDED" and original_voided is None:
-                original_voided = r.hash
-        return original_refused or original_voided
+        else escrow-level VOIDED). O(1) via index — no log scan (REA F7)."""
+        return self._original_refusal_by_escrow.get(escrow_id)
+
+    def _retry_rate_window(self, escrow_id: str, now: float) -> _RetryRateWindow:
+        """Return the active rate-limit window for escrow_id, rolling if needed."""
+        state = self._retry_rate_windows.get(escrow_id)
+        if state is not None and (now - state.window_start) >= self.retry_rate_limit_w:
+            # Window closed. If the ledger cannot amend an in-window aggregate
+            # (e.g. SqliteLedger), flush a deferred aggregate now.
+            if (
+                state.rate_limited > 0
+                and state.aggregate_seq is None
+                and not hasattr(self.ledger, "update_payload")
+            ):
+                self._append_rate_limited_receipt(
+                    escrow_id,
+                    count=state.rate_limited,
+                    already_reason=state.last_already_reason,
+                )
+            state = None
+        if state is None:
+            state = _RetryRateWindow(window_start=now)
+            self._retry_rate_windows[escrow_id] = state
+        return state
+
+    def _append_rate_limited_receipt(
+        self, escrow_id: str, count: int, already_reason: str
+    ) -> Receipt:
+        """One aggregated REFUSED receipt covering `count` over-limit retries."""
+        original = self._original_refusal_id(escrow_id)
+        return self.ledger.append(
+            "REFUSED",
+            {
+                "escrow_id": escrow_id,
+                "reason": "rate_limited",
+                "count": count,
+                "covered_reason": already_reason,
+                "receipt_id": f"rl_{uuid.uuid4().hex}",
+                "original_refusal_id": original,
+            },
+        )
 
     def _append_retry_denial(self, escrow_id: str, reason: str) -> Receipt:
         """REA F6: unique denial receipt for a refused retry; never captures."""
@@ -209,6 +276,39 @@ class ReleaseVerifier:
                 "original_refusal_id": original,
             },
         )
+
+    def _handle_terminal_retry(self, escrow_id: str, already_reason: str) -> VerifyResult:
+        """
+        REA F6 + F7: refused retry on VOIDED/REFUSED. Up to N individual
+        denial receipts per window W; further retries return rate_limited and
+        are covered by one aggregated receipt (count == retries covered).
+        Never captures or changes escrow state. Caller holds self._lock.
+        """
+        now = self._monotonic()
+        state = self._retry_rate_window(escrow_id, now)
+        state.last_already_reason = already_reason
+
+        if state.individual < self.retry_rate_limit_n:
+            state.individual += 1
+            self._append_retry_denial(escrow_id, already_reason)
+            return VerifyResult(False, already_reason)
+
+        state.rate_limited += 1
+        if hasattr(self.ledger, "update_payload"):
+            if state.aggregate_seq is None:
+                receipt = self._append_rate_limited_receipt(
+                    escrow_id, count=1, already_reason=already_reason
+                )
+                state.aggregate_seq = receipt.seq
+                state.aggregate_payload = dict(receipt.payload)
+            else:
+                base = state.aggregate_payload or {}
+                state.aggregate_payload = {**base, "count": state.rate_limited}
+                self.ledger.update_payload(
+                    state.aggregate_seq, dict(state.aggregate_payload)
+                )
+        # else: deferred write on window roll (append-only ledgers).
+        return VerifyResult(False, "rate_limited")
 
     def _predicate_passes(self, escrow: Escrow, evidence: Evidence) -> tuple[bool, str]:
         if escrow.predicate_type is PredicateType.D:
@@ -274,20 +374,19 @@ class ReleaseVerifier:
         with self._lock:
             escrow = self._escrows.get(escrow_id)
             if escrow is None:
-                self.ledger.append(
+                unknown_receipt = self.ledger.append(
                     "REFUSED", {"escrow_id": escrow_id, "reason": "unknown_escrow"}
                 )
+                self._remember_original_refusal(escrow_id, unknown_receipt.hash)
                 return VerifyResult(False, "unknown_escrow")
 
             # Already resolved → return the recorded outcome, never re-capture.
             if escrow.state == "CAPTURED":
                 return VerifyResult(True, "already_captured")
             if escrow.state in ("VOIDED", "REFUSED"):
-                # REA F6: every refused retry writes a unique denial receipt
-                # referencing the original refusal; money is never captured.
+                # REA F6 + F7: denial receipts with per-escrow rate limit.
                 reason = f"already_{escrow.state.lower()}"
-                self._append_retry_denial(escrow_id, reason)
-                return VerifyResult(False, reason)
+                return self._handle_terminal_retry(escrow_id, reason)
             # Indeterminate states need an explicit operator step first:
             # reconcile() for UNKNOWN, retry_cleanup() for CLEANUP_PENDING.
             if escrow.state == "UNKNOWN":
@@ -320,9 +419,10 @@ class ReleaseVerifier:
                         refused_state = "REFUSED"  # predicate refusals mark REFUSED
 
             if refuse_reason is not None:
-                self.ledger.append(
+                refused_receipt = self.ledger.append(
                     "REFUSED", {"escrow_id": escrow_id, "reason": refuse_reason}
                 )
+                self._remember_original_refusal(escrow_id, refused_receipt.hash)
                 escrow.state = "REFUSING"
             else:
                 escrow.state = "CAPTURING"
@@ -348,9 +448,11 @@ class ReleaseVerifier:
                 late_reason = self.permits.release_block_reason(permit_id)
                 if late_reason is not None:
                     # Refuse: void the hold (I/O, no verifier lock).
-                    self.ledger.append(
+                    late_receipt = self.ledger.append(
                         "REFUSED", {"escrow_id": escrow_id, "reason": late_reason}
                     )
+                    with self._lock:
+                        self._remember_original_refusal(escrow_id, late_receipt.hash)
                     outcome = (
                         "late_refused",
                         late_reason,
@@ -598,5 +700,6 @@ class ReleaseVerifier:
                 return False
             escrow.state = "VOIDED"
             self.permits.settle_void(permit_id, auth_id)
-            self.ledger.append("VOIDED", {"escrow_id": escrow_id})
+            void_receipt = self.ledger.append("VOIDED", {"escrow_id": escrow_id})
+            self._remember_original_refusal(escrow_id, void_receipt.hash)
             return True

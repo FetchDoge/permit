@@ -69,6 +69,7 @@ Permit fails closed. When state is uncertain, money does not move.
 | Void fails | The escrow waits in **CLEANUP_PENDING** with the reservation held until `retry_cleanup()` confirms the void |
 | Provider merchant, currency, or amount mismatch | The sandbox client binds `payee.merchant_id`, CAD, and amount to the operation and refuses a mismatch (`PERMIT_PAYPAL_MERCHANT_ID`) |
 | Tampered delivery evidence | Release refused, hold voided |
+| Retry on already REFUSED/VOIDED escrow | Denial receipt (F6); per-escrow rate limit **N=100** individual denials per window **W=60s** (F7 defaults, configurable on `ReleaseVerifier`). Further retries return `rate_limited` and are covered by one aggregated receipt whose `count` equals the retries it covers — nothing is released or captured |
 
 **What it does not defend (production boundaries):**
 - With `--db PATH`, the SQLite ledger is durable (#24): survives crashes, restarts and a second writer on one machine; after some crashes an operator step is needed (rate unmeasured). Durable mode restores permits and reservations from receipts, but does not restore escrows, pending ops, or approvals (F3). Default (in-memory) mode still loses permits, escrows, revocations, and the ledger on restart.
