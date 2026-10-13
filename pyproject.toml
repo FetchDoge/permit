@@ -12,10 +12,26 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest>=8", "pytest-cov>=5"]
+lint = ["ruff>=0.8"]
+security = ["bandit>=1.7", "pip-audit>=2.7"]
 
 [tool.setuptools.packages.find]
 include = ["permit*", "settlement*", "agent*", "scenarios*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "sandbox_live: hits PayPal sandbox; skipped without PERMIT_PAYPAL_* creds",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# Classic default gate; CI lint job is continue-on-error until the baseline is cleared.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "demos", "docs"]
