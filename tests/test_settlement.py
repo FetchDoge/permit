@@ -285,33 +285,70 @@ def test_retry_denial_receipts_serial_and_parallel():
     assert escrow.state == "REFUSED"
 
 
-def _rate_limited_receipts(ledger):
-    return [
+def _rate_limited_receipts(ledger, escrow_id: str | None = None):
+    out = [
         r
         for r in ledger.receipts()
         if r.event_type == "REFUSED" and r.payload.get("reason") == "rate_limited"
     ]
+    if escrow_id is not None:
+        out = [r for r in out if r.payload.get("escrow_id") == escrow_id]
+    return out
 
 
-def _refuse_escrow(verifier, artifact=b"tampered"):
+def _tally_count_sum(ledger, escrow_id: str) -> int:
+    return sum(int(r.payload["count"]) for r in _rate_limited_receipts(ledger, escrow_id))
+
+
+def _refuse_escrow(verifier, escrow_id: str = "esc_1", artifact=b"tampered"):
     result = verifier.verify_and_capture(
-        "esc_1", Evidence(delivered_bytes=artifact)
+        escrow_id, Evidence(delivered_bytes=artifact)
     )
     assert not result.released
     return result
 
 
+def _second_escrow(verifier, paypal, permits, escrow_a, escrow_id: str = "esc_2"):
+    check = permits.check(escrow_a.permit_id, 1000, "merchant_1")
+    assert check.allowed
+    auth2 = check.receipt.payload["auth_id"]
+    pp_auth2 = paypal.authorize(1000, "merchant_1")
+    escrow_b = Escrow(
+        escrow_id=escrow_id,
+        permit_id=escrow_a.permit_id,
+        auth_id=auth2,
+        paypal_auth_id=pp_auth2.auth_id,
+        amount_cents=1000,
+        merchant_id="merchant_1",
+        predicate_type=PredicateType.D,
+        artifact_hash=escrow_a.artifact_hash,
+    )
+    verifier.register(escrow_b)
+    return escrow_b
+
+
+def _max_rate_growth(n: int, over_limit: int, batch: int) -> int:
+    """N individual denials + ceil(over_limit / batch) append-only tallies."""
+    import math
+
+    tallies = 0 if over_limit <= 0 else math.ceil(over_limit / batch)
+    return n + tallies
+
+
 def test_retry_rate_limit_flood_serial():
-    """REA F7: 10_000 serial retries on one refused escrow grow the log by at
-    most N individual denials + one aggregated rate-limited receipt; count
-    equals covered retries; nothing captured; chain valid."""
+    """REA F7: 10_000 serial retries — bounded append-only growth, exact tally
+    sum, nothing captured, chain valid, prior hashes stable."""
+    import math
+
     import settlement.verifier as vmod
 
     n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    batch = getattr(vmod, "DEFAULT_RETRY_TALLY_BATCH", 100)
     verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
     _refuse_escrow(verifier)
     assert escrow.state == "REFUSED"
     captures_before = len(paypal.capture_calls)
+    hashes_before = [r.hash for r in verifier.ledger.receipts()]
     before = len(verifier.ledger)
 
     reasons = []
@@ -323,32 +360,40 @@ def test_retry_rate_limit_flood_serial():
         assert result.capture is None
         reasons.append(result.reason)
 
+    verifier.flush_retry_rate_limits("esc_1")
+    over = 10_000 - n
     assert reasons[:n] == ["already_refused"] * n
     assert all(r == "rate_limited" for r in reasons[n:])
     growth = len(verifier.ledger) - before
-    assert growth <= n + 1, f"log grew by {growth}, want <= {n + 1}"
-    assert growth == n + 1
+    assert growth <= _max_rate_growth(n, over, batch), (
+        f"log grew by {growth}, want <= {_max_rate_growth(n, over, batch)}"
+    )
     assert len(_retry_denials(verifier.ledger)) == n
-    rl = _rate_limited_receipts(verifier.ledger)
-    assert len(rl) == 1
-    assert rl[0].payload["count"] == 10_000 - n
-    assert rl[0].payload["count"] == reasons.count("rate_limited")
+    assert _tally_count_sum(verifier.ledger, "esc_1") == over
     assert len(paypal.capture_calls) == captures_before == 0
     assert escrow.state == "REFUSED"
+    # Earlier receipt hashes never change (append-only; no rewrite).
+    after_hashes = [r.hash for r in verifier.ledger.receipts()]
+    assert after_hashes[: len(hashes_before)] == hashes_before
     ok, reason = verifier.ledger.verify_chain()
     assert ok, reason
+    # Sanity: batching actually bounded the tally count.
+    rl = _rate_limited_receipts(verifier.ledger, "esc_1")
+    assert len(rl) == math.ceil(over / batch)
 
 
 def test_retry_rate_limit_flood_concurrent():
-    """REA F7: 10_000 retries across 8 threads — same N+1 bound and exact count."""
+    """REA F7: 10_000 retries across 8 threads — same bound and exact count."""
     import threading
 
     import settlement.verifier as vmod
 
     n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    batch = getattr(vmod, "DEFAULT_RETRY_TALLY_BATCH", 100)
     verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
     _refuse_escrow(verifier)
     captures_before = len(paypal.capture_calls)
+    hashes_before = [r.hash for r in verifier.ledger.receipts()]
     before = len(verifier.ledger)
 
     n_threads = 8
@@ -380,75 +425,75 @@ def test_retry_rate_limit_flood_concurrent():
     for t in threads:
         t.join()
     assert errors == []
+    verifier.flush_retry_rate_limits("esc_1")
+    over = 10_000 - n
     assert len(reasons) == 10_000
     assert reasons.count("already_refused") == n
-    assert reasons.count("rate_limited") == 10_000 - n
+    assert reasons.count("rate_limited") == over
     growth = len(verifier.ledger) - before
-    assert growth <= n + 1
-    assert growth == n + 1
-    rl = _rate_limited_receipts(verifier.ledger)
-    assert len(rl) == 1
-    assert rl[0].payload["count"] == 10_000 - n
+    assert growth <= _max_rate_growth(n, over, batch)
+    assert _tally_count_sum(verifier.ledger, "esc_1") == over
     assert len(paypal.capture_calls) == captures_before == 0
     assert escrow.state == "REFUSED"
+    after_hashes = [r.hash for r in verifier.ledger.receipts()]
+    assert after_hashes[: len(hashes_before)] == hashes_before
     ok, reason = verifier.ledger.verify_chain()
     assert ok, reason
 
 
 def test_retry_rate_limit_isolation_between_escrows():
-    """REA F7: flooding escrow A does not rate-limit or slow escrow B."""
+    """REA F7: flooding A does not rate-limit B; B's median stays within 2x baseline."""
+    import statistics
     import threading
     import time
 
     import settlement.verifier as vmod
 
     n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    batch = getattr(vmod, "DEFAULT_RETRY_TALLY_BATCH", 100)
     verifier, paypal, permits, escrow_a, artifact = _setup(PredicateType.D)
-    # Second escrow on the same permit.
-    check = permits.check(escrow_a.permit_id, 1000, "merchant_1")
-    assert check.allowed
-    auth2 = check.receipt.payload["auth_id"]
-    pp_auth2 = paypal.authorize(1000, "merchant_1")
-    escrow_b = Escrow(
-        escrow_id="esc_2",
-        permit_id=escrow_a.permit_id,
-        auth_id=auth2,
-        paypal_auth_id=pp_auth2.auth_id,
-        amount_cents=1000,
-        merchant_id="merchant_1",
-        predicate_type=PredicateType.D,
-        artifact_hash=escrow_a.artifact_hash,
-    )
-    verifier.register(escrow_b)
+    escrow_b = _second_escrow(verifier, paypal, permits, escrow_a)
 
     verifier.verify_and_capture("esc_1", Evidence(delivered_bytes=b"tampered"))
     verifier.verify_and_capture("esc_2", Evidence(delivered_bytes=b"tampered"))
     assert escrow_a.state == "REFUSED" and escrow_b.state == "REFUSED"
 
+    evidence = Evidence(delivered_bytes=artifact)
+
+    def _median_b(samples: int = 30) -> float:
+        times = []
+        for _ in range(samples):
+            t0 = time.perf_counter_ns()
+            r = verifier.verify_and_capture("esc_2", evidence)
+            t1 = time.perf_counter_ns()
+            assert not r.released
+            assert r.reason == "already_refused"
+            times.append(t1 - t0)
+        return statistics.median(times)
+
+    baseline_b = _median_b()
+
     before = len(verifier.ledger)
-    # Flood A while B takes a handful of retries.
-    b_reasons: list[str] = []
     errors: list[BaseException] = []
+    b_during: list[float] = []
 
     def flood_a():
         try:
             for _ in range(10_000):
-                r = verifier.verify_and_capture(
-                    "esc_1", Evidence(delivered_bytes=artifact)
-                )
+                r = verifier.verify_and_capture("esc_1", evidence)
                 assert not r.released
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
     def poke_b():
         try:
-            time.sleep(0.01)
-            for _ in range(5):
-                r = verifier.verify_and_capture(
-                    "esc_2", Evidence(delivered_bytes=artifact)
-                )
+            for _ in range(40):
+                t0 = time.perf_counter_ns()
+                r = verifier.verify_and_capture("esc_2", evidence)
+                t1 = time.perf_counter_ns()
                 assert not r.released
-                b_reasons.append(r.reason)
+                assert r.reason == "already_refused"
+                b_during.append(t1 - t0)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -459,61 +504,203 @@ def test_retry_rate_limit_isolation_between_escrows():
     t_a.join()
     t_b.join()
     assert errors == []
-    assert b_reasons == ["already_refused"] * 5
+    verifier.flush_retry_rate_limits("esc_1")
+    over = 10_000 - n
     growth = len(verifier.ledger) - before
-    # A's N+1 plus B's 5 individual denials.
-    assert growth == (n + 1) + 5
-    rl_a = [
-        r
-        for r in _rate_limited_receipts(verifier.ledger)
-        if r.payload.get("escrow_id") == "esc_1"
-    ]
-    rl_b = [
-        r
-        for r in _rate_limited_receipts(verifier.ledger)
-        if r.payload.get("escrow_id") == "esc_2"
-    ]
-    assert len(rl_a) == 1 and rl_a[0].payload["count"] == 10_000 - n
-    assert rl_b == []
+    # A's bounded growth + B's individual denials during the poke.
+    assert growth <= _max_rate_growth(n, over, batch) + len(b_during)
+    assert _tally_count_sum(verifier.ledger, "esc_1") == over
+    assert _rate_limited_receipts(verifier.ledger, "esc_2") == []
+    median_during = statistics.median(b_during)
+    assert median_during <= 2.0 * baseline_b, (
+        f"B median during flood={median_during} exceeds 2x baseline={baseline_b}"
+    )
     ok, reason = verifier.ledger.verify_chain()
     assert ok, reason
 
 
-def test_retry_refusal_index_benchmark():
-    """REA F7: with an escrow-id refusal index, median retry with 100k receipts
-    is at most 2x the median with 100 receipts (no full-log scan)."""
+def test_retry_refusal_index_benchmark_over_limit():
+    """REA F7: over-limit retry median with 100k receipts is at most 2x with 100."""
     import statistics
     import time
 
-    def _median_retry_ns(pad: int) -> float:
+    import settlement.verifier as vmod
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+
+    def _median_over_limit_ns(pad: int) -> float:
         verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
         _refuse_escrow(verifier)
-        # Pad the ledger with unrelated receipts after the original refusal so
-        # a scan-based lookup would pay O(pad) per retry.
         for i in range(pad):
             verifier.ledger.append(
                 "BLOCKED",
                 {"escrow_id": f"pad_{i}", "reason": "benchmark_pad"},
             )
-        samples = []
         evidence = Evidence(delivered_bytes=artifact)
-        # Warm once, then measure.
-        verifier.verify_and_capture("esc_1", evidence)
+        # Exhaust the individual-denial budget so samples are over-limit.
+        for _ in range(n):
+            r = verifier.verify_and_capture("esc_1", evidence)
+            assert r.reason == "already_refused"
+        # Warm one over-limit path.
+        warm = verifier.verify_and_capture("esc_1", evidence)
+        assert warm.reason == "rate_limited"
+        samples = []
         for _ in range(40):
             t0 = time.perf_counter_ns()
             result = verifier.verify_and_capture("esc_1", evidence)
             t1 = time.perf_counter_ns()
-            assert not result.released
-            assert result.reason in ("already_refused", "rate_limited")
+            assert result.reason == "rate_limited"
             samples.append(t1 - t0)
         return statistics.median(samples)
 
-    median_100 = _median_retry_ns(100)
-    median_100k = _median_retry_ns(100_000)
+    median_100 = _median_over_limit_ns(100)
+    median_100k = _median_over_limit_ns(100_000)
     assert median_100 > 0
     assert median_100k <= 2.0 * median_100, (
-        f"median@100k={median_100k} ns exceeds 2x median@100={median_100} ns"
+        f"over-limit median@100k={median_100k} ns exceeds 2x @100={median_100} ns"
     )
+
+
+def test_retry_rate_limit_receipt_hashes_stable_across_flood():
+    """REA F7: flooding never rewrites earlier receipt hashes."""
+    verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
+    _refuse_escrow(verifier)
+    # Seed a few denials so the prefix is non-trivial.
+    for _ in range(5):
+        verifier.verify_and_capture("esc_1", Evidence(delivered_bytes=artifact))
+    prefix = [(r.seq, r.hash, r.prev_hash) for r in verifier.ledger.receipts()]
+    for _ in range(500):
+        verifier.verify_and_capture("esc_1", Evidence(delivered_bytes=artifact))
+    verifier.flush_retry_rate_limits("esc_1")
+    after = verifier.ledger.receipts()
+    for seq, h, prev in prefix:
+        assert after[seq].hash == h
+        assert after[seq].prev_hash == prev
+    ok, reason = verifier.ledger.verify_chain()
+    assert ok, reason
+
+
+def test_retry_rate_limit_crash_mid_window_sqlite():
+    """REA F7: crash mid-window loses at most B-1 unflushed over-limits (Sqlite)."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.sqlite_ledger import SqliteLedger
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    batch = getattr(vmod, "DEFAULT_RETRY_TALLY_BATCH", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        ledger = SqliteLedger(path)
+        permits = PermitStore(ledger=ledger)
+        paypal = MockPayPalClient()
+        verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
+        permit, _ = permits.grant(
+            agent_id="agent_1",
+            cap_cents=5000,
+            allowlist=["merchant_1"],
+            expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        check = permits.check(permit.permit_id, 3000, "merchant_1")
+        auth_id = check.receipt.payload["auth_id"]
+        pp_auth = paypal.authorize(3000, "merchant_1")
+        artifact = b"delivered work product"
+        escrow = Escrow(
+            escrow_id="esc_1",
+            permit_id=permit.permit_id,
+            auth_id=auth_id,
+            paypal_auth_id=pp_auth.auth_id,
+            amount_cents=3000,
+            merchant_id="merchant_1",
+            predicate_type=PredicateType.D,
+            artifact_hash=hashlib.sha256(artifact).hexdigest(),
+        )
+        verifier.register(escrow)
+        _refuse_escrow(verifier)
+        evidence = Evidence(delivered_bytes=artifact)
+        # Exhaust individual budget, then over-limit by (2*batch - 1):
+        # one full durable tally + (batch-1) unflushed in memory.
+        for _ in range(n):
+            assert (
+                verifier.verify_and_capture("esc_1", evidence).reason
+                == "already_refused"
+            )
+        over = 2 * batch - 1
+        for _ in range(over):
+            assert (
+                verifier.verify_and_capture("esc_1", evidence).reason
+                == "rate_limited"
+            )
+        durable_before_crash = _tally_count_sum(ledger, "esc_1")
+        assert durable_before_crash == batch  # one flushed tally
+        # Simulate crash: drop the live verifier (unflushed remainder lost).
+        del verifier
+        ledger2 = SqliteLedger(path)
+        permits2 = PermitStore(ledger=ledger2)
+        paypal2 = MockPayPalClient()
+        verifier2 = ReleaseVerifier(paypal2, permits2, ledger=ledger2)
+        recovered = _tally_count_sum(ledger2, "esc_1")
+        lost = over - recovered
+        assert lost <= batch - 1, f"lost {lost} exceeds batch-1={batch - 1}"
+        assert recovered == durable_before_crash
+        # original_refusal_id rebuilt from ledger.
+        assert verifier2._original_refusal_id("esc_1") is not None
+        assert verifier2._original_refusal_id("esc_1") == _original_refusal_hash(
+            ledger2, "esc_1"
+        )
+
+
+def test_retry_rate_limit_restart_keeps_counter_and_f6_link():
+    """REA F7: restart rebuilds rate-limit counters and original_refusal_id."""
+    import settlement.verifier as vmod
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    batch = getattr(vmod, "DEFAULT_RETRY_TALLY_BATCH", 100)
+    # Controllable clock so the window stays open across "restart".
+    clock = [1_000_000.0]
+
+    def now():
+        return clock[0]
+
+    verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
+    # Re-bind with injected clock.
+    verifier = ReleaseVerifier(
+        paypal, permits, ledger=verifier.ledger, clock=now
+    )
+    # Re-register escrow on the new verifier instance wrapping same stores.
+    with verifier._lock:
+        verifier._escrows[escrow.escrow_id] = escrow
+    _refuse_escrow(verifier)
+    original = verifier._original_refusal_id("esc_1")
+    assert original is not None
+    evidence = Evidence(delivered_bytes=artifact)
+    for _ in range(n):
+        assert verifier.verify_and_capture("esc_1", evidence).reason == "already_refused"
+    # One full batch of over-limit (durable) + 3 unflushed.
+    for _ in range(batch + 3):
+        assert verifier.verify_and_capture("esc_1", evidence).reason == "rate_limited"
+    verifier.flush_retry_rate_limits("esc_1")  # persist the +3 too
+    assert _tally_count_sum(verifier.ledger, "esc_1") == batch + 3
+    ledger = verifier.ledger
+
+    # Restart: new verifier, same ledger, same clock (window still open).
+    verifier2 = ReleaseVerifier(paypal, permits, ledger=ledger, clock=now)
+    with verifier2._lock:
+        verifier2._escrows[escrow.escrow_id] = escrow
+    assert verifier2._original_refusal_id("esc_1") == original
+    state = verifier2._retry_rate_windows.get("esc_1")
+    assert state is not None
+    assert state.individual == n
+    assert state.rate_limited == batch + 3
+    assert state.unflushed == 0
+    # Next over-limit continues the same window (does not reset the budget).
+    r = verifier2.verify_and_capture("esc_1", evidence)
+    assert r.reason == "rate_limited"
+    assert verifier2._retry_rate_windows["esc_1"].rate_limited == batch + 4
+    # F6 link on new tallies still points at the original refusal.
+    verifier2.flush_retry_rate_limits("esc_1")
+    last = _rate_limited_receipts(ledger, "esc_1")[-1]
+    assert last.payload["original_refusal_id"] == original
 
 
 def test_only_verifier_calls_capture():

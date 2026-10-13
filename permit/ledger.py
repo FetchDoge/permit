@@ -88,35 +88,6 @@ class Ledger:
         with self._lock:
             return self._allowed_by_auth.get(auth_id)
 
-    def update_payload(self, seq: int, payload: dict) -> Receipt:
-        """
-        Replace the payload at seq and rehash seq..end so the chain stays
-        valid. Used by REA F7 to amend a per-window aggregated rate-limited
-        receipt's count (still one receipt per window; not a general edit API).
-        """
-        with self._lock:
-            if seq < 0 or seq >= len(self._receipts):
-                raise IndexError(f"receipt seq {seq} out of range")
-            old = self._receipts[seq]
-            self._receipts[seq] = Receipt(
-                seq=old.seq,
-                prev_hash=old.prev_hash,
-                event_type=old.event_type,
-                payload=payload,
-                timestamp=old.timestamp,
-            )
-            for i in range(seq + 1, len(self._receipts)):
-                prev = self._receipts[i - 1]
-                cur = self._receipts[i]
-                self._receipts[i] = Receipt(
-                    seq=cur.seq,
-                    prev_hash=prev.hash,
-                    event_type=cur.event_type,
-                    payload=cur.payload,
-                    timestamp=cur.timestamp,
-                )
-            return self._receipts[seq]
-
     def __len__(self) -> int:
         return len(self._receipts)
 
