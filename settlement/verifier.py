@@ -51,8 +51,9 @@ from permit.retry_rate_store import (
     InMemoryRetryRateStore,
     RetryRateIntegrityError,
     RetryRateRow,
-    clear_high_water_creating_intent,
     create_high_water,
+    get_high_water,
+    high_water_create,
     high_water_lock,
     publish_rate_mac_to_anchor,
     rate_limited_mac,
@@ -522,15 +523,25 @@ class ReleaseVerifier:
                         f"denials escrow_id={key[0]!r} window_id={key[1]!r} "
                         f"(chain_individual={count}); refuse to start"
                     )
-                if row.tally_flushed and row.rate_limited > 0:
+                if row.tally_flushed:
+                    # No-tally allowed only from HMAC-verified counter (==0)
+                    # cross-checked with chain denials — not editable row alone.
+                    try:
+                        hw_confirmed = get_high_water(row.escrow_id, row.window_id)
+                    except RetryRateIntegrityError:
+                        raise RetryRateIntegrityError(
+                            "retry rate side table marked flushed but chain has no "
+                            f"tally for escrow_id={key[0]!r} window_id={key[1]!r} "
+                            "(counter unverifiable); refuse"
+                        ) from None
+                    if hw_confirmed == 0 and count > 0:
+                        continue
                     raise RetryRateIntegrityError(
                         "retry rate side table marked flushed but chain has no tally "
-                        f"for escrow_id={key[0]!r} window_id={key[1]!r}; refuse"
+                        f"for escrow_id={key[0]!r} window_id={key[1]!r} "
+                        f"(hw_confirmed={hw_confirmed}, chain_individual={count}); "
+                        "refuse"
                     )
-                if row.tally_flushed:
-                    # rate_limited==0: closed with only individual denials —
-                    # no chain tally is expected.
-                    continue
                 self._reconcile_open_window_integrity(
                     row, chain_tallies, chain_denials
                 )
@@ -571,10 +582,22 @@ class ReleaseVerifier:
                     self._persist_rate_window(row.escrow_id, state)
                 continue
 
-            if row.tally_flushed and checker is None and row.rate_limited > 0:
+            if row.tally_flushed and checker is None:
+                try:
+                    hw_confirmed = get_high_water(row.escrow_id, row.window_id)
+                except RetryRateIntegrityError:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table tally_flushed=1 but no chain tally for "
+                        f"escrow_id={row.escrow_id!r} window_id={row.window_id!r} "
+                        "(counter unverifiable); refuse to start"
+                    ) from None
+                chain_n = int(chain_denials.get(key, 0))
+                if hw_confirmed == 0 and chain_n > 0:
+                    continue
                 raise RetryRateIntegrityError(
                     "retry rate side table tally_flushed=1 but no chain tally for "
-                    f"escrow_id={row.escrow_id!r} window_id={row.window_id!r}; "
+                    f"escrow_id={row.escrow_id!r} window_id={row.window_id!r} "
+                    f"(hw_confirmed={hw_confirmed}, chain_individual={chain_n}); "
                     "refuse to start"
                 )
             if row.tally_flushed:
@@ -768,17 +791,16 @@ class ReleaseVerifier:
             )
             try:
                 # Brand-new window only — never recreate a missing sidecar
-                # for an existing DB/side row. Creating intent (-1) covers
-                # the create→persist gap against startup orphan checks.
-                create_high_water(escrow_id, state.window_id, initial=0)
-                try:
-                    self._persist_rate_window(escrow_id, state)
-                except Exception:
-                    remove_high_water(escrow_id, state.window_id)
-                    raise
-                # Leave creating intent (-1) until reconcile/write_intent;
-                # clearing before the persist is visible races startup.
-                clear_high_water_creating_intent(escrow_id, state.window_id)
+                # for an existing DB/side row. Hold flock across create+persist.
+                with high_water_create(
+                    escrow_id, state.window_id, initial=0
+                ) as hwlock:
+                    try:
+                        self._persist_rate_window(escrow_id, state)
+                    except Exception:
+                        remove_high_water(escrow_id, state.window_id)
+                        raise
+                    hwlock.clear_creating_intent()
             except RuntimeError:
                 adopted = self._refresh_open_window_from_store(escrow_id)
                 if adopted is None:

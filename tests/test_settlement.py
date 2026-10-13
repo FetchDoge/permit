@@ -1064,6 +1064,144 @@ def test_flushed_window_rate_limited_tally_deleted_refuses():
         ledger2.close()
 
 
+def test_flushed_window_tally_deleted_rate_limited_lowered_without_key_refuses():
+    """Delete tally + edit rate_limited→0 without key; HMAC counter still >0 → refuse."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import get_high_water
+    from permit.sqlite_ledger import SqliteLedger
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, _ = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=5
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None and side.rate_limited == 5
+        wid = side.window_id
+        verifier.flush_retry_rate_limits("esc_1")
+        tallies = _rate_limited_receipts(ledger, "esc_1")
+        assert len(tallies) == 1
+        tally_seq = tallies[0].seq
+        tip = ledger._conn.execute("SELECT MAX(seq) FROM receipts").fetchone()[0]
+        assert tally_seq == tip
+        ledger._conn.execute("DROP TRIGGER IF EXISTS receipts_no_delete")
+        ledger._conn.execute("DELETE FROM receipts WHERE seq = ?", (tally_seq,))
+        # Tamper editable row only (no MAC key / no sidecar rewrite).
+        ledger._conn.execute(
+            "DROP TRIGGER IF EXISTS retry_rate_rate_limited_monotonic"
+        )
+        ledger._conn.execute(
+            "UPDATE retry_rate_windows SET rate_limited = 0"
+            " WHERE escrow_id = ? AND window_id = ?",
+            ("esc_1", wid),
+        )
+        assert get_high_water("esc_1", wid) == 5
+        ledger.close()
+
+        # Startup cross-check must refuse: HMAC counter still 5 despite
+        # the editable rate_limited column being lowered to 0.
+        with pytest.raises(
+            RetryRateIntegrityError,
+            match="confirmed|no tally|hw_confirmed|marked flushed|tally_flushed",
+        ):
+            SqliteLedger(path)
+
+
+def test_stale_pending_hw_dead_writer_refused():
+    """Pending counter from a dead writer with no DB row → refuse at startup."""
+    import tempfile
+
+    from permit.retry_rate_store import (
+        HighWaterRecord,
+        _atomic_write_hw_record,
+        assert_high_water_files_for_rows,
+        create_high_water,
+        high_water_lock,
+    )
+    from permit.sqlite_ledger import SqliteLedger
+
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        ledger = SqliteLedger(path)
+        ledger.close()
+        create_high_water("esc_dead", "rw_dead", initial=0)
+        with high_water_lock("esc_dead", "rw_dead") as hwlock:
+            rec = HighWaterRecord(
+                escrow_id="esc_dead",
+                window_id="rw_dead",
+                confirmed=0,
+                intent=-1,
+                writer_pid=2**22 - 3,  # unused pid
+                writer_start=1,
+            )
+            _atomic_write_hw_record(hwlock._path, rec)
+        with pytest.raises(
+            RetryRateIntegrityError,
+            match="orphan|dead writer|stale|planted|pending",
+        ):
+            assert_high_water_files_for_rows(
+                [],
+                refresh_rows=lambda: [],
+                row_exists=lambda e, w: False,
+            )
+
+
+def test_planted_pending_hw_deleted_row_refused():
+    """Pending counter whose DB row was deleted → refuse at startup."""
+    import tempfile
+
+    from permit.retry_rate_store import (
+        HighWaterRecord,
+        RetryRateRow,
+        _atomic_write_hw_record,
+        create_high_water,
+        high_water_lock,
+    )
+    from permit.sqlite_ledger import SqliteLedger
+
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        ledger = SqliteLedger(path)
+        create_high_water("esc_plant", "rw_plant", initial=0)
+        ledger.retry_rate_store.upsert(
+            RetryRateRow(
+                escrow_id="esc_plant",
+                window_id="rw_plant",
+                window_start=1.0,
+                individual=0,
+                rate_limited=0,
+                covered_reason="already_refused",
+                tally_flushed=False,
+            )
+        )
+        with high_water_lock("esc_plant", "rw_plant") as hwlock:
+            rec = HighWaterRecord(
+                escrow_id="esc_plant",
+                window_id="rw_plant",
+                confirmed=0,
+                intent=1,
+                writer_pid=2**22 - 5,
+                writer_start=99,
+            )
+            _atomic_write_hw_record(hwlock._path, rec)
+        # Delete the DB row; leave the planted pending sidecar.
+        ledger._conn.execute(
+            "DELETE FROM retry_rate_windows"
+            " WHERE escrow_id = ? AND window_id = ?",
+            ("esc_plant", "rw_plant"),
+        )
+        ledger.close()
+        with pytest.raises(
+            RetryRateIntegrityError,
+            match="orphan|dead writer|stale|planted|pending",
+        ):
+            SqliteLedger(path)
+
+
 def test_retry_rate_limit_side_table_tamper_row_deleted():
     """Side row deleted while chain tally remains → refuse to start."""
     import tempfile
@@ -2229,6 +2367,7 @@ def _mp_startup_opener_worker(
 
         os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = mac_key
         os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = hw_path
+        # Overlap instrumentation env is inherited from the parent process.
         clear_retry_rate_mac_key_cache()
 
         opens = 0
@@ -2248,12 +2387,17 @@ def _mp_startup_opener_worker(
 def test_retry_rate_limit_eight_processes_no_false_integrity_error():
     """
     8 processes × 20 rounds: writers create new windows while others open
-    SqliteLedger (startup orphan path). Report false-refusal count; fail if > 0.
+    SqliteLedger (startup orphan path). Each round prints false-refusals and
+    startup/write overlaps; fail if total overlaps == 0 or refusals > 0.
     """
     import multiprocessing as mp
     import tempfile
 
-    from permit.retry_rate_store import RetryRateIntegrityError
+    from permit.retry_rate_store import (
+        RetryRateIntegrityError,
+        _ENV_STARTUP_OVERLAP_FILE,
+        _ENV_WRITE_ACTIVE_DIR,
+    )
     from permit.sqlite_ledger import SqliteLedger
 
     n_writers = 4
@@ -2263,15 +2407,21 @@ def test_retry_rate_limit_eight_processes_no_false_integrity_error():
     rounds = 20
     n_escrows = 4
     false_refusals = 0
+    total_overlaps = 0
 
-    def _one_round(round_idx: int) -> int:
+    def _one_round(round_idx: int) -> tuple[int, int]:
         import permit.retry_rate_store as rrs
 
         with tempfile.TemporaryDirectory() as td:
             path = td + f"/ledger_{round_idx}.sqlite"
             hw_base = path + ".hw"
             stop_flag = td + "/stop"
+            write_active = td + "/writing"
+            overlap_file = td + "/overlaps"
+            os.makedirs(write_active, mode=0o700, exist_ok=True)
             os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = hw_base
+            os.environ[_ENV_WRITE_ACTIVE_DIR] = write_active
+            os.environ[_ENV_STARTUP_OVERLAP_FILE] = overlap_file
             rrs.clear_retry_rate_mac_key_cache()
             rrs.load_retry_rate_mac_key(refresh=True)
             clock_value = 3_000_000.0 + round_idx
@@ -2291,7 +2441,7 @@ def test_retry_rate_limit_eight_processes_no_false_integrity_error():
             digest = hashlib.sha256(artifact).hexdigest()
             escrow_ids = [f"esc_{i}" for i in range(n_escrows)]
             # Refuse each escrow but do NOT pre-create rate windows — writers
-            # must create windows (create_high_water+INSERT) while starters open.
+            # must create windows while starters open.
             for eid in escrow_ids:
                 check = permits.check(permit.permit_id, 3000, "merchant_1")
                 auth_id = check.receipt.payload["auth_id"]
@@ -2344,6 +2494,8 @@ def test_retry_rate_limit_eight_processes_no_false_integrity_error():
                 )
                 for _ in range(n_starters)
             ]
+            # Propagate overlap instrumentation into spawn workers via env
+            # (already set above; spawn inherits).
             for p in writers + starters:
                 p.start()
             for p in writers:
@@ -2371,24 +2523,42 @@ def test_retry_rate_limit_eight_processes_no_false_integrity_error():
                 for status, detail in results
             ), results
 
+            overlaps = 0
+            if os.path.exists(overlap_file):
+                with open(overlap_file, "r", encoding="utf-8") as fh:
+                    overlaps = sum(1 for line in fh if line.strip())
+
             try:
                 final = SqliteLedger(path)
                 final.check_retry_rate_integrity()
                 final.close()
-                return worker_false
+                refusals = worker_false
             except RetryRateIntegrityError:
-                return worker_false + 1
+                refusals = worker_false + 1
+
+            print(
+                f"eight_processes_round={round_idx} "
+                f"false_refusals={refusals} overlaps={overlaps}"
+            )
+            return refusals, overlaps
 
     for i in range(rounds):
-        false_refusals += _one_round(i)
+        r, o = _one_round(i)
+        false_refusals += r
+        total_overlaps += o
 
     print(
         f"eight_processes_false_refusal_count={false_refusals} "
+        f"eight_processes_startup_write_overlaps={total_overlaps} "
         f"(rounds={rounds}, writers={n_writers}, starters={n_starters}, "
         f"per_writer={per_writer}, starter_opens={starter_opens})"
     )
     assert false_refusals == 0, (
         f"false RetryRateIntegrityError count {false_refusals} > 0"
+    )
+    assert total_overlaps > 0, (
+        f"startup/write overlaps={total_overlaps}; test did not race the "
+        "orphan path"
     )
 
 
