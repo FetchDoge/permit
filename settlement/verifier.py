@@ -251,7 +251,13 @@ class ReleaseVerifier:
             if escrow.state == "CAPTURED":
                 return VerifyResult(True, "already_captured")
             if escrow.state in ("VOIDED", "REFUSED"):
-                return VerifyResult(False, f"already_{escrow.state.lower()}")
+                # REA F6: every refused retry still writes a denial receipt so
+                # the ledger records the attempt; money is never captured.
+                reason = f"already_{escrow.state.lower()}"
+                self.ledger.append(
+                    "REFUSED", {"escrow_id": escrow_id, "reason": reason}
+                )
+                return VerifyResult(False, reason)
             # Indeterminate states need an explicit operator step first:
             # reconcile() for UNKNOWN, retry_cleanup() for CLEANUP_PENDING.
             if escrow.state == "UNKNOWN":

@@ -155,6 +155,53 @@ def test_void_releases_permit_reservation():
     assert not result.released
 
 
+def test_retry_on_refused_or_voided_writes_denial_receipt():
+    """REA F6: every refused retry on an already REFUSED/VOIDED escrow must
+    append a denial receipt; capture must never run; hash chain stays valid."""
+    for terminal, expected_reason, first_release in (
+        (
+            "REFUSED",
+            "already_refused",
+            lambda v, art: v.verify_and_capture(
+                "esc_1", Evidence(delivered_bytes=b"tampered")
+            ),
+        ),
+        (
+            "VOIDED",
+            "already_voided",
+            lambda v, art: (v.void("esc_1"), None)[1],
+        ),
+    ):
+        verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
+        first_release(verifier, artifact)
+        assert escrow.state == terminal
+        before = [
+            r for r in verifier.ledger.receipts() if r.event_type == "REFUSED"
+        ]
+        n_before = len(before)
+        captures_before = len(paypal.capture_calls)
+
+        result = verifier.verify_and_capture(
+            "esc_1", Evidence(delivered_bytes=artifact)
+        )
+
+        assert not result.released
+        assert result.reason == expected_reason
+        assert result.capture is None
+        assert len(paypal.capture_calls) == captures_before
+        refused = [
+            r for r in verifier.ledger.receipts() if r.event_type == "REFUSED"
+        ]
+        assert len(refused) == n_before + 1
+        assert refused[-1].payload == {
+            "escrow_id": "esc_1",
+            "reason": expected_reason,
+        }
+        ok, reason = verifier.ledger.verify_chain()
+        assert ok, reason
+        assert escrow.state == terminal
+
+
 def test_only_verifier_calls_capture():
     import ast
 
