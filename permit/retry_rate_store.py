@@ -677,12 +677,19 @@ def list_hw_entry_digests() -> dict[str, str]:
 
 def assert_high_water_files_for_rows(
     rows: list[tuple[str, str, int]],
+    *,
+    fresh_count: object | None = None,
 ) -> None:
     """
     Startup bidirectional cross-check:
     - every DB rate row has a valid HMAC-tied sidecar; reconcile intent;
       confirmed must equal DB ``rate_limited``.
     - every counter file under the HW root maps to a DB row (no orphans).
+
+    ``fresh_count``, when provided, is ``fresh_count(escrow_id, window_id)
+    -> int | None`` and is called **under the per-window flock** so the
+    count is not a stale pre-flock snapshot (multiprocess writers may
+    advance DB+file between the caller's SELECT and flock acquisition).
     """
     for escrow_id, window_id, db_count in rows:
         path = _hw_entry_path(escrow_id, window_id)
@@ -695,8 +702,16 @@ def assert_high_water_files_for_rows(
                 "rewrite with the row's rate_limited under mode 0600 "
                 "owned by the service uid, then restart)"
             )
-        reconcile_intent_with_db(escrow_id, window_id, int(db_count))
-        check_high_water(escrow_id, window_id, int(db_count))
+        with high_water_lock(escrow_id, window_id) as hwlock:
+            count = int(db_count)
+            if fresh_count is not None:
+                refreshed = fresh_count(escrow_id, window_id)
+                if refreshed is None:
+                    # Row disappeared under flock (flushed/deleted); skip.
+                    continue
+                count = int(refreshed)
+            hwlock.reconcile(count)
+            hwlock.check(count)
 
     for digest, fpath in list_hw_entry_digests().items():
         matched = False

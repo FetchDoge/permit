@@ -235,12 +235,34 @@ class SqliteLedger:
             # Fail-closed bidirectional cross-check: every DB rate row ↔
             # HMAC-tied sidecar (reconcile intent; exact confirmed==count),
             # and every sidecar maps to a DB row. Optional anchor consulted.
+            # Re-read rate_limited under each per-window flock so concurrent
+            # writers cannot leave us reconciling a stale pre-flock snapshot.
             hw_rows = self._conn.execute(
                 "SELECT escrow_id, window_id, rate_limited, rate_mac"
                 " FROM retry_rate_windows"
             ).fetchall()
+            db_path = self._path
+
+            def _fresh_hw_count(escrow_id: str, window_id: str) -> int | None:
+                probe = sqlite3.connect(
+                    db_path,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                try:
+                    probe.execute("PRAGMA busy_timeout=30000")
+                    row = probe.execute(
+                        "SELECT rate_limited FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?",
+                        (escrow_id, window_id),
+                    ).fetchone()
+                finally:
+                    probe.close()
+                return None if row is None else int(row[0])
+
             assert_high_water_files_for_rows(
-                [(str(r[0]), str(r[1]), int(r[2])) for r in hw_rows]
+                [(str(r[0]), str(r[1]), int(r[2])) for r in hw_rows],
+                fresh_count=_fresh_hw_count,
             )
             consult_anchor_at_startup(
                 {str(r[3]) for r in hw_rows if r[3]}
@@ -1156,10 +1178,28 @@ class SqliteLedger:
                     (escrow_id,),
                 ).fetchall()
         for eid, wid, rlim in pre:
+            # Fresh probe under flock — no skew tolerance; intent reconcile only.
             with high_water_lock(str(eid), str(wid)) as hwlock:
-                hwlock.check(int(rlim))
-                if int(rlim) == hwlock.get() + 1:
-                    hwlock.set(int(rlim))
+                probe = sqlite3.connect(
+                    self._path,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                try:
+                    probe.execute("PRAGMA busy_timeout=30000")
+                    row = probe.execute(
+                        "SELECT rate_limited FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?"
+                        " AND tally_flushed = 0",
+                        (str(eid), str(wid)),
+                    ).fetchone()
+                finally:
+                    probe.close()
+                if row is None:
+                    continue
+                count = int(row[0])
+                hwlock.reconcile(count)
+                hwlock.check(count)
 
         with self._lock:
             cached: list[Receipt] = []
