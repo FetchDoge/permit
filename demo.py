@@ -120,7 +120,25 @@ def demo_mock():
 def main():
     ap = argparse.ArgumentParser(description="Permit end-to-end demo")
     ap.add_argument("--sandbox", action="store_true", help="use the real sandbox rail")
+    ap.add_argument(
+        "--allow-demo-mac-key",
+        action="store_true",
+        default=False,
+        help=(
+            "opt in to the built-in demo retry-rate HMAC key and a temp "
+            "high-water sidecar (off by default; required when "
+            "PERMIT_RETRY_RATE_MAC_KEY / _KEY_FILE are unset)"
+        ),
+    )
     args = ap.parse_args()
+    if args.allow_demo_mac_key:
+        os.environ["PERMIT_RETRY_RATE_ALLOW_DEMO_MAC_KEY"] = "1"
+        if not os.environ.get("PERMIT_RETRY_RATE_MAC_HW_FILE"):
+            import tempfile
+
+            hw_dir = tempfile.mkdtemp(prefix="permit-demo-hw-")
+            os.chmod(hw_dir, 0o700)
+            os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = hw_dir
     if args.sandbox:
         print("Sandbox mode needs PERMIT_PAYPAL_CLIENT_ID/SECRET and interactive")
         print("payer approval per order - run from a session with a browser tap.")

@@ -9,13 +9,20 @@ No secrets are required for the default mock-rail suite.
 from __future__ import annotations
 
 import os
+import tempfile
 
 import pytest
 
 # Stable HMAC key for the suite (outside the DB). Production must set its own.
+# Minimum 32 bytes. Demo-key fallback is NOT used here — env is set explicitly.
+_TEST_MAC_KEY = "test-retry-rate-mac-key-NOT-FOR-PRODUCTION"  # 42 bytes
+os.environ.setdefault("PERMIT_RETRY_RATE_MAC_KEY", _TEST_MAC_KEY)
+
+# High-water sidecar (outside the DB). Shared across the suite / spawn workers.
+_HW_DIR = tempfile.mkdtemp(prefix="permit-retry-rate-hw-")
 os.environ.setdefault(
-    "PERMIT_RETRY_RATE_MAC_KEY",
-    "test-retry-rate-mac-key-NOT-FOR-PRODUCTION",
+    "PERMIT_RETRY_RATE_MAC_HW_FILE",
+    os.path.join(_HW_DIR, "retry_rate.hw"),
 )
 
 _SANDBOX_CREDS = (

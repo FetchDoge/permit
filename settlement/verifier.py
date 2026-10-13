@@ -51,6 +51,7 @@ from permit.retry_rate_store import (
     InMemoryRetryRateStore,
     RetryRateIntegrityError,
     RetryRateRow,
+    high_water_lock,
     rate_limited_mac,
     verify_rate_limited_mac,
 )
@@ -64,10 +65,10 @@ from .paypal_client import PayPalClient, PayPalTimeout, Capture
 # BEGIN IMMEDIATE, ``individual`` is an indexed COUNT of chain already_*
 # denial receipts for (escrow, window_id). The side table holds window_id,
 # window_start, and an HMAC rate_mac over rate_limited
-# (HMAC-SHA256(key, latest_denial_hash || escrow || window || count)),
-# key from PERMIT_RETRY_RATE_MAC_KEY / _KEY_FILE outside the DB — loss
-# bound 0, no checkpoint/K. Threat model: DB write without the key is
-# in scope; attacker with both DB and key is out of scope. At most one
+# (HMAC-SHA256(key, prev_mac || denial || escrow || window || count || hw)),
+# key + monotonic high-water sidecar outside the DB — loss bound 0, no
+# checkpoint/K. Threat model: DB write without the key+sidecar is in
+# scope; attacker with DB + sidecar + key is out of scope. At most one
 # OPEN window per escrow (UNIQUE partial index). Process memory is never
 # the authority. window_start comes from the row and is NOT reset on
 # restart; a window closes when any writer sees now >= start + W.
@@ -312,13 +313,39 @@ class ReleaseVerifier:
         state: _RetryRateWindow,
         *,
         rate_mac: str | None = None,
+        prev_rate_mac: str | None = None,
     ) -> None:
         """Write window counters to the side store (durable on Sqlite)."""
+        side = self._rate_store.get_open(escrow_id)
+        if (
+            prev_rate_mac is None
+            and side is not None
+            and side.window_id == state.window_id
+        ):
+            prev_rate_mac = side.prev_rate_mac
+        if prev_rate_mac is None:
+            prev_rate_mac = ""
         if rate_mac is None:
             anchor = self._latest_denial_hash(escrow_id, state.window_id)
-            rate_mac = rate_limited_mac(
-                anchor, escrow_id, state.window_id, state.rate_limited
-            )
+            # Preserve existing mac when only non-count fields change and
+            # there is already a tag; otherwise mint with current HW=count.
+            if (
+                side is not None
+                and side.window_id == state.window_id
+                and side.rate_limited == state.rate_limited
+                and side.rate_mac
+            ):
+                rate_mac = side.rate_mac
+                prev_rate_mac = side.prev_rate_mac
+            else:
+                rate_mac = rate_limited_mac(
+                    anchor,
+                    escrow_id,
+                    state.window_id,
+                    state.rate_limited,
+                    prev_mac=prev_rate_mac,
+                    high_water=int(state.rate_limited),
+                )
         self._rate_store.upsert(
             RetryRateRow(
                 escrow_id=escrow_id,
@@ -329,6 +356,7 @@ class ReleaseVerifier:
                 covered_reason=state.last_already_reason,
                 tally_flushed=state.tally_flushed,
                 rate_mac=rate_mac,
+                prev_rate_mac=prev_rate_mac or "",
             )
         )
 
@@ -434,6 +462,7 @@ class ReleaseVerifier:
             row.window_id,
             row.rate_limited,
             row.rate_mac,
+            prev_mac=row.prev_rate_mac,
         )
         if row.rate_limited > 0 and row.individual < self.retry_rate_limit_n:
             raise RetryRateIntegrityError(
@@ -551,6 +580,7 @@ class ReleaseVerifier:
                     row.window_id,
                     row.rate_limited,
                     row.rate_mac,
+                    prev_mac=row.prev_rate_mac,
                 )
 
             expired = (now - state.window_start) >= self.retry_rate_limit_w
@@ -652,16 +682,19 @@ class ReleaseVerifier:
         chain_denials = self._chain_individual_denials()
         chain_tallies = self._chain_rate_tallies()
         side = self._rate_store.get_open(escrow_id)
-        rate_mac = (
-            side.rate_mac
-            if side is not None and side.window_id == state.window_id
-            else rate_limited_mac(
+        if side is not None and side.window_id == state.window_id:
+            rate_mac = side.rate_mac
+            prev_mac = side.prev_rate_mac
+        else:
+            prev_mac = ""
+            rate_mac = rate_limited_mac(
                 self._latest_denial_hash(escrow_id, state.window_id),
                 escrow_id,
                 state.window_id,
                 state.rate_limited,
+                prev_mac=prev_mac,
+                high_water=int(state.rate_limited),
             )
-        )
         row = RetryRateRow(
             escrow_id=escrow_id,
             window_id=state.window_id,
@@ -671,6 +704,7 @@ class ReleaseVerifier:
             covered_reason=state.last_already_reason,
             tally_flushed=state.tally_flushed,
             rate_mac=rate_mac,
+            prev_rate_mac=prev_mac,
         )
         self._reconcile_open_window_integrity(
             row, chain_tallies, chain_denials, closing=True
@@ -858,6 +892,7 @@ class ReleaseVerifier:
                     open_row.window_id,
                     open_row.rate_limited,
                     open_row.rate_mac,
+                    prev_mac=open_row.prev_rate_mac,
                 )
                 if open_row.individual != expected:
                     raise RetryRateIntegrityError(
@@ -888,34 +923,82 @@ class ReleaseVerifier:
                 )
                 self._denial_count_by_window[key] = chain_indiv + 1
                 state.individual = chain_indiv + 1
-                self._persist_rate_window(escrow_id, state)
+                cur_mac = (
+                    open_row.rate_mac
+                    if open_row is not None
+                    and open_row.window_id == state.window_id
+                    else ""
+                )
+                hw0 = int(state.rate_limited)
+                new_mac = rate_limited_mac(
+                    denial.hash,
+                    escrow_id,
+                    state.window_id,
+                    hw0,
+                    prev_mac=cur_mac,
+                    high_water=hw0,
+                )
+                self._persist_rate_window(
+                    escrow_id,
+                    state,
+                    rate_mac=new_mac,
+                    prev_rate_mac=cur_mac,
+                )
                 return VerifyResult(False, already_reason)
 
             # Verify on every over-limit step (loss bound 0).
+            # Persist SQL/side row first, then raise the sidecar HW.
             anchor = self._latest_denial_hash(escrow_id, state.window_id)
-            side_mac = (
-                open_row.rate_mac
-                if open_row is not None
+            if (
+                open_row is not None
                 and open_row.window_id == state.window_id
-                else rate_limited_mac(
-                    anchor, escrow_id, state.window_id, state.rate_limited
+            ):
+                side_mac = open_row.rate_mac
+                side_prev = open_row.prev_rate_mac
+            else:
+                side_prev = ""
+                side_mac = rate_limited_mac(
+                    anchor,
+                    escrow_id,
+                    state.window_id,
+                    state.rate_limited,
+                    prev_mac=side_prev,
+                    high_water=int(state.rate_limited),
                 )
-            )
             verify_rate_limited_mac(
                 anchor,
                 escrow_id,
                 state.window_id,
                 state.rate_limited,
                 side_mac,
+                prev_mac=side_prev,
             )
+            prev_for_new = side_mac
             state.rate_limited += 1
+            new_mac = rate_limited_mac(
+                anchor,
+                escrow_id,
+                state.window_id,
+                state.rate_limited,
+                prev_mac=prev_for_new,
+                high_water=int(state.rate_limited),
+            )
             self._persist_rate_window(
                 escrow_id,
                 state,
-                rate_mac=rate_limited_mac(
-                    anchor, escrow_id, state.window_id, state.rate_limited
-                ),
+                rate_mac=new_mac,
+                prev_rate_mac=prev_for_new,
             )
+            # Re-read after persist so HW never tracks a clobbered-away count.
+            side_now = self._rate_store.get_open(escrow_id)
+            hw_val = (
+                int(side_now.rate_limited)
+                if side_now is not None
+                and side_now.window_id == state.window_id
+                else int(state.rate_limited)
+            )
+            with high_water_lock(escrow_id, state.window_id) as hwlock:
+                hwlock.set(hw_val)
             return VerifyResult(False, "rate_limited")
 
     def _predicate_passes(self, escrow: Escrow, evidence: Evidence) -> tuple[bool, str]:

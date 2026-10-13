@@ -7,9 +7,8 @@ on:
     branches: [main]
 
 # Pin the default token (CodeQL actions/missing-workflow-permissions).
-# Top-level: contents: read only. Extra scopes per job where needed
-# (coverage artifact upload → actions: write on pytest). CodeQL's own
-# dynamic workflow grants itself security-events: write — not this file.
+# Top-level: contents: read only. Only the CodeQL job adds
+# security-events: write. No actions: write anywhere.
 permissions:
   contents: read
 
@@ -29,7 +28,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: write  # coverage.xml artifact upload (py3.12 only)
     strategy:
       fail-fast: false
       matrix:
@@ -51,16 +49,9 @@ jobs:
           --cov=permit --cov=settlement
           --cov-report=xml:coverage.xml
           --cov-report=term-missing:skip-covered
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        if: matrix.python-version == '3.12'
-        with:
-          name: coverage-report
-          path: coverage.xml
-          if-no-files-found: error
-          retention-days: 14
       - name: mock demo smoke
         if: matrix.python-version == '3.12'
-        run: python demo.py
+        run: python demo.py --allow-demo-mac-key
 
   test-optimized:
     name: pytest (python -O)
@@ -150,6 +141,26 @@ jobs:
           ./gitleaks version
       - name: gitleaks
         run: ./gitleaks detect --source . --verbose --redact --config .gitleaks.toml
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
 
   # Required branch-ruleset check name. Aggregates pytest matrix, -O, and security.
   test:
