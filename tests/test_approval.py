@@ -274,7 +274,14 @@ def test_remaining_cents_reflects_tightened_cap():
 
 
 def test_approval_single_use_under_concurrency():
-    """F2: N threads race the same approval_id; exactly one ALLOWED."""
+    """F2: N threads race the same approval_id; exactly one ALLOWED.
+
+    A short pause inside check() widens the pre-claim TOCTOU window so the
+    race reproduces on unfixed code; with claim_approval() only one thread
+    reaches check(), so the pause is harmless on the fix.
+    """
+    import time
+
     n_threads = 8
     n_trials = 30
     for trial in range(n_trials):
@@ -285,6 +292,13 @@ def test_approval_single_use_under_concurrency():
         )
         assert pending.reason == "pending_principal_approval"
         flow.approve_approval(pending.approval_id)
+        orig_check = store.check
+
+        def check_with_yield(*args, **kwargs):
+            time.sleep(0.005)
+            return orig_check(*args, **kwargs)
+
+        store.check = check_with_yield  # type: ignore[method-assign]
         barrier = threading.Barrier(n_threads)
         results: list = []
         lock = threading.Lock()

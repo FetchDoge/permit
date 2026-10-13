@@ -7,6 +7,8 @@ by polling order state, and authorize_order() resumes the SAME order -
 never a second one.
 """
 
+import os
+import pathlib
 import subprocess
 import sys
 import textwrap
@@ -17,7 +19,6 @@ from settlement.sandbox_client import (
     ApprovalTimeout,
     MerchantMismatch,
     NeedsPayerApproval,
-    SandboxAPIError,
     SandboxPayPalClient,
 )
 
@@ -182,6 +183,8 @@ def test_void_tolerates_empty_204_body():
 
 def test_void_failed_raises_sandbox_api_error():
     """F4: a non-2xx void must raise — never return VOIDED via assert."""
+    from settlement.sandbox_client import SandboxAPIError
+
     c = make_client([(500, {"name": "INTERNAL_ERROR"})])
     with pytest.raises(SandboxAPIError) as exc:
         c.void("AUTH999")
@@ -206,13 +209,16 @@ def test_void_failed_raises_under_python_optimize():
             raise SystemExit("void did not raise under -O")
         """
     )
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(repo_root)}
     result = subprocess.run(
         [sys.executable, "-O", "-c", script],
         capture_output=True,
         text=True,
-        cwd="/workspace",
+        cwd=str(repo_root),
+        env=env,
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_authorize_order_already_authorized_recovers_via_get():
