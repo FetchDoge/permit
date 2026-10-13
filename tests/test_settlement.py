@@ -3038,54 +3038,72 @@ def test_restart_joint_rollback_caught_with_anchor_stub():
             clear_retry_rate_mac_key_cache()
 
 
-def test_hw_symlink_counter_lock_parent_refused():
-    """Symlink counter file, lock file, or parent directory → refuse."""
+def test_hw_symlink_counter_file_refused():
+    """Planted symlink at the counter file path → refuse (seq 386)."""
     import tempfile
 
     import settlement.verifier as vmod
-    from permit.retry_rate_store import (
-        RetryRateIntegrityError,
-        _hw_entry_path,
-        _hw_lock_path,
-        _hw_root_dir,
-        get_high_water,
-    )
+    from permit.retry_rate_store import _hw_entry_path, get_high_water
 
     n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
     with tempfile.TemporaryDirectory() as td:
         path = td + "/ledger.sqlite"
         clock = [1_000_000.0]
-        verifier, ledger, evidence = _sqlite_refused_setup(
+        _verifier, ledger, _evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=1
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
+        real = hw_path + ".real"
+        os.rename(hw_path, real)
+        os.symlink(real, hw_path)
+        with pytest.raises(RetryRateIntegrityError, match="symlink"):
+            get_high_water(side.escrow_id, side.window_id)
+        ledger.close()
+
+
+def test_hw_symlink_lock_file_refused():
+    """Planted symlink at the lock file path → refuse (seq 386)."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import _hw_entry_path, _hw_lock_path, get_high_water
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        _verifier, ledger, _evidence = _sqlite_refused_setup(
             path, clock, n_denials=n, over=1
         )
         side = ledger.retry_rate_store.get_open("esc_1")
         assert side is not None
         hw_path = _hw_entry_path(side.escrow_id, side.window_id)
         lock_path = _hw_lock_path(hw_path)
-        root = _hw_root_dir()
-
-        # Counter file symlink
-        real = hw_path + ".real"
-        os.rename(hw_path, real)
-        os.symlink(real, hw_path)
+        assert os.path.exists(lock_path)
+        real_lock = lock_path + ".real"
+        os.rename(lock_path, real_lock)
+        os.symlink(real_lock, lock_path)
         with pytest.raises(RetryRateIntegrityError, match="symlink"):
             get_high_water(side.escrow_id, side.window_id)
-        os.unlink(hw_path)
-        os.rename(real, hw_path)
+        ledger.close()
 
-        # Lock file symlink
-        if os.path.exists(lock_path):
-            real_lock = lock_path + ".real"
-            os.rename(lock_path, real_lock)
-            os.symlink(real_lock, lock_path)
-            with pytest.raises(RetryRateIntegrityError, match="symlink"):
-                get_high_water(side.escrow_id, side.window_id)
-            os.unlink(lock_path)
-            os.rename(real_lock, lock_path)
 
-        # Parent directory symlink: point HW_FILE at a symlink dir
-        import permit.retry_rate_store as rrs
+def test_hw_symlink_parent_directory_refused():
+    """Planted symlink as the HW parent directory → refuse (seq 386)."""
+    import tempfile
 
+    import permit.retry_rate_store as rrs
+    import settlement.verifier as vmod
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        _verifier, ledger, _evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=1
+        )
         decoy = td + "/decoy_hw"
         os.mkdir(decoy, 0o700)
         link = td + "/hw_link"
@@ -3103,6 +3121,59 @@ def test_hw_symlink_counter_lock_parent_refused():
                 os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = old_hw
             rrs.clear_retry_rate_mac_key_cache()
             rrs.load_retry_rate_mac_key(refresh=True)
+        ledger.close()
+
+
+def test_hw_symlink_temp_file_refused(monkeypatch):
+    """Planted symlink at the atomic-write temp path → refuse (seq 386)."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        HighWaterRecord,
+        _atomic_write_hw_record,
+        _hw_entry_path,
+        _hw_lock_path,
+    )
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    fixed = "ab" * 16  # token_hex(16) → 32 hex chars
+    monkeypatch.setattr(
+        "permit.retry_rate_store.secrets.token_hex",
+        lambda nbytes=16: fixed,
+    )
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        _verifier, ledger, _evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=1
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
+        parent = os.path.dirname(hw_path)
+        tmp = os.path.join(parent, f".hwtmp.{fixed}.{os.getpid()}")
+        decoy = td + "/decoy_payload"
+        open(decoy, "wb").write(b"x")
+        os.symlink(decoy, tmp)
+        import fcntl as _fcntl
+
+        lock_fd = os.open(_hw_lock_path(hw_path), os.O_RDWR)
+        try:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+            with pytest.raises(RetryRateIntegrityError, match="symlink|temp file"):
+                _atomic_write_hw_record(
+                    hw_path,
+                    HighWaterRecord(
+                        escrow_id=side.escrow_id,
+                        window_id=side.window_id,
+                        confirmed=1,
+                        intent=None,
+                    ),
+                )
+        finally:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+            os.close(lock_fd)
         ledger.close()
 
 
@@ -3130,3 +3201,213 @@ def test_check_high_water_has_no_skew_tolerance():
         # Exact match still ok.
         assert check_high_water(side.escrow_id, side.window_id, 50) == 50
         ledger.close()
+
+
+def test_lowered_counter_file_caught():
+    """Attack: lower only the HMAC-tied counter file; DB stays high → refuse."""
+    import fcntl as _fcntl
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        HighWaterRecord,
+        _atomic_write_hw_record,
+        _hw_entry_path,
+        _hw_lock_path,
+    )
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=50
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None and side.rate_limited == 50
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
+        lock_fd = os.open(_hw_lock_path(hw_path), os.O_RDWR)
+        try:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+            # Valid file HMAC for a lowered confirmed — key assumed stolen for
+            # the file only; DB count remains 50 so exact match must refuse.
+            _atomic_write_hw_record(
+                hw_path,
+                HighWaterRecord(
+                    escrow_id=side.escrow_id,
+                    window_id=side.window_id,
+                    confirmed=40,
+                    intent=None,
+                ),
+            )
+        finally:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+            os.close(lock_fd)
+        before = len(ledger)
+        with pytest.raises(
+            RetryRateIntegrityError,
+            match="sidecar != DB|exact match|confirmed != DB|process high-water|rollback",
+        ):
+            verifier.verify_and_capture("esc_1", evidence)
+        assert len(ledger) == before
+        ledger.close()
+
+
+def _sigkill_joint_rollback_worker(path, hw_base, mac_key, ready_q):
+    """Child: open ledger (loads process HW), signal ready, sleep until SIGKILL."""
+    import time
+
+    from permit.retry_rate_store import clear_retry_rate_mac_key_cache
+    from permit.sqlite_ledger import SqliteLedger
+
+    os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = mac_key
+    os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = hw_base
+    clear_retry_rate_mac_key_cache()
+    ledger = SqliteLedger(path)
+    ready_q.put(("ready", os.getpid()))
+    # Hold the process (and in-process HW) until the parent SIGKILLs us.
+    while True:
+        time.sleep(60)
+
+
+def _run_joint_rollback_with_sigkill_between_steps(
+    *,
+    use_anchor: bool,
+) -> bool:
+    """
+    Build state, hold a live child, roll DB back, SIGKILL child, roll file back,
+    then reopen. Returns True if the joint rollback was detected (refused).
+    """
+    import multiprocessing as mp
+    import signal
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        clear_rate_mac_anchor,
+        clear_retry_rate_mac_key_cache,
+        set_rate_mac_anchor,
+    )
+    from permit.sqlite_ledger import SqliteLedger
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    detected = False
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        anchor_path = td + "/anchor.mac"
+        clock = [1_000_000.0]
+        if use_anchor:
+            set_rate_mac_anchor(
+                _FileAnchorStub(anchor_path),
+                url="https://example.invalid/anchor",
+            )
+        try:
+            _verifier, ledger, _evidence = _sqlite_refused_setup(
+                path, clock, n_denials=n, over=20
+            )
+            side = ledger.retry_rate_store.get_open("esc_1")
+            assert side is not None and side.rate_limited == 20
+            hw_base = os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"]
+            mac_key = os.environ["PERMIT_RETRY_RATE_MAC_KEY"]
+            ledger.close()
+
+            ctx = mp.get_context("spawn")
+            ready_q = ctx.Queue()
+            child = ctx.Process(
+                target=_sigkill_joint_rollback_worker,
+                args=(path, hw_base, mac_key, ready_q),
+            )
+            child.start()
+            status, child_pid = ready_q.get(timeout=30)
+            assert status == "ready" and child_pid == child.pid
+
+            # Step 1 of joint rollback (DB only), then SIGKILL, then file.
+            import fcntl as _fcntl
+            import sqlite3
+
+            from permit.retry_rate_store import (
+                HighWaterRecord,
+                _DDL_RATE_LIMITED_MONOTONIC,
+                _atomic_write_hw_record,
+                _hw_entry_path,
+                _hw_lock_path,
+                rate_limited_mac,
+            )
+
+            target = 8
+            conn = sqlite3.connect(path)
+            conn.execute("DROP TRIGGER IF EXISTS retry_rate_rate_limited_monotonic")
+            row = conn.execute(
+                "SELECT escrow_id, window_id, prev_rate_mac FROM retry_rate_windows"
+                " WHERE tally_flushed = 0"
+            ).fetchone()
+            assert row is not None
+            eid, wid, prev_mac = row[0], row[1], row[2] or ""
+            den = conn.execute(
+                "SELECT hash FROM receipts WHERE event_type='REFUSED'"
+                " AND refusal_kind='already' AND escrow_id=? AND window_id=?"
+                " ORDER BY seq DESC LIMIT 1",
+                (eid, wid),
+            ).fetchone()
+            assert den is not None
+            forged = rate_limited_mac(
+                den[0], eid, wid, target, prev_mac=prev_mac, high_water=target
+            )
+            conn.execute(
+                "UPDATE retry_rate_windows SET rate_limited=?, rate_mac=?"
+                " WHERE escrow_id=? AND window_id=?",
+                (target, forged, eid, wid),
+            )
+            conn.commit()
+            conn.execute(_DDL_RATE_LIMITED_MONOTONIC)
+            conn.close()
+
+            # Between the two rollback steps: force-kill the honest process.
+            os.kill(child.pid, signal.SIGKILL)
+            child.join(timeout=10)
+            assert child.exitcode is not None  # reaped after SIGKILL
+
+            hw_path = _hw_entry_path(eid, wid)
+            lock_fd = os.open(_hw_lock_path(hw_path), os.O_RDWR)
+            try:
+                _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+                _atomic_write_hw_record(
+                    hw_path,
+                    HighWaterRecord(
+                        escrow_id=eid, window_id=wid, confirmed=target, intent=None
+                    ),
+                )
+            finally:
+                _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+                os.close(lock_fd)
+
+            clear_retry_rate_mac_key_cache()
+            try:
+                SqliteLedger(path)
+            except RetryRateIntegrityError:
+                detected = True
+        finally:
+            clear_rate_mac_anchor()
+            clear_retry_rate_mac_key_cache()
+            _restore_suite_mac_key()
+    return detected
+
+
+def test_joint_rollback_sigkill_between_steps_with_anchor():
+    """Joint DB+file rollback with SIGKILL between steps; anchor stub catches it."""
+    assert _run_joint_rollback_with_sigkill_between_steps(use_anchor=True) is True
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "bar 2 decision pending with Marc: cross-restart joint DB+counter-file "
+        "rollback with no external anchor is currently detected=False; this "
+        "test asserts detection so it XFAILs until that bar lands"
+    ),
+)
+def test_joint_rollback_sigkill_between_steps_no_anchor():
+    """Joint DB+file rollback after SIGKILL, no anchor — desire detection."""
+    # Currently detected=False without an anchor; xfail(strict) until Marc's
+    # bar 2 decision makes this pass (then remove the marker).
+    assert _run_joint_rollback_with_sigkill_between_steps(use_anchor=False) is True

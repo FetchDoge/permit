@@ -469,10 +469,17 @@ def _atomic_write_hw_record(path: str, rec: HighWaterRecord) -> None:
     tmp = os.path.join(
         parent, f".hwtmp.{secrets.token_hex(16)}.{os.getpid()}"
     )
+    _refuse_if_symlink(tmp, what="high-water temp file")
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(tmp, flags, 0o600)
+    try:
+        fd = os.open(tmp, flags, 0o600)
+    except OSError as exc:
+        # O_NOFOLLOW → ELOOP when a symlink was planted at the temp path.
+        raise RetryRateIntegrityError(
+            f"high-water temp file at {tmp!r} refused: {exc}; refuse"
+        ) from exc
     try:
         os.write(fd, payload)
         os.fsync(fd)
