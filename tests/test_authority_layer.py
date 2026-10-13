@@ -370,7 +370,7 @@ def test_authorize_gets_idempotency_key_when_supported():
     flow, _, permits, permit = _permit_layer(paypal=IdemPayPal())
     attempt = flow.spend(permit.permit_id, 1000, "merchant_1", PRED, "hash")
     auth_id = attempt.receipts[0].payload["auth_id"]
-    assert seen["key"] == f"{permit.permit_id}:{auth_id}"
+    assert seen["key"] == f"{permit.permit_id}:{auth_id}:authorize"
 
 
 # ---------------------------------------------------------------------------

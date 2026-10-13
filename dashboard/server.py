@@ -33,19 +33,7 @@ class Dashboard:
     # -- state ------------------------------------------------------------
 
     def state(self) -> dict:
-        permits = []
-        if self.permits:
-            for p in self.permits._permits.values():
-                permits.append({
-                    "permit_id": p.permit_id,
-                    "agent_id": p.agent_id,
-                    "cap_cents": p.cap_cents,
-                    "reserved_cents": p.reserved_cents,
-                    "captured_cents": p.captured_cents,
-                    "remaining_cents": p.remaining_cents(),
-                    "revoked": p.revoked,
-                    "allowlist": list(p.allowlist),
-                })
+        permits = self.permits.permits_snapshot() if self.permits else []
         receipts = []
         if self.ledger:
             for r in self.ledger.receipts():
@@ -56,34 +44,67 @@ class Dashboard:
                     "timestamp": r.timestamp,
                     "hash": r.hash[:12],
                 })
-        escrows = []
-        if self.verifier:
-            for e in self.verifier._escrows.values():
-                escrows.append({
-                    "escrow_id": e.escrow_id,
-                    "permit_id": e.permit_id,
-                    "amount_cents": e.amount_cents,
-                    "merchant_id": e.merchant_id,
-                    "predicate": e.predicate_type.value,
-                    "state": e.state,
-                    "paypal_auth_id": e.paypal_auth_id,
-                })
+        escrows = self.verifier.escrows_snapshot() if self.verifier else []
         chain_ok, chain_reason = self.ledger.verify_chain() if self.ledger else (True, "")
+        approvals = []
+        if self.permits:
+            for a in self.permits.pending_approvals():
+                approvals.append({
+                    "approval_id": a.approval_id,
+                    "permit_id": a.permit_id,
+                    "agent_id": a.agent_id,
+                    "amount_cents": a.amount_cents,
+                    "merchant_id": a.merchant_id,
+                    "status": a.status,
+                    "expires_at": a.expires_at,
+                })
         return {
             "permits": permits,
             "escrows": escrows,
             "receipts": receipts,
             "chain_ok": chain_ok,
             "chain_reason": chain_reason,
+            "approvals": approvals,
         }
 
     def estop(self, permit_id: str) -> dict:
         if not self.flow:
             return {"ok": False, "error": "no flow bound"}
-        result = self.flow.estop(permit_id)
-        return {"ok": True, "receipt_seq": result.receipt.seq,
-                "voided": result.voided,
-                "unknown_open": list(result.unknown_open)}
+        receipt, voided = self.flow.estop(permit_id)
+        return {"ok": True, "receipt_seq": receipt.seq, "voided": voided}
+
+    def decide_approval(self, approval_id: str, approved: bool) -> dict:
+        if not self.flow:
+            return {"ok": False, "error": "no flow bound"}
+        try:
+            if approved:
+                self.flow.approve_approval(approval_id, actor="dashboard")
+            else:
+                self.flow.deny_approval(approval_id, actor="dashboard")
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "approval_id": approval_id,
+                "decision": "approved" if approved else "denied"}
+
+    def revoke_cascade(self, permit_id: str) -> dict:
+        """Revoke a permit and its whole subtree (revocation wins the race)."""
+        if not self.flow:
+            return {"ok": False, "error": "no flow bound"}
+        receipt, voided = self.flow.revoke_cascade(permit_id)
+        return {"ok": True, "receipt_seq": receipt.seq, "voided": voided}
+
+    def tighten(self, permit_id: str, cap_cents: int) -> dict:
+        """Narrow a permit's cap post-issuance (authority only ever narrows)."""
+        if not self.permits:
+            return {"ok": False, "error": "no store bound"}
+        if not isinstance(cap_cents, int) or cap_cents <= 0:
+            return {"ok": False, "error": "cap_cents must be a positive integer"}
+        try:
+            permit, receipt = self.permits.tighten(permit_id, cap_cents=cap_cents)
+        except Exception as e:  # UnknownPermit, ValueError
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "permit_id": permit.permit_id,
+                "receipt_seq": receipt.seq}
 
     # -- http ---------------------------------------------------------------
 
@@ -117,6 +138,25 @@ class Dashboard:
                     body = json.loads(self.rfile.read(length) or b"{}")
                     self._send(200, json.dumps(
                         dash.estop(body.get("permit_id", ""))))
+                elif self.path == "/api/revoke-cascade":
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    self._send(200, json.dumps(
+                        dash.revoke_cascade(body.get("permit_id", ""))))
+                elif self.path == "/api/tighten":
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    self._send(200, json.dumps(
+                        dash.tighten(body.get("permit_id", ""),
+                                     body.get("cap_cents", 0))))
+                elif self.path.startswith("/api/approvals/"):
+                    # /api/approvals/<id>/approve | /deny
+                    parts = self.path.split("/")
+                    if len(parts) == 5 and parts[4] in ("approve", "deny"):
+                        self._send(200, json.dumps(dash.decide_approval(
+                            parts[3], parts[4] == "approve")))
+                    else:
+                        self._send(404, b'{"error":"not found"}')
                 else:
                     self._send(404, b'{"error":"not found"}')
 

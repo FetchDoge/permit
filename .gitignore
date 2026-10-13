@@ -1,6 +1,13 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
+.audit-venv/
+.venv/
 .env
 *.egg-info/
 demo_transcript.jsonl
+demo_transcript.replay.jsonl
+.env.sandbox
+coverage.xml
+.coverage

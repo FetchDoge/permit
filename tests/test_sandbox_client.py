@@ -7,6 +7,12 @@ by polling order state, and authorize_order() resumes the SAME order -
 never a second one.
 """
 
+import os
+import pathlib
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 from settlement.sandbox_client import (
@@ -69,12 +75,15 @@ def test_order_status_reports_api_state():
 
 
 def test_authorize_order_on_approved_order():
-    c = make_client([(201, AUTH_BODY)])
+    c = make_client([(201, AUTH_BODY), (200, AUTH_BODY)])
     auth = c.authorize_order("ORDER123", 3000, "merchant_x")
     assert auth.auth_id == "AUTH999"
     assert auth.amount_cents == 3000
     assert auth.merchant_id == "merchant_x"
-    assert c._calls == [("POST", "/v2/checkout/orders/ORDER123/authorize")]
+    assert c._calls == [
+        ("POST", "/v2/checkout/orders/ORDER123/authorize"),
+        ("GET", "/v2/checkout/orders/ORDER123"),
+    ]
 
 
 def test_authorize_order_merchant_mismatch():
@@ -172,28 +181,74 @@ def test_void_tolerates_empty_204_body():
     assert void.status == "VOIDED"
 
 
-def test_authorize_uses_distinct_request_ids_for_create_and_authorize():
-    """
-    P0 regression (2026-10-02 adversarial review): create-order and
-    authorize-order must NOT share one PayPal-Request-Id. PayPal replays
-    the earlier call's response on reuse, which made authorize raise
-    KeyError and stranded the reservation with no UNKNOWN receipt.
-    """
-    client = SandboxPayPalClient("id", "secret")
-    client._token = "tok"
-    seen = []
+def test_void_failed_raises_sandbox_api_error():
+    """F4: a non-2xx void must raise — never return VOIDED via assert."""
+    from settlement.sandbox_client import SandboxAPIError
 
-    def fake_http(method, path, body=None, auth=None, request_id=None, **kwargs):
-        seen.append((method, path, request_id))
-        if path == "/v2/checkout/orders":
-            return (201, ORDER)
-        return (201, AUTH_BODY)
+    c = make_client([(500, {"name": "INTERNAL_ERROR"})])
+    with pytest.raises(SandboxAPIError) as exc:
+        c.void("AUTH999")
+    assert exc.value.status == 500
+    assert exc.value.operation == "void"
 
-    client._http = fake_http
-    auth = client.authorize(3000, "merchant_x", idempotency_key="prm_x:auth_y")
+
+def test_void_failed_raises_under_python_optimize():
+    """F4: the raise survives python -O (asserts would be stripped)."""
+    script = textwrap.dedent(
+        """
+        from settlement.sandbox_client import SandboxAPIError, SandboxPayPalClient
+        c = SandboxPayPalClient("id", "secret")
+        c._token = "tok"
+        c._http = lambda *a, **k: (500, {"name": "INTERNAL_ERROR"})
+        try:
+            c.void("AUTH999")
+        except SandboxAPIError as e:
+            assert e.status == 500
+            assert e.operation == "void"
+        else:
+            raise SystemExit("void did not raise under -O")
+        """
+    )
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(repo_root)}
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_authorize_order_already_authorized_recovers_via_get():
+    """P0 (live 2026-10-05): when the payer's browser completes the
+    authorization itself (normal hermes flow for intent=AUTHORIZE), POST
+    /authorize answers 422 ORDER_ALREADY_AUTHORIZED. authorize_order()
+    must recover idempotently from the order instead of crashing."""
+    already = {
+        "name": "UNPROCESSABLE_ENTITY",
+        "details": [{"issue": "ORDER_ALREADY_AUTHORIZED"}],
+    }
+    c = make_client([(422, already), (200, AUTH_BODY)])
+    auth = c.authorize_order("ORDER123", 3000, "merchant_x")
     assert auth.auth_id == "AUTH999"
-    create_ids = [r for (m, p, r) in seen if p == "/v2/checkout/orders"]
-    authz_ids = [r for (m, p, r) in seen if p.endswith("/authorize")]
-    assert create_ids == ["prm_x:auth_y:create"], create_ids
-    assert authz_ids == ["prm_x:auth_y:authorize"], authz_ids
-    assert create_ids[0] != authz_ids[0]
+    assert auth.amount_cents == 3000
+    assert c._calls == [
+        ("POST", "/v2/checkout/orders/ORDER123/authorize"),
+        ("GET", "/v2/checkout/orders/ORDER123"),
+    ]
+
+
+def test_authorize_order_binds_trust_against_get_when_post_omits_payee():
+    """P0 (live 2026-10-05): the POST /authorize response can omit
+    payee on some flows, which used to trip _bind_trust into a false
+    MerchantMismatch. Trust is now bound against the GET order response,
+    the source of truth."""
+    import copy
+
+    post_body = copy.deepcopy(AUTH_BODY)
+    del post_body["purchase_units"][0]["payee"]
+    c = make_client([(201, post_body), (200, AUTH_BODY)])
+    auth = c.authorize_order("ORDER123", 3000, "merchant_x")
+    assert auth.auth_id == "AUTH999"

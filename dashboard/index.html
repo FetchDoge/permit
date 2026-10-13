@@ -3,556 +3,290 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Permit | payment authority for agents</title>
+<title>Permit — payment authority for agents</title>
 <style>
-  :root {
-    color-scheme: dark;
-    --bg: #07090d;
-    --card: #0e131a;
-    --line: #223041;
-    --line-strong: #2e4158;
-    --txt: #e7eef6;
-    --dim: #8b9bb0;
-    --green: #3ddc97;
-    --red: #ff5c5c;
-    --amber: #f0b429;
-    --blue: #5eb1ff;
-    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Liberation Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace;
-    --sans: "Segoe UI", "Liberation Sans", "DejaVu Sans", Helvetica, Arial, sans-serif;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { background: var(--bg); }
-  body {
-    color: var(--txt);
-    font: 14px/1.45 var(--sans);
-    padding: 0 22px 28px;
-    max-width: 1120px;
-    margin: 0 auto;
-  }
-  header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 18px;
-    border-top: 2px solid var(--blue);
-    border-bottom: 1px solid var(--line);
-    padding: 16px 0 14px;
-    margin-bottom: 14px;
-  }
-  .brand { display: flex; gap: 12px; align-items: flex-start; min-width: 0; }
-  .mark {
-    width: 38px; height: 38px; flex: none; margin-top: 2px;
-    display: grid; place-items: center;
-    border: 1px solid var(--blue); color: var(--blue);
-    font-family: var(--mono); font-weight: 700;
-  }
-  .eyebrow {
-    font-family: var(--mono); font-size: 10px; letter-spacing: 0.18em;
-    text-transform: uppercase; color: var(--blue); margin-bottom: 4px;
-  }
-  h1 {
-    font-family: var(--mono); font-size: 22px; font-weight: 700;
-    letter-spacing: 0.16em; line-height: 1;
-  }
-  .sub { color: var(--dim); font-size: 13px; margin-top: 6px; }
-  .tag { font-size: 16px; margin-top: 8px; }
-  .head-meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; }
-  .badge, .rail, .live, .pill, .st, .k, .hint, button, select, .money, .mono, .legend b, .metric .v, .seq, .ev, .chip {
-    font-family: var(--mono);
-  }
-  .badge {
-    font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
-    padding: 5px 10px; border: 1px solid var(--line); color: var(--dim);
-  }
-  .badge.ok { color: var(--green); border-color: #1f6b45; background: #0d1f16; }
-  .badge.bad { color: var(--red); border-color: #7a2a2a; background: #241012; }
-  .rail {
-    flex: none; white-space: nowrap; font-style: normal;
-    font-size: 9px; font-weight: 700; letter-spacing: 0.12em;
-    color: var(--amber); border: 1px solid #6b5420; background: #1a150c;
-    padding: 3px 6px;
-  }
-  .live {
-    display: inline-flex; align-items: center; gap: 6px;
-    color: var(--green); font-size: 10px; font-weight: 700; letter-spacing: 0.14em;
-  }
-  .live i { width: 7px; height: 7px; background: var(--green); display: block; }
-  .live.wait { color: var(--dim); }
-  .live.wait i { background: var(--dim); }
-  .live.down { color: var(--amber); }
-  .live.down i { background: var(--amber); }
-  .banner {
-    border: 1px solid #6b5420; background: #1a150c; color: var(--amber);
-    font-size: 12px; letter-spacing: 0.03em; padding: 8px 12px; margin-bottom: 14px;
-  }
-  #err { display: none; margin-bottom: 14px; font-size: 12px; padding: 10px 12px; }
-  #err.warn { color: var(--amber); border: 1px solid #6b5420; background: #1a150c; }
-  #err.badlink { color: var(--red); border: 1px solid #7a2a2a; background: #241012; }
-  .strip {
-    display: grid; grid-template-columns: repeat(4, 1fr);
-    border: 1px solid var(--line); background: var(--card); margin-bottom: 16px;
-  }
-  .metric { padding: 12px 14px 13px; border-right: 1px solid var(--line); min-width: 0; }
-  .metric:last-child { border-right: none; }
-  .k {
-    display: block; font-size: 10px; letter-spacing: 0.14em;
-    text-transform: uppercase; color: var(--dim); margin-bottom: 6px;
-  }
-  .metric .v {
-    display: block; font-size: 26px; font-weight: 600; line-height: 1.1;
-    font-variant-numeric: tabular-nums; letter-spacing: -0.03em;
-  }
-  .metric .s { display: block; margin-top: 4px; color: var(--dim); font-size: 11px; }
-  .metric.ok { box-shadow: inset 3px 0 0 var(--green); }
-  .metric.ok .v { color: var(--green); }
-  .metric.bad { box-shadow: inset 3px 0 0 var(--red); background: #1a0d10; }
-  .metric.bad .v { color: var(--red); }
-  .layout {
-    display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
-    gap: 16px; align-items: start;
-  }
-  .col, .card { min-width: 0; }
-  .sec-label, .card-h {
-    display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
-  }
-  .sec-label { margin-bottom: 10px; }
-  h2 {
-    font-family: var(--mono); font-size: 11px; font-weight: 700;
-    letter-spacing: 0.16em; text-transform: uppercase; color: var(--dim);
-  }
-  .hint { color: var(--dim); font-size: 11px; }
-  .card {
-    background: var(--card); border: 1px solid var(--line);
-    padding: 14px; margin-bottom: 12px;
-  }
-  .permit { border-left: 3px solid var(--blue); }
-  .permit.revoked { border-left-color: var(--red); background: #120e10; border-color: #4a2428; }
-  .pid-row { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; margin-bottom: 10px; }
-  .pid { color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
-  .pill {
-    flex: none; font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
-    text-transform: uppercase; padding: 3px 7px; border: 1px solid var(--line);
-  }
-  .pill.on { color: var(--green); border-color: #1f6b45; }
-  .pill.off { color: var(--red); border-color: #7a2a2a; }
-  .money-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-  .money { font-size: 28px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
-  .permit.revoked .money { color: var(--dim); }
-  .money-sub { color: var(--dim); font-size: 12px; margin-top: 6px; }
-  .stack { display: flex; height: 10px; background: #101820; margin: 14px 0 10px; }
-  .stack i { display: block; height: 100%; }
-  .remaining, .sw.remaining { background: var(--blue); }
-  .reserved, .sw.reserved { background: var(--amber); }
-  .captured, .sw.captured { background: var(--green); }
-  .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--dim); font-size: 12px; }
-  .legend b { color: var(--txt); font-weight: 600; font-variant-numeric: tabular-nums; }
-  .sw { width: 8px; height: 8px; display: inline-block; margin-right: 6px; vertical-align: -1px; }
-  .allow { margin-top: 12px; }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-  .chip {
-    font-size: 11px; color: var(--txt); border: 1px solid var(--line-strong);
-    background: #0a1017; padding: 3px 7px; overflow-wrap: anywhere;
-  }
-  button.estop {
-    margin-top: 14px; width: 100%; padding: 11px 10px;
-    border: 1px solid var(--red); background: transparent; color: var(--red);
-    font-size: 13px; font-weight: 700; letter-spacing: 0.16em; cursor: pointer;
-  }
-  button.estop:hover { background: var(--red); color: #fff; }
-  button.estop:disabled { opacity: 0.4; cursor: default; }
-  button.estop:disabled:hover { background: transparent; color: var(--red); }
-  .escrow {
-    display: flex; justify-content: space-between; align-items: center; gap: 12px;
-    padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 12px;
-  }
-  .escrow:last-child { border-bottom: none; }
-  .lhs { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-  .id { overflow-wrap: anywhere; color: var(--dim); }
-  .amtline { display: flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; }
-  .st {
-    flex: none; font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
-    padding: 3px 7px; border: 1px solid transparent;
-  }
-  .st.AUTHORIZED { color: var(--blue); background: #102033; border-color: #1d3e66; }
-  .st.CAPTURED { color: var(--green); background: #0d2218; border-color: #1f6b45; }
-  .st.VOIDED, .st.UNKNOWN, .st.CLEANUP_PENDING { color: var(--amber); background: #241c0c; border-color: #6b5420; }
-  .st.REFUSED, .st.FAILED { color: var(--red); background: #2a1214; border-color: #7a2a2a; }
-  .st.other { color: var(--dim); background: #121820; border-color: var(--line); }
-  .filterlab {
-    display: flex; align-items: center; gap: 8px; color: var(--dim);
-    font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
-  }
-  select {
-    background: #0a1017; color: var(--txt); border: 1px solid var(--line-strong);
-    font-size: 12px; letter-spacing: 0.04em; text-transform: none; padding: 4px 8px;
-  }
-  .chain-hint { margin: 2px 0 10px; }
-  #chain { max-height: min(70vh, 720px); overflow: auto; padding-right: 4px; scrollbar-color: #243041 transparent; }
-  #chain::-webkit-scrollbar { width: 8px; }
-  #chain::-webkit-scrollbar-thumb { background: #243041; }
-  .rcpt {
-    display: grid; grid-template-columns: 48px max-content minmax(0, 1fr);
-    gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--line);
-    font-size: 12px; align-items: baseline;
-  }
-  .rcpt:last-child { border-bottom: none; }
-  .seq { color: var(--dim); font-variant-numeric: tabular-nums; }
-  .ev { font-weight: 700; letter-spacing: 0.04em; }
-  .ev.GRANTED, .ev.AUTHORIZED { color: var(--blue); }
-  .ev.ALLOWED, .ev.CAPTURED { color: var(--green); }
-  .ev.BLOCKED, .ev.VOIDED, .ev.UNKNOWN, .ev.CLEANUP_PENDING { color: var(--amber); }
-  .ev.REFUSED, .ev.REVOKED, .ev.E-STOP, .ev.FAILED { color: var(--red); }
-  .detail { color: var(--dim); overflow-wrap: anywhere; }
-  .empty { color: var(--dim); font-size: 13px; padding: 8px 0; }
-  .empty.inline { padding: 0; }
-  footer {
-    margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line);
-    color: var(--dim); font-size: 12px;
-    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
-  }
-  :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
-  @media (max-width: 800px) {
-    .layout { grid-template-columns: 1fr; }
-    .strip { grid-template-columns: 1fr 1fr; }
-    .metric { border-bottom: 1px solid var(--line); }
-    .metric:nth-child(odd) { border-right: 1px solid var(--line); }
-    .metric:nth-child(even) { border-right: none; }
-    .metric:nth-last-child(-n+2) { border-bottom: none; }
-    .metric .v { font-size: 22px; }
-  }
-  @media (max-width: 640px) {
-    body { padding: 0 14px 22px; }
-    header { flex-direction: column; }
-    .head-meta { justify-content: flex-start; }
-    h1 { letter-spacing: 0.12em; }
-    .money { font-size: 24px; }
-    .rcpt { grid-template-columns: 42px minmax(0, 1fr); }
-    .rcpt .seq { grid-row: 1 / span 2; align-self: start; }
-    .rcpt .detail { grid-column: 2; }
-  }
+  :root { --bg:#0d1117; --card:#161b22; --line:#30363d; --txt:#e6edf3;
+          --dim:#8b949e; --green:#3fb950; --red:#f85149; --amber:#d29922;
+          --blue:#58a6ff; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--txt);
+         font:14px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+         padding:24px; max-width:1100px; margin:0 auto; }
+  header { display:flex; align-items:center; gap:12px; margin-bottom:20px; }
+  header h1 { font-size:20px; font-weight:600; letter-spacing:.5px; }
+  header h1 span { color:var(--dim); font-weight:400; }
+  .badge { font-size:11px; padding:3px 10px; border-radius:20px;
+           border:1px solid var(--line); color:var(--dim); }
+  .badge.ok { color:var(--green); border-color:var(--green); }
+  .badge.bad { color:var(--red); border-color:var(--red); }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:800px){ .grid{ grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line);
+          border-radius:8px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px;
+             color:var(--dim); margin-bottom:12px; }
+  .permit { border-left:3px solid var(--blue); }
+  .permit.revoked { border-left-color:var(--red); opacity:.75; }
+  .money { font-size:28px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .money small { font-size:13px; color:var(--dim); font-weight:400; }
+  .bar { height:8px; background:#21262d; border-radius:4px; margin:10px 0 6px; }
+  .bar i { display:block; height:100%; border-radius:4px;
+           background:linear-gradient(90deg,var(--blue),var(--green));
+           transition:width .4s; }
+  .kv { display:flex; justify-content:space-between; font-size:12px;
+        color:var(--dim); padding:2px 0; }
+  .kv b { color:var(--txt); font-weight:500; font-variant-numeric:tabular-nums; }
+  .mono { font-family:ui-monospace, "SF Mono", Menlo, monospace; font-size:12px; }
+  button.estop { margin-top:12px; width:100%; padding:10px; border-radius:6px;
+    border:1px solid var(--red); background:transparent; color:var(--red);
+    font-size:13px; font-weight:600; letter-spacing:1px; cursor:pointer; }
+  button.estop:hover { background:var(--red); color:#fff; }
+  button.estop:disabled { opacity:.35; cursor:default; }
+  button.estop:disabled:hover { background:transparent; color:var(--red); }
+  .escrow { display:flex; justify-content:space-between; align-items:center;
+            padding:8px 0; border-bottom:1px solid var(--line); font-size:12px; }
+  .escrow:last-child { border-bottom:none; }
+  .st { font-size:10px; padding:2px 8px; border-radius:12px; font-weight:600;
+        letter-spacing:.5px; }
+  .st.AUTHORIZED { background:#1f3a5f; color:var(--blue); }
+  .st.CAPTURED { background:#1a3a24; color:var(--green); }
+  .st.VOIDED { background:#3a2a1a; color:var(--amber); }
+  .st.REFUSED { background:#3a1a1a; color:var(--red); }
+  #chain { max-height:420px; overflow-y:auto; }
+  .rcpt { display:flex; gap:10px; padding:7px 0; border-bottom:1px solid var(--line);
+          font-size:12px; align-items:baseline; }
+  .rcpt:last-child { border-bottom:none; }
+  .seq { color:var(--dim); min-width:34px; }
+  .ev { font-weight:600; font-size:11px; min-width:92px; }
+  .ev.GRANTED{color:var(--blue);} .ev.ALLOWED{color:var(--green);}
+  .ev.AUTHORIZED{color:var(--blue);} .ev.CAPTURED{color:var(--green);}
+  .ev.BLOCKED{color:var(--amber);} .ev.REFUSED{color:var(--red);}
+  .ev.VOIDED{color:var(--amber);} .ev.REVOKED{color:var(--red);}
+  .ev.DELEGATED{color:var(--blue);} .ev.REVOKED_CASCADE{color:var(--red);}
+  .ev.CARVE_RELEASED{color:var(--green);} .ev.E-STOP{color:var(--red);}
+  .detail { color:var(--dim); }
+  .empty { color:var(--dim); font-style:italic; padding:12px 0; }
+  #err { color:var(--red); font-size:12px; margin-bottom:12px; display:none; }
+  .node { border-left:2px solid var(--line); margin:4px 0 4px 8px;
+          padding:8px 0 8px 12px; }
+  .node.root { border-left-color:var(--blue); }
+  .node.revoked { border-left-color:var(--red); opacity:.78; }
+  .nodehead { display:flex; justify-content:space-between; align-items:baseline;
+              gap:8px; font-size:12px; flex-wrap:wrap; }
+  .carve { color:var(--amber); font-size:11px; margin:2px 0 4px; }
+  .carve.released { color:var(--green); }
+  .controls { display:flex; gap:6px; margin-top:6px; flex-wrap:wrap; }
+  .ctl { font-size:10px; font-weight:600; letter-spacing:.5px; padding:4px 10px;
+         border-radius:4px; border:1px solid var(--line); background:transparent;
+         color:var(--dim); cursor:pointer; }
+  .ctl:hover { border-color:var(--dim); color:var(--txt); }
+  .ctl.danger { border-color:var(--red); color:var(--red); }
+  .ctl.danger:hover { background:var(--red); color:#fff; }
+  .ctl:disabled { opacity:.35; cursor:default; }
 </style>
 </head>
 <body>
 <header>
-  <div class="brand">
-    <div class="mark" aria-hidden="true">P</div>
-    <div>
-      <div class="eyebrow">Judge console</div>
-      <h1>PERMIT</h1>
-      <p class="sub">payment authority for agents</p>
-      <p class="tag">Permits, not trust.</p>
-    </div>
-  </div>
-  <div class="head-meta">
-    <span class="rail">MOCK RAIL</span>
-    <span class="badge" id="chainBadge" role="status">chain verifying...</span>
-    <span class="live wait" id="live"><i aria-hidden="true"></i><span id="liveText">POLL</span></span>
-  </div>
+  <h1>PERMIT <span>payment authority for agents</span></h1>
+  <span class="badge ok" id="chainBadge">chain verifying…</span>
 </header>
-<p class="banner">Every amount on this screen is a mock rail figure.</p>
-<div id="err" role="status"></div>
-<section class="strip" aria-label="Console status">
-  <div class="metric">
-    <span class="k">active permits</span>
-    <span class="v" id="mPermits">--</span>
-    <span class="s" id="mPermitsSub">awaiting poll</span>
+<div id="err"></div>
+<div class="grid">
+  <div>
+    <div class="card"><h2>Permits</h2><div id="permits"></div></div>
+    <div class="card"><h2>Delegation graph</h2><div id="graph"></div></div>
+    <div class="card"><h2>Pending approvals</h2><div id="approvals"></div></div>
+    <div class="card"><h2>In-flight escrows</h2><div id="escrows"></div></div>
   </div>
-  <div class="metric" title="AUTHORIZED, CLEANUP_PENDING, and UNKNOWN">
-    <span class="k">escrows in flight</span>
-    <span class="v" id="mEscrows">--</span>
-    <span class="s" id="mEscrowsSub">awaiting poll</span>
-  </div>
-  <div class="metric">
-    <span class="k">receipts</span>
-    <span class="v" id="mReceipts">--</span>
-    <span class="s" id="mReceiptsSub">logged events</span>
-  </div>
-  <div class="metric" id="mChain">
-    <span class="k">chain state</span>
-    <span class="v" id="mChainVal">WAIT</span>
-    <span class="s" id="mChainSub">awaiting poll</span>
-  </div>
-</section>
-<div class="layout">
-  <div class="col">
-    <div class="sec-label">
-      <h2>Permits</h2>
-      <span class="hint">remaining, reserved, captured</span>
-    </div>
-    <div id="permits"><div class="card"><div class="empty">waiting for rail state...</div></div></div>
-    <section class="card" aria-labelledby="escrowHeading">
-      <div class="card-h">
-        <h2 id="escrowHeading">Escrows</h2>
-        <span class="hint">mock rail</span>
-      </div>
-      <div id="escrows"><div class="empty">waiting for rail state...</div></div>
-    </section>
-  </div>
-  <section class="card" aria-labelledby="chainHeading">
-    <div class="card-h">
-      <h2 id="chainHeading">Receipt chain</h2>
-      <label class="filterlab">event
-        <select id="evFilter" aria-label="Filter receipts by event"></select>
-      </label>
-    </div>
-    <p class="hint chain-hint" id="chainMeta">mock rail, newest first</p>
-    <div id="chain"><div class="empty">waiting for rail state...</div></div>
-  </section>
+  <div class="card"><h2>Receipt chain</h2><div id="chain"></div></div>
 </div>
-<footer>
-  <span>Hackathon prototype.</span>
-  <span>Money figures are mock rail amounts.</span>
-</footer>
-<noscript><p class="banner">This console needs JavaScript to read the rail.</p></noscript>
 <script>
 const $ = id => document.getElementById(id);
-const EVENTS = ["GRANTED","ALLOWED","BLOCKED","AUTHORIZED","CAPTURED","REFUSED","VOIDED","E-STOP","REVOKED","UNKNOWN","CLEANUP_PENDING","FAILED"];
-const ESCROW_STATES = ["AUTHORIZED","CAPTURED","VOIDED","REFUSED","FAILED","UNKNOWN","CLEANUP_PENDING"];
-const IN_FLIGHT = new Set(["AUTHORIZED","CLEANUP_PENDING","UNKNOWN"]);
-let last = null;
-let filter = "ALL";
-let ticket = 0;
+const cents = c => "$" + (c/100).toFixed(2);
+const esc = s => String(s).replace(/[&<>"]/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-function esc(s) {
-  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
-  }[c]));
+// Advisory calibration score (Sol 6.1): display only, never blocks a spend.
+function calib(p){
+  const c = p.calibration;
+  if(!c) return "";
+  if(typeof c.S !== "number") return " · S n/a (advisory)";
+  return ` · S ${c.S.toFixed(2)} ${esc(c.verdict||"")} τ ${Number(c.tau).toFixed(2)} (advisory)`;
 }
-function money(c) {
-  const n = Number(c);
-  if (!Number.isFinite(n)) return "n/a";
-  const sign = n < 0 ? "-" : "";
-  return sign + "$" + (Math.abs(n) / 100).toFixed(2);
-}
-function barParts(p) {
-  const captured = Math.max(0, Number(p.captured_cents) || 0);
-  const reserved = Math.max(0, Number(p.reserved_cents) || 0);
-  const remaining = Math.max(0, Number(p.remaining_cents) || 0);
-  const cap = Math.max(0, Number(p.cap_cents) || 0);
-  const denom = Math.max(cap, captured + reserved + remaining, 1);
-  return {
-    captured: (100 * captured) / denom,
-    reserved: (100 * reserved) / denom,
-    remaining: (100 * remaining) / denom
-  };
-}
-function fmtSeq(seq) {
-  const s = String(seq == null ? "" : seq);
-  if (/^\d+$/.test(s)) return s.length < 2 ? s.padStart(2, "0") : s;
-  return s;
-}
-function evClass(ev) { return EVENTS.includes(ev) ? ev : "UNKNOWN"; }
-function receiptDetail(r) {
-  const p = (r && r.payload) || {};
-  switch (r.event) {
-    case "GRANTED":
-      return "cap " + money(p.cap_cents) + " | " + esc(p.agent_id || "");
-    case "ALLOWED":
-      return money(p.amount_cents) + " | " + esc(p.merchant_id || "");
-    case "BLOCKED":
-      return money(p.amount_cents == null ? 0 : p.amount_cents) + " | " + esc(p.reason || "");
-    case "AUTHORIZED":
-      return money(p.amount_cents) + " | mock rail auth" + (p.paypal_auth_id ? " " + esc(p.paypal_auth_id) : "");
-    case "CAPTURED":
-      if (p.paypal_capture_id) return money(p.amount_cents) + " | mock rail capture " + esc(p.paypal_capture_id);
-      return money(p.amount_cents) + " settled on mock rail";
-    case "REFUSED":
-      return esc(p.reason || "");
-    case "VOIDED":
-      if (p.amount_cents != null) return money(p.amount_cents) + " released";
-      if (p.escrow_id) return "escrow " + esc(p.escrow_id);
-      return "voided";
-    case "E-STOP":
-    case "REVOKED":
-      return "revoked | " + esc(p.permit_id || "");
-    case "UNKNOWN":
-      return esc(p.reason || "provider state unknown");
-    case "CLEANUP_PENDING":
-      return "void unconfirmed | " + esc(p.reason || "");
-    case "FAILED":
-      return "capture " + esc(p.status || "failed");
-    default:
-      return "";
+
+function receiptDetail(r){
+  const p = r.payload || {};
+  switch(r.event){
+    case "GRANTED": return `cap ${cents(p.cap_cents)} · ${esc(p.agent_id)}`;
+    case "ALLOWED": return `${cents(p.amount_cents)} · ${esc(p.merchant_id||"")}${calib(p)}`;
+    case "BLOCKED": return `${cents(p.amount_cents||0)} · ${esc(p.reason||"")}${calib(p)}`;
+    case "TAU_RAISED": return `advisory τ ${esc(p.from)} → ${esc(p.to)} · ${esc(p.actor||"")}`;
+    case "TAU_REFUSED": return `advisory τ ${esc(p.requested_tau)} refused · ${esc(p.reason||"")}`;
+    case "AUTHORIZED": return `${cents(p.amount_cents)} · paypal ${esc((p.paypal_auth_id||"").slice(0,14))}…`;
+    case "CAPTURED": return `${cents(p.amount_cents)} · capture ${esc((p.paypal_capture_id||"").slice(0,14))}…`;
+    case "REFUSED": return esc(p.reason||"");
+    case "VOIDED": return `escrow ${esc((p.escrow_id||"").slice(0,12))}…`;
+    case "REVOKED": return `permit ${esc((p.permit_id||"").slice(0,12))}…`;
+    case "E-STOP": return `permit ${esc((p.permit_id||"").slice(0,12))}… revoked`;
+    case "DELEGATED": return `cap ${cents(p.cap_cents)} · ${esc(p.agent_id||"")} · parent ${esc((p.parent_permit_id||"").slice(0,12))}…`;
+    case "REVOKED_CASCADE": return `cascade from ${esc((p.parent_id||"").slice(0,12))}… · revoked ${esc((p.permit_id||"").slice(0,12))}…`;
+    case "CARVE_RELEASED": return `${cents(p.released_cents||0)} back to parent ${esc((p.parent_permit_id||"").slice(0,12))}…`;
+    case "APPROVAL_REQUESTED": return `${cents(p.amount_cents)} · ${esc(p.merchant_id||"")} · needs principal`;
+    case "APPROVAL_DECIDED": return `${esc(p.decision||"")} · ${esc(p.actor||"")}`;
+    case "APPROVAL_PENDING": return `${cents(p.amount_cents)} · waiting on principal`;
+    default: return "";
   }
 }
-function escrowBadge(state) {
-  const s = String(state == null ? "" : state);
-  const known = ESCROW_STATES.includes(s);
-  return '<span class="st ' + (known ? s : "other") + '">' + esc(s || "UNKNOWN") + "</span>";
+
+async function decideApproval(id, approve){
+  const res = await fetch(`/api/approvals/${id}/${approve?"approve":"deny"}`,{method:"POST"});
+  const j = await res.json();
+  if(!j.ok) alert("decision failed: "+(j.error||"unknown"));
+  refresh();
 }
-function permitCard(p) {
-  const parts = barParts(p);
-  const allow = Array.isArray(p.allowlist) ? p.allowlist : [];
-  const chips = allow.length
-    ? allow.map(a => '<span class="chip">' + esc(a) + "</span>").join("")
-    : '<span class="empty inline">no merchants listed</span>';
-  const revoked = !!p.revoked;
-  return '<article class="card permit' + (revoked ? " revoked" : "") + '">'
-    + '<div class="pid-row"><div class="pid mono">' + esc(p.permit_id) + "</div>"
-    + '<div class="pill ' + (revoked ? "off" : "on") + '">' + (revoked ? "REVOKED" : "active") + "</div></div>"
-    + '<div class="money-row"><div><div class="money">' + money(p.remaining_cents) + "</div>"
-    + '<div class="money-sub">remaining of ' + money(p.cap_cents) + " cap</div></div>"
-    + '<span class="rail">MOCK RAIL</span></div>'
-    + '<div class="stack" aria-hidden="true">'
-    + '<i class="remaining" style="width:' + parts.remaining.toFixed(4) + '%"></i>'
-    + '<i class="reserved" style="width:' + parts.reserved.toFixed(4) + '%"></i>'
-    + '<i class="captured" style="width:' + parts.captured.toFixed(4) + '%"></i>'
-    + "</div>"
-    + '<div class="legend">'
-    + '<span><i class="sw remaining"></i>remaining <b>' + money(p.remaining_cents) + "</b></span>"
-    + '<span><i class="sw reserved"></i>reserved <b>' + money(p.reserved_cents) + "</b></span>"
-    + '<span><i class="sw captured"></i>captured <b>' + money(p.captured_cents) + "</b></span>"
-    + "</div>"
-    + '<div class="allow"><div class="k">allowlist</div><div class="chips">' + chips + "</div></div>"
-    + '<button class="estop" type="button" data-permit-id="' + esc(p.permit_id) + '" aria-label="E-STOP ' + esc(p.permit_id) + '"'
-    + (revoked ? " disabled" : "") + ">E-STOP</button></article>";
+
+async function estop(pid){
+  if(!confirm("E-STOP: revoke this permit and void every in-flight escrow?")) return;
+  const res = await fetch("/api/estop",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({permit_id:pid})});
+  const j = await res.json();
+  if(!j.ok) alert("e-stop failed: "+(j.error||"unknown"));
+  refresh();
 }
-function escrowRow(e) {
-  return '<div class="escrow"><div class="lhs"><div class="id mono">' + esc(e.escrow_id) + "</div>"
-    + '<div class="amtline"><span class="mono">' + money(e.amount_cents) + '</span> <span class="rail">MOCK RAIL</span></div></div>'
-    + escrowBadge(e.state) + "</div>";
+
+async function revokeTree(pid){
+  if(!confirm("Revoke this permit AND every descendant sub-permit (revocation wins the race)?")) return;
+  const res = await fetch("/api/revoke-cascade",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({permit_id:pid})});
+  const j = await res.json();
+  if(!j.ok) alert("revoke-cascade failed: "+(j.error||"unknown"));
+  refresh();
 }
-function showErr(kind, text) {
-  const el = $("err");
-  if (!text) {
-    el.style.display = "none";
-    el.className = "";
-    el.textContent = "";
-    return;
-  }
-  el.style.display = "block";
-  el.className = kind;
-  el.textContent = text;
+
+async function tightenPermit(pid, capCents){
+  const v = prompt(`Tighten cap for ${pid} (current cap ${cents(capCents)}).\nNew cap must be lower — authority only ever narrows:`, "");
+  if(v === null) return;
+  const nc = Math.round(Number(v.replace(/[^0-9.]/g,"")) * 100);
+  if(!nc || nc <= 0){ alert("enter a positive amount"); return; }
+  const res = await fetch("/api/tighten",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({permit_id:pid, cap_cents:nc})});
+  const j = await res.json();
+  if(!j.ok) alert("tighten failed: "+(j.error||"unknown"));
+  refresh();
 }
-function markLink(up) {
-  $("live").className = up ? "live" : "live down";
-  $("liveText").textContent = up ? "LIVE" : "LINK LOST";
-}
-function setChain(ok) {
-  const badge = $("chainBadge");
-  const cell = $("mChain");
-  if (ok) {
-    badge.textContent = "chain intact";
-    badge.className = "badge ok";
-    $("mChainVal").textContent = "INTACT";
-    $("mChainSub").textContent = "checks passed";
-    cell.className = "metric ok";
-  } else {
-    badge.textContent = "CHAIN BROKEN";
-    badge.className = "badge bad";
-    $("mChainVal").textContent = "BROKEN";
-    $("mChainSub").textContent = "checks failed";
-    cell.className = "metric bad";
-  }
-}
-function renderReceipts(receipts) {
-  const list = receipts.slice().reverse();
-  const shown = filter === "ALL" ? list : list.filter(r => r.event === filter);
-  const meta = $("chainMeta");
-  const suffix = "mock rail, newest first";
-  if (!list.length) meta.textContent = suffix;
-  else if (filter === "ALL") meta.textContent = list.length + " events | " + suffix;
-  else meta.textContent = shown.length + " of " + list.length + " | " + suffix;
-  const el = $("chain");
-  if (!list.length) {
-    el.innerHTML = '<div class="empty">no receipts yet</div>';
-    return;
-  }
-  if (!shown.length) {
-    el.innerHTML = '<div class="empty">no receipts for this event</div>';
-    return;
-  }
-  el.innerHTML = shown.map(r =>
-    '<div class="rcpt"><span class="seq">#' + esc(fmtSeq(r.seq)) + "</span>"
-    + '<span class="ev ' + evClass(r.event) + '">' + esc(r.event) + "</span>"
-    + '<span class="detail">' + receiptDetail(r) + "</span></div>"
-  ).join("");
-}
-function render(s) {
-  const permits = Array.isArray(s.permits) ? s.permits : [];
-  const escrows = Array.isArray(s.escrows) ? s.escrows : [];
-  const receipts = Array.isArray(s.receipts) ? s.receipts : [];
-  const active = permits.filter(p => !p.revoked).length;
-  const revokedN = permits.length - active;
-  $("mPermits").textContent = String(active);
-  $("mPermitsSub").textContent = !permits.length ? "none issued" : (!revokedN ? "all active" : revokedN + " revoked");
-  const flight = escrows.filter(e => IN_FLIGHT.has(e.state)).length;
-  $("mEscrows").textContent = String(flight);
-  $("mEscrowsSub").textContent = escrows.length + " on record";
-  $("mReceipts").textContent = String(receipts.length);
-  setChain(!!s.chain_ok);
-  const pending = escrows.filter(e => e.state === "CLEANUP_PENDING").length;
-  if (pending === 1) showErr("warn", "1 hold still needs cleanup. The reservation stays until the void confirms.");
-  else if (pending > 1) showErr("warn", pending + " holds still need cleanup. The reservation stays until the void confirms.");
-  else showErr("", "");
-  $("permits").innerHTML = permits.length
-    ? permits.map(permitCard).join("")
-    : '<div class="card"><div class="empty">no permits yet</div></div>';
-  $("escrows").innerHTML = escrows.length
-    ? escrows.map(escrowRow).join("")
-    : '<div class="empty">no escrows yet</div>';
-  renderReceipts(receipts);
-  markLink(true);
-}
-async function estop(pid) {
-  const msg = "E-STOP this permit (" + pid + ")? It will be revoked and in-flight holds voided. A void the mock rail does not confirm keeps that reservation.";
-  if (!confirm(msg)) return;
-  try {
-    const res = await fetch("/api/estop", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ permit_id: pid })
-    });
-    const j = await res.json();
-    if (!j || j.ok !== true) {
-      alert("e-stop failed: " + (j && j.error != null ? j.error : "unknown"));
-      return;
+
+function renderGraph(s){
+  // Carve and release ledger facts join permits into a delegation tree.
+  // Cascaded children lose their parent_id when the carve is released, so
+  // REVOKED_CASCADE receipts re-attach them under their revoked parent for
+  // the demo view ("revoked subtrees render distinctly").
+  const byId = {}; s.permits.forEach(p => byId[p.permit_id] = p);
+  const carve = {}, released = {}, cascadeParent = {};
+  s.receipts.forEach(r => {
+    const p = r.payload || {};
+    if(r.event === "DELEGATED") carve[p.child_permit_id] = p.cap_cents;
+    if(r.event === "CARVE_RELEASED") released[p.child_permit_id] = p.released_cents;
+    if(r.event === "REVOKED_CASCADE") cascadeParent[p.permit_id] = p.parent_id;
+  });
+  const kids = {}, via = {};
+  s.permits.forEach(p => {
+    let parent = p.parent_id, how = "live";
+    if(!parent && p.revoked && cascadeParent[p.permit_id] && byId[cascadeParent[p.permit_id]]){
+      parent = cascadeParent[p.permit_id]; how = "cascade";
     }
-    refresh();
-  } catch (e) {
-    alert("e-stop failed: dashboard link lost");
-  }
-}
-async function refresh() {
-  const my = ++ticket;
-  try {
-    const res = await fetch("/api/state");
-    if (!res.ok) throw new Error("bad status");
-    const s = await res.json();
-    if (my !== ticket) return;
-    last = s;
-    render(s);
-  } catch (e) {
-    if (my !== ticket) return;
-    markLink(false);
-    showErr("badlink", "dashboard link lost. retrying...");
-  }
-}
-function buildFilters() {
-  const sel = $("evFilter");
-  const all = document.createElement("option");
-  all.value = "ALL";
-  all.textContent = "ALL";
-  sel.appendChild(all);
-  EVENTS.forEach(ev => {
-    const o = document.createElement("option");
-    o.value = ev;
-    o.textContent = ev;
-    sel.appendChild(o);
+    if(parent){ (kids[parent] = kids[parent] || []).push(p.permit_id); via[p.permit_id] = how; }
   });
-  sel.addEventListener("change", () => {
-    filter = sel.value;
-    if (last) renderReceipts(Array.isArray(last.receipts) ? last.receipts : []);
-  });
+  const hasParent = new Set(Object.keys(via));
+  const roots = s.permits.filter(p => !hasParent.has(p.permit_id));
+
+  function edgeLabel(id){
+    if(carve[id] == null) return "";
+    if(released[id] != null)
+      return `<div class="carve released">carve ${cents(carve[id])} released${via[id]==="cascade"?" by cascade":""} back to parent</div>`;
+    return `<div class="carve">carved ${cents(carve[id])} from parent · still held</div>`;
+  }
+  function node(p, depth){
+    const dis = p.revoked ? "disabled" : "";
+    const status = p.revoked
+      ? (via[p.permit_id]==="cascade" ? "REVOKED · cascade" : "REVOKED")
+      : "active";
+    const capLine = (p.effective_cap_cents != null && p.effective_cap_cents < p.cap_cents)
+      ? `<span style="color:var(--dim)">remaining of ${cents(p.effective_cap_cents)} (tightened from ${cents(p.cap_cents)})</span>`
+      : `<span style="color:var(--dim)">remaining of ${cents(p.cap_cents)}</span>`;
+    let h = `<div class="node${depth===0?" root":""}${p.revoked?" revoked":""}">`;
+    h += edgeLabel(p.permit_id);
+    h += `<div class="nodehead"><span><b>${esc(p.agent_id)}</b>
+      <span class="mono" style="color:var(--dim)">${esc(p.permit_id.slice(0,14))}…</span></span>
+      <span><b>${cents(p.remaining_cents)}</b> ${capLine}</span></div>`;
+    h += `<div class="kv"><span>reserved</span><b>${cents(p.reserved_cents)}</b></div>
+          <div class="kv"><span>captured</span><b>${cents(p.captured_cents)}</b></div>
+          <div class="kv"><span>status</span><b>${status}</b></div>`;
+    h += `<div class="controls">
+      <button class="ctl danger" ${dis} onclick="revokeTree('${esc(p.permit_id)}')">REVOKE TREE</button>
+      <button class="ctl" ${dis} onclick="tightenPermit('${esc(p.permit_id)}',${p.effective_cap_cents||p.cap_cents})">TIGHTEN</button>
+    </div>`;
+    (kids[p.permit_id]||[]).forEach(cid => { h += node(byId[cid], depth+1); });
+    return h + `</div>`;
+  }
+  return roots.length
+    ? roots.map(p => node(p, 0)).join("")
+    : `<div class="empty">no permits yet</div>`;
 }
-$("permits").addEventListener("click", e => {
-  const btn = e.target.closest("button.estop");
-  if (!btn || btn.disabled) return;
-  estop(btn.dataset.permitId);
-});
-buildFilters();
-setInterval(refresh, 1000);
-refresh();
+
+async function refresh(){
+  try{
+    const s = await (await fetch("/api/state")).json();
+    $("err").style.display = "none";
+    const cb = $("chainBadge");
+    cb.textContent = s.chain_ok ? "chain intact · "+s.receipts.length+" receipts"
+                                : "CHAIN BROKEN";
+    cb.className = "badge " + (s.chain_ok ? "ok" : "bad");
+
+    $("permits").innerHTML = s.permits.length ? s.permits.map(p=>{
+      const pct = p.cap_cents ? Math.max(0,100*p.remaining_cents/p.cap_cents) : 0;
+      return `<div class="permit card ${p.revoked?"revoked":""}">
+        <div class="mono" style="color:var(--dim)">${esc(p.permit_id)}</div>
+        ${p.parent_id?`<div class="mono" style="color:var(--dim);font-size:11px">sub-permit of ${esc(p.parent_id.slice(0,14))}…</div>`:""}
+        <div class="money">${cents(p.remaining_cents)} <small>remaining of ${cents(p.cap_cents)}</small></div>
+        <div class="bar"><i style="width:${pct}%"></i></div>
+        <div class="kv"><span>reserved</span><b>${cents(p.reserved_cents)}</b></div>
+        <div class="kv"><span>captured</span><b>${cents(p.captured_cents)}</b></div>
+        <div class="kv"><span>allowlist</span><b class="mono">${p.allowlist.map(esc).join(", ")}</b></div>
+        <div class="kv"><span>status</span><b>${p.revoked?"REVOKED":"active"}</b></div>
+        <button class="estop" ${p.revoked?"disabled":""}
+          onclick="estop('${esc(p.permit_id)}')">E-STOP</button>
+      </div>`;
+    }).join("") : `<div class="empty">no permits yet</div>`;
+
+    $("escrows").innerHTML = s.escrows.length ? s.escrows.map(e=>
+      `<div class="escrow"><span class="mono">${esc(e.escrow_id.slice(0,14))}… ·
+        ${cents(e.amount_cents)}</span>
+        <span class="st ${e.state}">${e.state}</span></div>`
+    ).join("") : `<div class="empty">no escrows in flight</div>`;
+
+    $("graph").innerHTML = renderGraph(s);
+
+    $("approvals").innerHTML = (s.approvals||[]).length ? s.approvals.map(a=>
+      `<div class="escrow"><span>${cents(a.amount_cents)} · ${esc(a.merchant_id)}<br>
+        <span class="mono" style="color:var(--dim)">${esc(a.agent_id)} · expires ${esc(a.expires_at.slice(11,16))} UTC</span></span>
+        <span><button class="st" style="color:var(--green);border-color:var(--green);background:none;cursor:pointer;margin-right:6px"
+          onclick="decideApproval('${esc(a.approval_id)}',true)">APPROVE</button><button class="st"
+          style="color:var(--red);border-color:var(--red);background:none;cursor:pointer"
+          onclick="decideApproval('${esc(a.approval_id)}',false)">DENY</button></span></div>`
+    ).join("") : `<div class="empty">no pending approvals</div>`;
+
+    $("chain").innerHTML = s.receipts.length ? [...s.receipts].reverse().map(r=>
+      `<div class="rcpt"><span class="seq">#${String(r.seq).padStart(2,"0")}</span>
+       <span class="ev ${r.event}">${r.event}</span>
+       <span class="detail">${receiptDetail(r)}</span></div>`
+    ).join("") : `<div class="empty">no receipts yet</div>`;
+  }catch(e){ const el=$("err"); el.style.display="block";
+    el.textContent="dashboard link lost — retrying…"; }
+}
+setInterval(refresh, 1000); refresh();
 </script>
 </body>
 </html>

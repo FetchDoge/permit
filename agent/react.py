@@ -8,7 +8,9 @@ the tools in SpendTools; anything else the model emits is ignored.
 Transcript: every turn is appended to a JSONL transcript (llm text,
 parsed action, observation) so the video can show the agent's real
 reasoning trace. --replay <transcript> re-runs a saved transcript
-without calling the LLM (offline fallback for recording day).
+without calling the LLM (offline fallback for recording day): the
+recorded reasoning is replayed verbatim and the recorded actions are
+re-executed against the live tools, so the receipts stay real.
 """
 
 from __future__ import annotations
@@ -20,11 +22,11 @@ import re
 import subprocess
 import sys
 
-# Path to the LLM runner CLI. Configurable via PERMIT_GROK_CLI so the repo
-# carries no hardcoded local paths; the default is the author's workspace.
-GROK_CLI = os.environ.get(
-    "PERMIT_GROK_CLI", "/home/hatch/workspace/skills/grok/bin/grok.py"
-)
+# Path to the LLM runner CLI, set via the PERMIT_GROK_CLI environment
+# variable. There is no built-in default, so the repo carries no local paths.
+# Resolved at call time by _grok_cli(); this constant mirrors the value seen
+# at import time ("" when unset).
+GROK_CLI = os.environ.get("PERMIT_GROK_CLI", "")
 
 SYSTEM_TEMPLATE = """You are a shopping agent with a spending permit. You can spend ONLY \
 through your tools - you have no other way to move money.
@@ -36,13 +38,26 @@ Tools (one call per turn):
 Args: {"escrow_id": str}
 - check_permit: see your permit's remaining budget. \
 Args: {}
+- delegate_subpermit: carve a sub-permit out of your remaining cap for \
+another agent. Args: {"cap_cents": int, "agent_id": str, \
+"expiry_minutes": int}. The child inherits your merchant allowlist and \
+cannot outlive or outspend your permit.
+- check_approval: poll a principal-approval request. \
+Args: {"approval_id": str}
+- complete_approved_spend: execute a principal-approved spend. \
+Args: {"approval_id": str}
 
 Rules:
 - Amounts are in cents (3000 = $30.00).
 - If a spend is BLOCKED, do NOT retry it or split it into smaller spends \
 to dodge the cap. Report the refusal.
+- If a spend is PENDING (above your permit's approval threshold), use \
+check_approval to poll; once approved, call complete_approved_spend, \
+then deliver as usual. A denied approval is final: report it.
 - After an ALLOWED spend, call deliver with the escrow_id to complete \
 the purchase, then report the capture id - unless the task says not to.
+- Delegation never increases total spending power: the carved cap is \
+reserved on your permit until the child spends or is revoked.
 - Keep reasoning short.
 
 Respond in exactly this format each turn:
@@ -91,10 +106,99 @@ def parse_action(text: str):
     return m_action.group(1), None
 
 
+def _grok_cli() -> str:
+    """Resolve the Grok runner path from PERMIT_GROK_CLI at call time.
+
+    Raises RuntimeError with setup guidance when the variable is unset.
+    """
+    cli = os.environ.get("PERMIT_GROK_CLI", "").strip()
+    if not cli:
+        raise RuntimeError(
+            "agent LLM backend not configured: PERMIT_GROK_CLI is not set. "
+            "Set PERMIT_GROK_CLI to the path of your Grok runner script, or run "
+            "the demo with --replay <transcript> (fully offline)."
+        )
+    return cli
+
+
+def llm_preflight() -> None:
+    """
+    Fail fast when the agent's LLM backend is unavailable.
+
+    The demo agent reasons through a real LLM unless --replay is used.
+    A missing runner must surface here — with setup guidance — not as a
+    mid-demo subprocess failure after beats have already run.
+    """
+    cli = _grok_cli()
+    if not os.path.isfile(cli):
+        raise RuntimeError(
+            f"agent LLM backend unavailable: {cli!r} is not a file. "
+            "Set PERMIT_GROK_CLI to the Grok runner, or run the demo with "
+            "--replay <transcript> (fully offline)."
+        )
+
+
+def _execute_tool(tools, name: str, args: dict) -> str:
+    """Run one tool call. Tool errors become observations, not crashes."""
+    fn = getattr(tools, name, None)
+    if fn is None or name.startswith("_") or name == "deliver_tampered":
+        return json.dumps({"ok": False, "error": f"unknown tool {name!r}"})
+    try:
+        return fn(**args)
+    except Exception as e:  # tool errors are observations, not crashes
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+def _remap_ids(value, id_map: dict[str, str]):
+    """
+    Rewrite recorded ids to this run's fresh ids (exact string match).
+
+    Replay re-executes the recorded actions, but ids are minted fresh each
+    run — so a recorded deliver(escrow_id=<old>) must follow the fresh
+    escrow_id the re-executed attempt_spend just returned.
+    """
+    if isinstance(value, dict):
+        return {k: _remap_ids(v, id_map) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_remap_ids(v, id_map) for v in value]
+    if isinstance(value, str) and value in id_map:
+        return id_map[value]
+    return value
+
+
+def _learn_ids(recorded_text: str, fresh_text: str,
+               id_map: dict[str, str]) -> None:
+    """
+    Map recorded ids -> fresh ids by comparing the recorded observation
+    with the fresh one. Any string field whose key names an id
+    (endswith "_id" / "_ids") is paired; lists pair positionally.
+    """
+    try:
+        rec = json.loads(recorded_text)
+        fresh = json.loads(fresh_text)
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(rec, dict) or not isinstance(fresh, dict):
+        return
+    for key, rec_val in rec.items():
+        if key not in fresh:
+            continue
+        if not (key.endswith("_id") or key.endswith("_ids")):
+            continue
+        fresh_val = fresh[key]
+        if isinstance(rec_val, str) and isinstance(fresh_val, str):
+            if rec_val != fresh_val:
+                id_map[rec_val] = fresh_val
+        elif isinstance(rec_val, list) and isinstance(fresh_val, list):
+            for r, f in zip(rec_val, fresh_val):
+                if isinstance(r, str) and isinstance(f, str) and r != f:
+                    id_map[r] = f
+
+
 def llm_turn(system: str, history: str) -> str:
     """One Grok call. Returns the raw text (receipt stripped)."""
     proc = subprocess.run(
-        [sys.executable, GROK_CLI, "chat", history,
+        [sys.executable, _grok_cli(), "chat", history,
          "--system", system, "--temperature", "0.3",
          "--max-tokens", "400"],
         capture_output=True, text=True, timeout=180,
@@ -112,8 +216,15 @@ def run_agent(tools, task: str, transcript_path: str,
     Drive the agent on `task`. Returns the final ANSWER.
     Every turn is appended to transcript_path as JSONL, sectioned by beat.
     With replay=<path>, replays that transcript's turns for this beat
-    without calling the LLM (offline fallback for recording day).
+    without calling the LLM (offline fallback for recording day): the
+    recorded reasoning text is replayed verbatim and the recorded ACTIONS
+    are re-executed against the live tools, so the receipts stay real.
     """
+    if replay is None:
+        # The agent reasons through a real LLM: verify the runner exists
+        # before any beat runs, with setup guidance on failure.
+        llm_preflight()
+
     transcript = open(transcript_path, "a")
     history = f"TASK: {task}\n"
     log = lambda obj: (transcript.write(json.dumps(obj) + "\n"),
@@ -121,18 +232,49 @@ def run_agent(tools, task: str, transcript_path: str,
     system = build_system(list(tools.catalog.keys()))
 
     if replay:
-        # Offline fallback: replay this beat's section of a saved transcript.
-        final, in_beat = "", False
+        # Offline fallback: this beat's recorded turns, no LLM call.
+        # Recorded actions are RE-EXECUTED (deterministic on the mock
+        # rail); the fresh observations replace the recorded ones, and
+        # recorded ids are remapped to the fresh ids so chained calls
+        # (deliver after attempt_spend) follow the new ids.
+        section, in_beat = [], False
         for line in open(replay):
             obj = json.loads(line)
             if obj.get("type") == "beat":
                 in_beat = obj.get("n") == beat
                 continue
-            if not in_beat:
+            if in_beat:
+                section.append(obj)
+        final = ""
+        id_map: dict[str, str] = {}
+        i = 0
+        while i < len(section):
+            obj = section[i]
+            otype = obj.get("type")
+            if otype == "action":
+                if i + 1 >= len(section) or section[i + 1].get("type") != "observation":
+                    raise ValueError(
+                        f"replay transcript corrupt at beat {beat}: "
+                        "action without a following observation"
+                    )
+                rec_obs = section[i + 1]
+                name = obj["tool"]
+                args = _remap_ids(obj.get("args") or {}, id_map)
+                obs_text = _execute_tool(tools, name, args)
+                log({"type": "action", "tool": name, "args": args})
+                log({"type": "observation", "text": obs_text})
+                _learn_ids(rec_obs.get("text", ""), obs_text, id_map)
+                i += 2
+                continue
+            if otype == "observation":
+                # Stray recorded observation (its action was re-executed
+                # above): skip it, the fresh one stands.
+                i += 1
                 continue
             log(obj)
-            if obj.get("type") == "answer":
+            if otype == "answer":
                 final = obj["text"]
+            i += 1
         transcript.close()
         return final
 
@@ -159,15 +301,7 @@ def run_agent(tools, task: str, transcript_path: str,
             continue
 
         log({"type": "action", "tool": name, "args": args})
-        fn = getattr(tools, name, None)
-        if fn is None or name.startswith("_") or name == "deliver_tampered":
-            obs = json.dumps({"ok": False,
-                              "error": f"unknown tool {name!r}"})
-        else:
-            try:
-                obs = fn(**args)
-            except Exception as e:  # tool errors are observations, not crashes
-                obs = json.dumps({"ok": False, "error": str(e)})
+        obs = _execute_tool(tools, name, args)
         history += f"OBSERVATION: {obs}\n"
         log({"type": "observation", "text": obs})
 

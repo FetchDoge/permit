@@ -5,7 +5,10 @@ Runs the whole spend pipeline and prints the receipt chain:
   1. grant a permit (cap $50, one merchant, 1h expiry)
   2. ALLOWED spend: $30 to the allowed merchant -> hold -> release -> capture
   3. BLOCKED spend: $30 over the remaining cap -> receipt, PayPal never called
-  4. E-stop on a second permit mid-hold -> escrow voided, release refused
+  4. Delegate a $15 sub-permit. The child holds $10. Revoke the parent.
+     The cascade revokes the child, this run's void confirms, and a
+     later release is refused. An unconfirmed void would leave the cap
+     reserved.
 
 Every step prints its ledger receipts. Nothing here is faked: the chain
 verifies at the end, and the mock PayPal client records every call.
@@ -32,7 +35,15 @@ from settlement.verifier import Evidence, PredicateType, ReleaseVerifier, sign_a
 def show(receipts, prefix=""):
     for r in receipts:
         p = r.payload
-        detail = p.get("reason", p.get("permit_id", ""))
+        if r.event_type == "DELEGATED":
+            detail = (
+                f"child of {p.get('parent_permit_id', '')} cap "
+                f"${(p.get('cap_cents') or 0) / 100:.2f}"
+            )
+        elif r.event_type == "REVOKED_CASCADE":
+            detail = f"cascade from {p.get('parent_id', '')} revoked {p.get('permit_id', '')}"
+        else:
+            detail = p.get("reason", p.get("permit_id", ""))
         print(f"{prefix}#{r.seq:02d} {r.event_type:10s} {detail}")
 
 
@@ -72,18 +83,35 @@ def demo_mock():
     show(attempt.receipts)
     print(f"   PayPal authorize calls after block: {len(paypal.authorizations)} (unchanged)")
 
-    print("== 4. e-stop mid-hold on a second permit ==")
-    permit2, _ = permits.grant(
-        agent_id="demo_agent",
+    print("== 4. delegate a $15 sub-permit; child holds $10; revoke parent cascades ==")
+    parent, _ = permits.grant(
+        agent_id="budget_owner",
         cap_cents=5000,
         allowlist=[merchant],
         expiry=datetime.now(timezone.utc) + timedelta(hours=1),
     )
-    attempt2 = flow.spend(permit2.permit_id, 1000, merchant, PredicateType.D, digest)
-    receipt, voided = flow.estop(permit2.permit_id)
-    show((receipt,) + tuple(ledger.receipts()[-len(voided):]))
+    res = permits.delegate(
+        parent.permit_id, "buying_agent", 1500, [merchant],
+        parent.expiry - timedelta(minutes=5),
+    )
+    assert res.ok, f"delegate must succeed: {res.reason}"
+    child = res.permit
+    print(f"   parent {parent.permit_id} cap $50.00")
+    print(f"   child  {child.permit_id} cap $15.00 (carved from parent remaining)")
+    attempt2 = flow.spend(child.permit_id, 1000, merchant, PredicateType.D, digest)
+    assert attempt2.allowed, "child spend should be allowed"
+    receipt, voided = flow.revoke_cascade(parent.permit_id)
+    show((receipt,) + tuple(r for r in ledger.receipts() if r.event_type == "REVOKED_CASCADE"))
+    cascaded = [r for r in ledger.receipts() if r.event_type == "REVOKED_CASCADE"]
+    print(f"   cascade: {len(cascaded)} descendant(s) revoked, voids confirmed: {len(voided)}.")
     refused = flow.release(attempt2.escrow_id, Evidence(delivered_bytes=artifact))
-    print(f"   post-e-stop release: released={refused.released} reason={refused.reason}")
+    print(f"   post-cascade release: released={refused.released} reason={refused.reason}")
+    print(f"   parent remaining ${parent.remaining_cents() / 100:.2f} (unspent carve released)")
+    assert receipt.event_type == "E-STOP", "missing e-stop receipt"
+    assert len(cascaded) == 1 and cascaded[0].payload["permit_id"] == child.permit_id
+    assert parent.revoked and child.revoked, "cascade must revoke parent and child"
+    assert attempt2.escrow_id in voided, "cascade did not confirm the child's void"
+    assert not refused.released, "release after cascade must be refused"
 
     ok, reason = ledger.verify_chain()
     print(f"== ledger chain: {'VERIFIED' if ok else 'BROKEN: ' + reason} ({len(ledger)} receipts)")

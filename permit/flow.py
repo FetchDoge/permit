@@ -11,7 +11,11 @@ Spend pipeline: the only path from a spend attempt to money movement.
     estop():   revoke the permit, void every in-flight escrow AND every
                outstanding authorized-but-unregistered hold whose provider
                void is confirmed. Unconfirmed cleanup stays reserved and is
-               reported on EstopResult.unresolved.
+               reported on EstopResult.unresolved. Cascades to descendants.
+    delegate(): carve a sub-permit out of a permit's remaining cap.
+    revoke_cascade():
+               revoke a permit and all descendants, void every in-flight
+               hold in the subtree, release unspent delegation carves.
 
 Invariant: no PayPal authorize or capture is reachable without an ALLOWED
 receipt on the same permit for the same attempt. The pipeline is the only
@@ -49,7 +53,7 @@ from datetime import datetime, timezone
 
 from .ledger import Ledger, Receipt
 from .permit import PermitStore
-from settlement.verifier import Escrow
+from settlement.verifier import Escrow, PredicateType
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,8 @@ class SpendAttempt:
     reason: str
     escrow_id: str | None
     receipts: tuple[Receipt, ...]
+    # Set when the attempt is gated on principal approval.
+    approval_id: str | None = None
 
 
 class ApprovalRequired(Exception):
@@ -303,10 +309,7 @@ class SpendPipeline:
 
     def _find_check_receipt(self, auth_id: str) -> Receipt | None:
         """Locate the ALLOWED receipt for an outstanding auth_id, if any."""
-        for r in self.ledger.receipts():
-            if r.event_type == "ALLOWED" and r.payload.get("auth_id") == auth_id:
-                return r
-        return None
+        return self.ledger.allowed_receipt(auth_id)
 
     # -- spend ----------------------------------------------------------------
 
@@ -317,10 +320,20 @@ class SpendPipeline:
         merchant_id: str,
         predicate_type,
         artifact_hash: str,
+        approval_id: str | None = None,
     ) -> SpendAttempt:
         """
         One spend attempt. Returns ALLOWED + escrow_id on success, or
         BLOCKED with the receipt and zero PayPal traffic.
+
+        Principal approvals: when the permit's approval threshold is set
+        and amount_cents exceeds it, the attempt does NOT reserve — it
+        returns pending_principal_approval with an approval_id. The
+        principal approves/denies out of band; complete_approved_spend()
+        then re-runs the full authority check (fail-closed if the budget
+        moved). Pass approval_id to execute an already-approved request;
+        the id binds the exact (permit, amount, merchant) — anything else
+        is rejected as invalid_approval.
 
         With the real sandbox client, paypal.authorize() may raise
         NeedsPayerApproval: the cap reservation stays held and the caller
@@ -344,11 +357,93 @@ class SpendPipeline:
             )
             return SpendAttempt(False, "merchant_not_bound", None, (receipt,))
 
+        # (6a2) Principal-approval gate. Runs BEFORE check() so a pending
+        # request never reserves cap. claim_approval() is atomic under
+        # _store_lock (approved → claimed) so two concurrent spends cannot
+        # both observe the same approval as approved.
+        claimed = False
+        if approval_id is not None:
+            if not self.permits.claim_approval(
+                approval_id,
+                permit_id=permit_id,
+                amount_cents=amount_cents,
+                merchant_id=merchant_id,
+            ):
+                receipt = self.ledger.append(
+                    "BLOCKED",
+                    {
+                        "permit_id": permit_id,
+                        "amount_cents": amount_cents
+                        if isinstance(amount_cents, int)
+                        else repr(amount_cents),
+                        "merchant_id": merchant_id,
+                        "reason": "invalid_approval",
+                        "approval_id": approval_id,
+                    },
+                )
+                return SpendAttempt(False, "invalid_approval", None, (receipt,))
+            claimed = True
+        else:
+            threshold = self.permits.approval_threshold(permit_id)
+            if (
+                threshold is not None
+                and isinstance(amount_cents, int)
+                and not isinstance(amount_cents, bool)
+                and amount_cents > threshold
+            ):
+                # The 4-clause check must pass first: no approval request
+                # for a spend the authority would refuse anyway.
+                probe = self.permits.eligible(
+                    permit_id, amount_cents, merchant_id
+                )
+                if probe.allowed:
+                    predicate_value = (
+                        predicate_type.value
+                        if hasattr(predicate_type, "value")
+                        else str(predicate_type)
+                    )
+                    approval = self.permits.request_approval(
+                        permit_id,
+                        amount_cents,
+                        merchant_id,
+                        predicate_value,
+                        artifact_hash,
+                    )
+                    receipt = self.ledger.append(
+                        "APPROVAL_PENDING",
+                        {
+                            "permit_id": permit_id,
+                            "amount_cents": amount_cents,
+                            "merchant_id": merchant_id,
+                            "reason": "pending_principal_approval",
+                            "approval_id": approval.approval_id,
+                            "threshold_cents": threshold,
+                        },
+                    )
+                    return SpendAttempt(
+                        False,
+                        "pending_principal_approval",
+                        None,
+                        (receipt,),
+                        approval.approval_id,
+                    )
+                # else: fall through to check() for the authoritative BLOCKED.
+
         # (6b) check() as before (ALLOWED reserves cap).
         check = self.permits.check(permit_id, amount_cents, merchant_id)
         if not check.allowed:
             # BLOCKED: receipt written by check(). PayPal is never called.
+            # Restore a claimed approval so the principal's word stands;
+            # only the authority recheck failed. The agent may retry
+            # complete_approved_spend() later.
+            if claimed:
+                self.permits.restore_approval(approval_id)
             return SpendAttempt(False, check.reason, None, (check.receipt,))
+
+        if claimed:
+            # The principal's word is now spent: single-consumption, so one
+            # approval can never authorize two holds.
+            self.permits.consume_approval(approval_id)
 
         auth_id = check.receipt.payload["auth_id"]
         # (6c) Track the outstanding operation BEFORE the external call,
@@ -360,11 +455,7 @@ class SpendPipeline:
             pp_auth = self._authorize(
                 amount_cents,
                 merchant_id,
-                # Attempt key, not a call key: the sandbox client derives
-                # distinct PayPal-Request-Id values for create vs authorize,
-                # because PayPal replays the prior response when one request
-                # id is reused across different API calls.
-                idempotency_key=f"{permit_id}:{auth_id}",
+                idempotency_key=f"{permit_id}:{auth_id}:authorize",
             )
         except Exception as exc:
             if _is_needs_payer_approval(exc):
@@ -570,23 +661,80 @@ class SpendPipeline:
         """Evidence in, money out - or a REFUSED receipt. Pass-through."""
         return self.verifier.verify_and_capture(escrow_id, evidence)
 
-    def estop(self, permit_id: str) -> EstopResult:
+    def approve_approval(
+        self, approval_id: str, actor: str = "human"
+    ):
         """
-        E-stop: revoke the permit, void every in-flight escrow, AND void
-        every outstanding authorized-but-unregistered hold (the threaded
-        case of the P1-1 race — the in-authorize case is caught by the
-        post-authorize recheck in spend()).
+        The principal's word: approve a pending above-threshold spend.
+        Approval alone moves no money; the agent completes it with
+        complete_approved_spend(), which re-runs the authority check.
+        """
+        return self.permits.decide_approval(approval_id, True, actor=actor)
 
-        Returns an EstopResult: the e-stop receipt, the voided ids (escrow
-        ids for registered escrows, permit auth_ids for outstanding
-        unregistered holds), unknown_open — escrows in UNKNOWN state,
-        which e-stop deliberately does not void (racing a pending capture
-        could double-move money), and unresolved — cleanup that was not
-        confirmed. Those stay reserved; reconcile() remains the path for
-        UNKNOWN, and retry_cleanup() remains the path for an unregistered
-        pending void. Failed or ambiguous voids are not listed as voided.
+    def deny_approval(
+        self, approval_id: str, actor: str = "human"
+    ):
+        """The principal refuses: the spend can never complete."""
+        return self.permits.decide_approval(approval_id, False, actor=actor)
+
+    def complete_approved_spend(self, approval_id: str) -> SpendAttempt:
         """
-        receipt, in_flight_auth_ids = self.permits.estop(permit_id)
+        Execute a principal-approved spend. The approval binds the exact
+        (permit, amount, merchant, predicate, artifact): spend() re-runs
+        the full authority check with the stored parameters, so a budget
+        that moved since approval fails closed.
+        """
+        approval = self.permits.get_approval(approval_id)
+        if approval is None or approval.status != "approved":
+            receipt = self.ledger.append(
+                "BLOCKED",
+                {
+                    "permit_id": approval.permit_id if approval else None,
+                    "reason": "approval_not_approved",
+                    "approval_id": approval_id,
+                },
+            )
+            return SpendAttempt(False, "approval_not_approved", None, (receipt,))
+        return self.spend(
+            approval.permit_id,
+            approval.amount_cents,
+            approval.merchant_id,
+            PredicateType(approval.predicate_type),
+            approval.artifact_hash,
+            approval_id=approval_id,
+        )
+
+    def delegate(
+        self,
+        parent_permit_id: str,
+        agent_id: str,
+        cap_cents: int,
+        allowlist: list[str],
+        expiry: datetime,
+    ):
+        """
+        Carve a sub-permit out of a parent permit's remaining cap.
+        Thin pass-through to the permit store; constraints are enforced
+        there (unknown/revoked/expired parent, over-cap, merchant
+        escalation, expiry beyond parent).
+        """
+        return self.permits.delegate(
+            parent_permit_id, agent_id, cap_cents, allowlist, expiry
+        )
+
+    def _void_permit_holds(
+        self, permit_id: str, in_flight_auth_ids: list[str]
+    ) -> tuple[list[str], list[str], list[str]]:
+        """
+        Void one permit's in-flight holds: registered escrows via the
+        verifier, plus outstanding authorized-but-unregistered holds
+        (the P1-1 race window). Shared by estop() and revoke_cascade().
+
+        Returns (voided, unknown_open, unresolved). Unconfirmed voids keep
+        the reservation and are listed in unresolved; UNKNOWN escrows are
+        listed in unknown_open and are not raced with a void. Failures are
+        collected rather than raising mid-loop.
+        """
         voided: list[str] = []
         unknown_open: list[str] = []
         unresolved: list[str] = []
@@ -635,4 +783,68 @@ class SpendPipeline:
                 voided.append(auth_id)
             else:
                 unresolved.append(auth_id)
+        return voided, unknown_open, unresolved
+
+    def revoke_cascade(self, permit_id: str) -> tuple[Receipt, list[str]]:
+        """
+        Revoke a permit and every descendant permit, void every in-flight
+        hold in the subtree, then release unspent delegation carves
+        post-order (children before parents).
+
+        Returns the root receipt and the voided ids, mirroring estop().
+        """
+        receipt, in_flight = self.permits.revoke_subtree(permit_id)
+        voided: list[str] = []
+        for pid, auth_ids in in_flight.items():
+            v, _unknown, _unresolved = self._void_permit_holds(pid, auth_ids)
+            voided.extend(v)
+        # Release carves post-order: children before parents. The subtree
+        # map is keyed by permit; a child's parent always appears earlier
+        # in a BFS order, so reversed() yields children first. Permits
+        # without a parent (the root) are skipped by release_carve().
+        for pid in reversed(list(in_flight.keys())):
+            self.permits.release_carve(pid)
+        # Also release carves for revoked children that had no in-flight
+        # holds (they are not in the in_flight map).
+        for pid in reversed(self.permits.children_of(permit_id)):
+            self._release_subtree_carves(pid)
+        return receipt, voided
+
+    def _release_subtree_carves(self, permit_id: str) -> None:
+        """release_carve() for a permit and all its descendants, post-order."""
+        for cid in self.permits.children_of(permit_id):
+            self._release_subtree_carves(cid)
+        self.permits.release_carve(permit_id)
+
+    def estop(self, permit_id: str) -> EstopResult:
+        """
+        E-stop: revoke the permit, void every in-flight escrow, AND void
+        every outstanding authorized-but-unregistered hold (the threaded
+        case of the P1-1 race — the in-authorize case is caught by the
+        post-authorize recheck in spend()).
+
+        Returns an EstopResult: the e-stop receipt, the voided ids (escrow
+        ids for registered escrows, permit auth_ids for outstanding
+        unregistered holds), unknown_open — escrows in UNKNOWN state,
+        which e-stop deliberately does not void (racing a pending capture
+        could double-move money), and unresolved — cleanup that was not
+        confirmed. Those stay reserved; reconcile() remains the path for
+        UNKNOWN, and retry_cleanup() remains the path for an unregistered
+        pending void. Failed or ambiguous voids are not listed as voided.
+
+        The e-stop cascades: every descendant permit is revoked and its
+        in-flight holds are voided too (parent first, then descendants).
+        Failures are collected across the whole subtree rather than
+        raising mid-loop.
+        """
+        receipt, in_flight = self.permits.estop_cascade(permit_id)
+        voided: list[str] = []
+        unknown_open: list[str] = []
+        unresolved: list[str] = []
+        for pid, auth_ids in in_flight.items():
+            v, uo, ur = self._void_permit_holds(pid, auth_ids)
+            voided.extend(v)
+            unknown_open.extend(uo)
+            unresolved.extend(ur)
         return EstopResult(receipt, voided, unknown_open, unresolved)
+

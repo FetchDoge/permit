@@ -84,6 +84,20 @@ class ApprovalTimeout(Exception):
         self.last_status = last_status
 
 
+class SandboxAPIError(RuntimeError):
+    """Raised when a sandbox HTTP call returns an unexpected status.
+
+    Explicit (not assert): identical under python -O. A failed void must
+    not be reported as success.
+    """
+
+    def __init__(self, operation: str, status: int, body):
+        super().__init__(f"{operation} failed: {status} {body}")
+        self.operation = operation
+        self.status = status
+        self.body = body
+
+
 def _is_network_timeout(exc: BaseException) -> bool:
     """True for transport-level failures that leave provider state unknown.
 
@@ -179,7 +193,8 @@ class SandboxPayPalClient(PayPalClient):
             },
             request_id=idempotency_key,
         )
-        assert status in (200, 201), f"order create failed: {status} {order}"
+        if status not in (200, 201):
+            raise SandboxAPIError("order create", status, order)
         approval_url = next(
             l["href"] for l in order["links"] if l["rel"] == "approve"
         )
@@ -192,7 +207,8 @@ class SandboxPayPalClient(PayPalClient):
         """
         self._ensure_token()
         status, order = self._http("GET", f"/v2/checkout/orders/{order_id}")
-        assert status == 200, f"order fetch failed: {status} {order}"
+        if status != 200:
+            raise SandboxAPIError("order fetch", status, order)
         return order["status"]
 
     def wait_for_approval(self, order_id: str, timeout_s: float = 120,
@@ -261,12 +277,27 @@ class SandboxPayPalClient(PayPalClient):
             for d in (auth_body or {}).get("details", [])
         ):
             raise NeedsPayerApproval(order_id, self._approval_url(order_id))
-        assert status in (200, 201), f"authorize failed: {status} {auth_body}"
+        if status == 422 and any(
+            d.get("issue") == "ORDER_ALREADY_AUTHORIZED"
+            for d in (auth_body or {}).get("details", [])
+        ):
+            # The payer's browser completed the authorization itself (the
+            # normal hermes flow for intent=AUTHORIZE). Recover
+            # idempotently from the order instead of failing.
+            pass
+        else:
+            if status not in (200, 201):
+                raise SandboxAPIError("authorize", status, auth_body)
 
-        self._bind_trust(auth_body, amount_cents)
+        # Trust-bind against the GET order response: it is the source of
+        # truth and carries the full purchase-unit shape (the POST
+        # /authorize response omits payee on some flows, which used to
+        # trip _bind_trust into a false MerchantMismatch).
+        _, order = self._http("GET", f"/v2/checkout/orders/{order_id}")
+        self._bind_trust(order, amount_cents)
 
         # The authorization lives in purchase_units[0].payments.authorizations[0].
-        pu = auth_body["purchase_units"][0]
+        pu = order["purchase_units"][0]
         auth = pu["payments"]["authorizations"][0]
         return Authorization(
             auth_id=auth["id"],
@@ -294,20 +325,10 @@ class SandboxPayPalClient(PayPalClient):
         payer hasn't approved yet; the caller then calls authorize_order()
         with the same order_id after approval - it must NOT call this
         method again (that would create a second order and double-reserve).
-
-        The idempotency_key is an ATTEMPT key, not a call key: PayPal
-        replays the previous response when a PayPal-Request-Id is reused
-        across different API calls, so create and authorize each get a
-        derived key (key + ":create", key + ":authorize"). Retrying the
-        same attempt reuses the same derived keys, which is the desired
-        idempotency. A retry of authorize_order() after approval uses the
-        ":authorize" key again.
         """
-        create_key = f"{idempotency_key}:create" if idempotency_key is not None else None
-        auth_key = f"{idempotency_key}:authorize" if idempotency_key is not None else None
-        order_id, _ = self.create_order(amount_cents, create_key)
+        order_id, _ = self.create_order(amount_cents, idempotency_key)
         return self.authorize_order(order_id, amount_cents, merchant_id,
-                                    auth_key)
+                                    idempotency_key)
 
     def get_authorization(self, auth_id: str) -> Authorization:
         """
@@ -318,7 +339,8 @@ class SandboxPayPalClient(PayPalClient):
         status, body = self._http(
             "GET", f"/v2/payments/authorizations/{auth_id}"
         )
-        assert status == 200, f"authorization fetch failed: {status} {body}"
+        if status != 200:
+            raise SandboxAPIError("authorization fetch", status, body)
         amount = body.get("amount", {})
         return Authorization(
             auth_id=body.get("id", auth_id),
@@ -367,5 +389,6 @@ class SandboxPayPalClient(PayPalClient):
         status, body = self._http(
             "POST", f"/v2/payments/authorizations/{auth_id}/void", {})
         # Void answers 204 with an empty body on success.
-        assert status in (200, 201, 204), f"void failed: {status} {body}"
+        if status not in (200, 201, 204):
+            raise SandboxAPIError("void", status, body)
         return Void(auth_id=auth_id, status="VOIDED")
