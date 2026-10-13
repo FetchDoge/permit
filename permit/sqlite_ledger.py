@@ -243,19 +243,25 @@ class SqliteLedger:
             # Re-read rate_limited under each per-window flock so concurrent
             # writers cannot leave us reconciling a stale pre-flock snapshot.
             db_path = self._path
+            # `:memory:` is per-connection — a second connect() is an empty
+            # DB. Probe via self._conn there; use a separate connection on
+            # file paths so we can observe foreign commits under flock.
 
-            def _probe_conn() -> sqlite3.Connection:
+            def _fresh_hw_count(escrow_id: str, window_id: str) -> int | None:
+                if db_path == ":memory:":
+                    row = self._conn.execute(
+                        "SELECT rate_limited FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?",
+                        (escrow_id, window_id),
+                    ).fetchone()
+                    return None if row is None else int(row[0])
                 probe = sqlite3.connect(
                     db_path,
                     isolation_level=None,
                     check_same_thread=False,
                 )
-                probe.execute("PRAGMA busy_timeout=30000")
-                return probe
-
-            def _fresh_hw_count(escrow_id: str, window_id: str) -> int | None:
-                probe = _probe_conn()
                 try:
+                    probe.execute("PRAGMA busy_timeout=30000")
                     row = probe.execute(
                         "SELECT rate_limited FROM retry_rate_windows"
                         " WHERE escrow_id = ? AND window_id = ?",
@@ -266,8 +272,21 @@ class SqliteLedger:
                 return None if row is None else int(row[0])
 
             def _refresh_rows() -> list[tuple[str, str, int]]:
-                probe = _probe_conn()
+                if db_path == ":memory:":
+                    return [
+                        (str(r[0]), str(r[1]), int(r[2]))
+                        for r in self._conn.execute(
+                            "SELECT escrow_id, window_id, rate_limited"
+                            " FROM retry_rate_windows"
+                        ).fetchall()
+                    ]
+                probe = sqlite3.connect(
+                    db_path,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
                 try:
+                    probe.execute("PRAGMA busy_timeout=30000")
                     return [
                         (str(r[0]), str(r[1]), int(r[2]))
                         for r in probe.execute(
@@ -279,8 +298,20 @@ class SqliteLedger:
                     probe.close()
 
             def _row_exists(escrow_id: str, window_id: str) -> bool:
-                probe = _probe_conn()
+                if db_path == ":memory:":
+                    row = self._conn.execute(
+                        "SELECT 1 FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?",
+                        (escrow_id, window_id),
+                    ).fetchone()
+                    return row is not None
+                probe = sqlite3.connect(
+                    db_path,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
                 try:
+                    probe.execute("PRAGMA busy_timeout=30000")
                     row = probe.execute(
                         "SELECT 1 FROM retry_rate_windows"
                         " WHERE escrow_id = ? AND window_id = ?",
@@ -290,7 +321,6 @@ class SqliteLedger:
                     probe.close()
                 return row is not None
 
-            # Snapshot under root lock inside assert (refresh_rows).
             hw_rows = _refresh_rows()
             assert_high_water_files_for_rows(
                 hw_rows,
