@@ -7,6 +7,12 @@ by polling order state, and authorize_order() resumes the SAME order -
 never a second one.
 """
 
+import os
+import pathlib
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 from settlement.sandbox_client import (
@@ -173,6 +179,46 @@ def test_void_tolerates_empty_204_body():
     void = c.void("AUTH999")
     assert void.auth_id == "AUTH999"
     assert void.status == "VOIDED"
+
+
+def test_void_failed_raises_sandbox_api_error():
+    """F4: a non-2xx void must raise — never return VOIDED via assert."""
+    from settlement.sandbox_client import SandboxAPIError
+
+    c = make_client([(500, {"name": "INTERNAL_ERROR"})])
+    with pytest.raises(SandboxAPIError) as exc:
+        c.void("AUTH999")
+    assert exc.value.status == 500
+    assert exc.value.operation == "void"
+
+
+def test_void_failed_raises_under_python_optimize():
+    """F4: the raise survives python -O (asserts would be stripped)."""
+    script = textwrap.dedent(
+        """
+        from settlement.sandbox_client import SandboxAPIError, SandboxPayPalClient
+        c = SandboxPayPalClient("id", "secret")
+        c._token = "tok"
+        c._http = lambda *a, **k: (500, {"name": "INTERNAL_ERROR"})
+        try:
+            c.void("AUTH999")
+        except SandboxAPIError as e:
+            assert e.status == 500
+            assert e.operation == "void"
+        else:
+            raise SystemExit("void did not raise under -O")
+        """
+    )
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(repo_root)}
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_authorize_order_already_authorized_recovers_via_get():
