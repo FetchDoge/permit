@@ -349,29 +349,33 @@ class SqliteLedger:
                     pass
                 raise
 
-    def _first_denial_hash_unlocked(
+    def _latest_denial_hash_unlocked(
         self, escrow_id: str, window_id: str
     ) -> str | None:
-        """Hash of the window's first already_* denial receipt (rate_mac anchor)."""
+        """Hash of the window's latest already_* denial (rate_mac message input)."""
         row = self._conn.execute(
             "SELECT hash FROM receipts"
             " WHERE event_type = 'REFUSED' AND refusal_kind = 'already'"
             " AND escrow_id = ? AND window_id = ?"
-            " ORDER BY seq LIMIT 1",
+            " ORDER BY seq DESC LIMIT 1",
             (escrow_id, window_id),
         ).fetchone()
         return str(row[0]) if row else None
 
-    def first_denial_hash(self, escrow_id: str, window_id: str) -> str | None:
-        """Public indexed lookup for the window's first already_* denial hash."""
+    def latest_denial_hash(self, escrow_id: str, window_id: str) -> str | None:
+        """Public indexed lookup for the window's latest already_* denial hash."""
         with self._lock:
-            return self._first_denial_hash_unlocked(escrow_id, window_id)
+            return self._latest_denial_hash_unlocked(escrow_id, window_id)
+
+    # Compat alias used by older call sites / tests.
+    def first_denial_hash(self, escrow_id: str, window_id: str) -> str | None:
+        return self.latest_denial_hash(escrow_id, window_id)
 
     def _check_retry_rate_integrity_unlocked(
         self, *, original_refusal_id_for=None, limit_n: int = 100
     ) -> None:
         """Caller holds lock; runs inside an open transaction."""
-        # original_refusal_id_for kept for API compat; rate_mac uses first denial.
+        # original_refusal_id_for kept for API compat; rate_mac uses latest denial.
         del original_refusal_id_for
         side_rows = self._conn.execute(
             "SELECT escrow_id, window_id, window_start, individual,"
@@ -418,7 +422,7 @@ class SqliteLedger:
                     f"escrow_id={eid!r} window_id={wid!r}: "
                     f"side={int(side[3])} chain={int(n)}; refuse"
                 )
-            anchor = self._first_denial_hash_unlocked(eid, wid)
+            anchor = self._latest_denial_hash_unlocked(eid, wid)
             verify_rate_limited_mac(
                 anchor, eid, wid, int(side[4]), side[7] or ""
             )
@@ -427,11 +431,34 @@ class SqliteLedger:
                     "retry rate side table rate_limited set before exhausting N "
                     f"for escrow_id={eid!r} window_id={wid!r}; refuse"
                 )
-        for key in tallies:
-            if key not in side_by_key:
+        tally_counts = {
+            (r[0], r[1]): int(r[2])
+            for r in self._conn.execute(
+                "SELECT escrow_id, window_id,"
+                " CAST(json_extract(payload, '$.count') AS INTEGER)"
+                " FROM receipts"
+                " WHERE event_type = 'REFUSED' AND refusal_kind = 'rate_tally'"
+                " AND escrow_id IS NOT NULL AND window_id IS NOT NULL"
+            ).fetchall()
+        }
+        for key, chain_count in tally_counts.items():
+            side = side_by_key.get(key)
+            if side is None:
                 raise RetryRateIntegrityError(
                     "retry rate side table missing row for chain tally "
                     f"escrow_id={key[0]!r} window_id={key[1]!r}; refuse"
+                )
+            if int(side[4]) != chain_count:
+                raise RetryRateIntegrityError(
+                    "retry rate side table count mismatch for "
+                    f"escrow_id={key[0]!r} window_id={key[1]!r}: "
+                    f"side={int(side[4])} chain={chain_count}; refuse"
+                )
+        for (eid, wid), side in side_by_key.items():
+            if int(side[6]) and (eid, wid) not in tally_counts:
+                raise RetryRateIntegrityError(
+                    "retry rate side table tally_flushed=1 but no chain tally for "
+                    f"escrow_id={eid!r} window_id={wid!r}; refuse to start"
                 )
 
     def sync_receipts_from_db(self) -> None:
@@ -565,7 +592,7 @@ class SqliteLedger:
     ) -> Receipt | None:
         """Append tally if needed and mark flushed. Inside an open transaction."""
         # Protect rate_limited via ledger-chained MAC before trusting the count.
-        anchor = self._first_denial_hash_unlocked(escrow_id, window_id)
+        anchor = self._latest_denial_hash_unlocked(escrow_id, window_id)
         verify_rate_limited_mac(
             anchor, escrow_id, window_id, rate_limited, rate_mac
         )
@@ -711,37 +738,26 @@ class SqliteLedger:
                         },
                     )
                     new_indiv = chain_indiv + 1
-                    # On the first denial, anchor rate_mac to that receipt.
-                    if chain_indiv == 0:
-                        zero_mac = rate_limited_mac(
-                            denial.hash, escrow_id, wid, 0
-                        )
-                        cur = self._conn.execute(
-                            "UPDATE retry_rate_windows"
-                            " SET individual = ?,"
-                            " covered_reason = ?,"
-                            " rate_mac = ?"
-                            " WHERE escrow_id = ? AND window_id = ?"
-                            " AND tally_flushed = 0"
-                            " RETURNING individual",
-                            (
-                                new_indiv,
-                                already_reason,
-                                zero_mac,
-                                escrow_id,
-                                wid,
-                            ),
-                        ).fetchone()
-                    else:
-                        cur = self._conn.execute(
-                            "UPDATE retry_rate_windows"
-                            " SET individual = ?,"
-                            " covered_reason = ?"
-                            " WHERE escrow_id = ? AND window_id = ?"
-                            " AND tally_flushed = 0"
-                            " RETURNING individual",
-                            (new_indiv, already_reason, escrow_id, wid),
-                        ).fetchone()
+                    # rate_mac message uses the latest denial's chain hash.
+                    zero_mac = rate_limited_mac(
+                        denial.hash, escrow_id, wid, int(rlim)
+                    )
+                    cur = self._conn.execute(
+                        "UPDATE retry_rate_windows"
+                        " SET individual = ?,"
+                        " covered_reason = ?,"
+                        " rate_mac = ?"
+                        " WHERE escrow_id = ? AND window_id = ?"
+                        " AND tally_flushed = 0"
+                        " RETURNING individual",
+                        (
+                            new_indiv,
+                            already_reason,
+                            zero_mac,
+                            escrow_id,
+                            wid,
+                        ),
+                    ).fetchone()
                     if cur is None:
                         raise RuntimeError(
                             "individual sync missed open window "
@@ -754,7 +770,7 @@ class SqliteLedger:
                     return already_reason, denial
 
                 # Over-limit: verify tag on EVERY increment, then rewrite it.
-                anchor = self._first_denial_hash_unlocked(escrow_id, wid)
+                anchor = self._latest_denial_hash_unlocked(escrow_id, wid)
                 verify_rate_limited_mac(
                     anchor, escrow_id, wid, int(rlim), cur_mac or ""
                 )
@@ -814,7 +830,7 @@ class SqliteLedger:
         else:
             wid, wstart, side_indiv, rlim, covered, rate_mac = open_row
             wstart_f = float(wstart)
-            anchor = self._first_denial_hash_unlocked(escrow_id, str(wid))
+            anchor = self._latest_denial_hash_unlocked(escrow_id, str(wid))
             verify_rate_limited_mac(
                 anchor,
                 escrow_id,
@@ -866,7 +882,7 @@ class SqliteLedger:
                     continue
                 wid, wstart, side_indiv, rlim, covered, rate_mac = open_row
                 wstart_f = float(wstart)
-                anchor = self._first_denial_hash_unlocked(escrow_id, str(wid))
+                anchor = self._latest_denial_hash_unlocked(escrow_id, str(wid))
                 verify_rate_limited_mac(
                     anchor,
                     escrow_id,

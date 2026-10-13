@@ -63,13 +63,14 @@ from .paypal_client import PayPalClient, PayPalTimeout, Capture
 # Decisions do NOT trust the side row for allow/limit: inside the same
 # BEGIN IMMEDIATE, ``individual`` is an indexed COUNT of chain already_*
 # denial receipts for (escrow, window_id). The side table holds window_id,
-# window_start, and a ledger-chained rate_mac over rate_limited
-# (SHA-256(first_denial_hash || escrow || window || count)) so
-# mid-window tampering is detectable before the tally — loss bound 0,
-# no checkpoint/K. At most
-# one OPEN window per escrow (UNIQUE partial index). Process memory is
-# never the authority. window_start comes from the row and is NOT reset
-# on restart; a window closes when any writer sees now >= start + W.
+# window_start, and an HMAC rate_mac over rate_limited
+# (HMAC-SHA256(key, latest_denial_hash || escrow || window || count)),
+# key from PERMIT_RETRY_RATE_MAC_KEY / _KEY_FILE outside the DB — loss
+# bound 0, no checkpoint/K. Threat model: DB write without the key is
+# in scope; attacker with both DB and key is out of scope. At most one
+# OPEN window per escrow (UNIQUE partial index). Process memory is never
+# the authority. window_start comes from the row and is NOT reset on
+# restart; a window closes when any writer sees now >= start + W.
 # Tallies are idempotent on (escrow_id, window_id). Disagreement →
 # RetryRateIntegrityError (chain wins; no anomaly receipt). Log growth
 # ≤ N+1 per window.
@@ -219,8 +220,11 @@ class ReleaseVerifier:
         # Soft mirror of open windows for tests / flush targets only —
         # never the authority for counts (chain COUNT + MAC-protected side).
         self._retry_rate_windows: dict[str, _RetryRateWindow] = {}
-        # (escrow_id, window_id) -> first already_* denial hash (rate_mac anchor).
-        self._first_denial_by_window: dict[tuple[str, str], str] = {}
+        # (escrow_id, window_id) -> latest already_* denial hash (HMAC input).
+        self._latest_denial_by_window: dict[tuple[str, str], str] = {}
+        # Process-local chain denial counts (in-memory ledger); rebuilt on
+        # startup, incremented on each denial — avoids O(n) log scans (bar 3).
+        self._denial_count_by_window: dict[tuple[str, str], int] = {}
         self._rate_locks: dict[str, threading.Lock] = {}
         self._rate_locks_guard = threading.Lock()
         # Terminal escrow_id -> already_refused/already_voided. Written when
@@ -266,19 +270,22 @@ class ReleaseVerifier:
                 self._rate_locks[escrow_id] = lock
             return lock
 
-    def _first_denial_hash(self, escrow_id: str, window_id: str) -> str | None:
-        """Hash of the window's first already_* denial (rate_mac anchor)."""
+    def _latest_denial_hash(self, escrow_id: str, window_id: str) -> str | None:
+        """Hash of the window's latest already_* denial (HMAC message input)."""
         key = (escrow_id, window_id)
-        cached = self._first_denial_by_window.get(key)
+        cached = self._latest_denial_by_window.get(key)
         if cached is not None:
             return cached
-        finder = getattr(self.ledger, "first_denial_hash", None)
+        finder = getattr(self.ledger, "latest_denial_hash", None)
+        if finder is None:
+            finder = getattr(self.ledger, "first_denial_hash", None)
         if finder is not None:
             found = finder(escrow_id, window_id)
             if isinstance(found, str) and found:
-                self._first_denial_by_window[key] = found
+                self._latest_denial_by_window[key] = found
                 return found
             return None
+        latest: str | None = None
         for r in self.ledger.receipts():
             if r.event_type != "REFUSED":
                 continue
@@ -289,16 +296,15 @@ class ReleaseVerifier:
                 r.payload.get("escrow_id") == escrow_id
                 and r.payload.get("window_id") == window_id
             ):
-                self._first_denial_by_window[key] = r.hash
-                return r.hash
-        return None
+                latest = r.hash
+        if latest is not None:
+            self._latest_denial_by_window[key] = latest
+        return latest
 
-    def _remember_first_denial(
+    def _remember_latest_denial(
         self, escrow_id: str, window_id: str, receipt_hash: str
     ) -> None:
-        key = (escrow_id, window_id)
-        if key not in self._first_denial_by_window:
-            self._first_denial_by_window[key] = receipt_hash
+        self._latest_denial_by_window[(escrow_id, window_id)] = receipt_hash
 
     def _persist_rate_window(
         self,
@@ -309,7 +315,7 @@ class ReleaseVerifier:
     ) -> None:
         """Write window counters to the side store (durable on Sqlite)."""
         if rate_mac is None:
-            anchor = self._first_denial_hash(escrow_id, state.window_id)
+            anchor = self._latest_denial_hash(escrow_id, state.window_id)
             rate_mac = rate_limited_mac(
                 anchor, escrow_id, state.window_id, state.rate_limited
             )
@@ -357,12 +363,10 @@ class ReleaseVerifier:
                 out[(eid, wid)] = r
         return out
 
-    def _chain_individual_denials(self) -> dict[tuple[str, str], int]:
-        """Count already_* denial receipts per (escrow_id, window_id)."""
-        counter = getattr(self.ledger, "count_individual_denials", None)
-        if counter is not None:
-            return counter()
+    def _rebuild_denial_count_cache(self) -> None:
+        """One-shot scan into the process-local denial count cache."""
         counts: dict[tuple[str, str], int] = {}
+        latest: dict[tuple[str, str], str] = {}
         for r in self.ledger.receipts():
             if r.event_type != "REFUSED":
                 continue
@@ -372,8 +376,20 @@ class ReleaseVerifier:
             eid = r.payload.get("escrow_id")
             wid = r.payload.get("window_id")
             if isinstance(eid, str) and isinstance(wid, str):
-                counts[(eid, wid)] = counts.get((eid, wid), 0) + 1
-        return counts
+                key = (eid, wid)
+                counts[key] = counts.get(key, 0) + 1
+                latest[key] = r.hash
+        self._denial_count_by_window = counts
+        self._latest_denial_by_window = latest
+
+    def _chain_individual_denials(self) -> dict[tuple[str, str], int]:
+        """Count already_* denial receipts per (escrow_id, window_id)."""
+        counter = getattr(self.ledger, "count_individual_denials", None)
+        if counter is not None:
+            return counter()
+        if not self._denial_count_by_window:
+            self._rebuild_denial_count_cache()
+        return dict(self._denial_count_by_window)
 
     def _assert_side_matches_chain_individuals(
         self,
@@ -403,7 +419,7 @@ class ReleaseVerifier:
         """
         Tamper checks for an open (or about-to-close) side row.
         Chain individual denials are the expected `individual`.
-        rate_limited is checked via ledger-chained rate_mac (first-denial anchor).
+        rate_limited is checked via HMAC rate_mac (latest-denial + external key).
         rate_limited>0 while individual < N is also refused.
         """
         key = (row.escrow_id, row.window_id)
@@ -413,7 +429,7 @@ class ReleaseVerifier:
             row.escrow_id, row.window_id, row.individual, chain_denials
         )
         verify_rate_limited_mac(
-            self._first_denial_hash(row.escrow_id, row.window_id),
+            self._latest_denial_hash(row.escrow_id, row.window_id),
             row.escrow_id,
             row.window_id,
             row.rate_limited,
@@ -438,6 +454,8 @@ class ReleaseVerifier:
         (chain wins; no anomaly receipt).
         """
         self._rebuild_original_refusals_from_ledger()
+        if getattr(self.ledger, "count_individual_denials", None) is None:
+            self._rebuild_denial_count_cache()
         checker = getattr(self.ledger, "check_retry_rate_integrity", None)
         if checker is not None:
             checker(
@@ -496,41 +514,51 @@ class ReleaseVerifier:
             )
 
             if chain_tally is not None:
-                chain_count = int(chain_tally.payload.get("count", -1))
-                if row.rate_limited != chain_count:
-                    raise RetryRateIntegrityError(
-                        "retry rate side table count mismatch for "
-                        f"escrow_id={row.escrow_id!r} window_id={row.window_id!r}: "
-                        f"side={row.rate_limited} chain={chain_count}; refuse to start"
-                    )
+                if checker is None:
+                    chain_count = int(chain_tally.payload.get("count", -1))
+                    if row.rate_limited != chain_count:
+                        raise RetryRateIntegrityError(
+                            "retry rate side table count mismatch for "
+                            f"escrow_id={row.escrow_id!r} "
+                            f"window_id={row.window_id!r}: "
+                            f"side={row.rate_limited} chain={chain_count}; "
+                            "refuse to start"
+                        )
                 if not row.tally_flushed:
                     state.tally_flushed = True
                     self._persist_rate_window(row.escrow_id, state)
                 continue
 
-            if row.tally_flushed:
+            if row.tally_flushed and checker is None:
                 raise RetryRateIntegrityError(
                     "retry rate side table tally_flushed=1 but no chain tally for "
                     f"escrow_id={row.escrow_id!r} window_id={row.window_id!r}; "
                     "refuse to start"
                 )
+            if row.tally_flushed:
+                continue
 
-            self._reconcile_open_window_integrity(
-                row, chain_tallies, chain_denials
-            )
-            verify_rate_limited_mac(
-                self._first_denial_hash(row.escrow_id, row.window_id),
-                row.escrow_id,
-                row.window_id,
-                row.rate_limited,
-                row.rate_mac,
-            )
+            # When checker ran, integrity was already validated in one
+            # snapshot — do not re-check against separately loaded counts
+            # (TOCTOU with concurrent writers). In-memory still reconciles.
+            if checker is None:
+                self._reconcile_open_window_integrity(
+                    row, chain_tallies, chain_denials
+                )
+                verify_rate_limited_mac(
+                    self._latest_denial_hash(row.escrow_id, row.window_id),
+                    row.escrow_id,
+                    row.window_id,
+                    row.rate_limited,
+                    row.rate_mac,
+                )
 
             expired = (now - state.window_start) >= self.retry_rate_limit_w
             if expired:
-                self._reconcile_open_window_integrity(
-                    row, chain_tallies, chain_denials, closing=True
-                )
+                if checker is None:
+                    self._reconcile_open_window_integrity(
+                        row, chain_tallies, chain_denials, closing=True
+                    )
                 self._append_window_tally(row.escrow_id, state)
                 state.tally_flushed = True
                 self._persist_rate_window(row.escrow_id, state)
@@ -628,7 +656,7 @@ class ReleaseVerifier:
             side.rate_mac
             if side is not None and side.window_id == state.window_id
             else rate_limited_mac(
-                self._first_denial_hash(escrow_id, state.window_id),
+                self._latest_denial_hash(escrow_id, state.window_id),
                 escrow_id,
                 state.window_id,
                 state.rate_limited,
@@ -800,9 +828,9 @@ class ReleaseVerifier:
             now = self._clock()
             # Live mid-window: deleted side row with chain denials → refuse now.
             open_row = self._rate_store.get_open(escrow_id)
-            chain_denials = self._chain_individual_denials()
-            chain_tallies = self._chain_rate_tallies()
             if open_row is None:
+                chain_denials = self._chain_individual_denials()
+                chain_tallies = self._chain_rate_tallies()
                 for (eid, wid), n in chain_denials.items():
                     if eid != escrow_id:
                         continue
@@ -813,18 +841,23 @@ class ReleaseVerifier:
                         f"escrow_id={eid!r} window_id={wid!r} "
                         f"(chain_individual={n}); refuse"
                     )
+                chain_indiv_hint = 0
             else:
+                # Hot path: cached chain count + latest-denial HMAC — no
+                # full-log scans (bar 3 at 100k receipts).
+                if not self._denial_count_by_window:
+                    self._rebuild_denial_count_cache()
+                expected = self._denial_count_by_window.get(
+                    (open_row.escrow_id, open_row.window_id), 0
+                )
                 verify_rate_limited_mac(
-                    self._first_denial_hash(
+                    self._latest_denial_hash(
                         open_row.escrow_id, open_row.window_id
                     ),
                     open_row.escrow_id,
                     open_row.window_id,
                     open_row.rate_limited,
                     open_row.rate_mac,
-                )
-                expected = chain_denials.get(
-                    (open_row.escrow_id, open_row.window_id), 0
                 )
                 if open_row.individual != expected:
                     raise RetryRateIntegrityError(
@@ -833,12 +866,13 @@ class ReleaseVerifier:
                         f"window_id={open_row.window_id!r}: "
                         f"side={open_row.individual} chain={expected}; refuse"
                     )
+                chain_indiv_hint = expected
 
             state = self._retry_rate_window_locked(escrow_id, now)
             state.last_already_reason = already_reason
-            # Decision from chain COUNT, not side.individual.
-            chain_indiv = chain_denials.get(
-                (escrow_id, state.window_id), 0
+            # Decision from chain COUNT (cached), not side.individual.
+            chain_indiv = self._denial_count_by_window.get(
+                (escrow_id, state.window_id), chain_indiv_hint
             )
 
             if chain_indiv < self.retry_rate_limit_n:
@@ -848,16 +882,17 @@ class ReleaseVerifier:
                     window_id=state.window_id,
                     window_start=state.window_start,
                 )
-                if chain_indiv == 0:
-                    self._remember_first_denial(
-                        escrow_id, state.window_id, denial.hash
-                    )
+                key = (escrow_id, state.window_id)
+                self._remember_latest_denial(
+                    escrow_id, state.window_id, denial.hash
+                )
+                self._denial_count_by_window[key] = chain_indiv + 1
                 state.individual = chain_indiv + 1
                 self._persist_rate_window(escrow_id, state)
                 return VerifyResult(False, already_reason)
 
             # Verify on every over-limit step (loss bound 0).
-            anchor = self._first_denial_hash(escrow_id, state.window_id)
+            anchor = self._latest_denial_hash(escrow_id, state.window_id)
             side_mac = (
                 open_row.rate_mac
                 if open_row is not None

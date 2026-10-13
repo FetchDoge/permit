@@ -1158,7 +1158,7 @@ def test_retry_rate_limit_side_table_tamper_rate_limited_before_n():
         side = ledger.retry_rate_store.get_open("esc_1")
         assert side is not None
         assert side.individual == 5
-        anchor = verifier._first_denial_hash("esc_1", side.window_id)
+        anchor = verifier._latest_denial_hash("esc_1", side.window_id)
         assert anchor is not None
         # Forge a valid MAC so the before-N check (not MAC) is what fires.
         ledger.retry_rate_store.upsert(
@@ -1721,6 +1721,53 @@ def test_retry_rate_limit_live_tamper_rate_limited_three():
         assert len(_rate_limited_receipts(ledger, "esc_1")) == 1
         assert _tally_count_sum(ledger, "esc_1") == 5
         assert len(ledger) - before == 1  # one tally; never > N+1 denials+tally
+        ledger.close()
+
+
+def test_retry_rate_limit_db_attacker_unkeyed_hash_refused():
+    """DB-write attacker without the HMAC key: unkeyed SHA-256 must not verify."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        RetryRateRow,
+        unkeyed_rate_limited_digest,
+    )
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=11
+        )
+        before = len(ledger)
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        assert side.rate_limited == 11
+        latest = ledger.latest_denial_hash(side.escrow_id, side.window_id)
+        assert latest is not None
+        # Attacker can write the DB and recompute a plain hash, but not the HMAC.
+        forged = unkeyed_rate_limited_digest(
+            latest, side.escrow_id, side.window_id, 0
+        )
+        assert forged != side.rate_mac
+        ledger.retry_rate_store.upsert(
+            RetryRateRow(
+                escrow_id=side.escrow_id,
+                window_id=side.window_id,
+                window_start=side.window_start,
+                individual=side.individual,
+                rate_limited=0,  # wipe the over-limit counter
+                covered_reason=side.covered_reason,
+                tally_flushed=False,
+                rate_mac=forged,  # unkeyed digest of the forged count
+            )
+        )
+        with pytest.raises(RetryRateIntegrityError, match="rate_mac mismatch"):
+            verifier.verify_and_capture("esc_1", evidence)
+        assert len(ledger) == before
+        assert _tally_count_sum(ledger, "esc_1") == 0
         ledger.close()
 
 

@@ -12,6 +12,12 @@ import os
 
 import pytest
 
+# Stable HMAC key for the suite (outside the DB). Production must set its own.
+os.environ.setdefault(
+    "PERMIT_RETRY_RATE_MAC_KEY",
+    "test-retry-rate-mac-key-NOT-FOR-PRODUCTION",
+)
+
 _SANDBOX_CREDS = (
     os.environ.get("PERMIT_PAYPAL_CLIENT_ID"),
     os.environ.get("PERMIT_PAYPAL_CLIENT_SECRET"),
