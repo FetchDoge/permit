@@ -84,6 +84,20 @@ class ApprovalTimeout(Exception):
         self.last_status = last_status
 
 
+class SandboxAPIError(RuntimeError):
+    """Raised when a sandbox HTTP call returns an unexpected status.
+
+    Explicit (not assert): identical under python -O. A failed void must
+    not be reported as success.
+    """
+
+    def __init__(self, operation: str, status: int, body):
+        super().__init__(f"{operation} failed: {status} {body}")
+        self.operation = operation
+        self.status = status
+        self.body = body
+
+
 def _is_network_timeout(exc: BaseException) -> bool:
     """True for transport-level failures that leave provider state unknown.
 
@@ -179,7 +193,8 @@ class SandboxPayPalClient(PayPalClient):
             },
             request_id=idempotency_key,
         )
-        assert status in (200, 201), f"order create failed: {status} {order}"
+        if status not in (200, 201):
+            raise SandboxAPIError("order create", status, order)
         approval_url = next(
             l["href"] for l in order["links"] if l["rel"] == "approve"
         )
@@ -192,7 +207,8 @@ class SandboxPayPalClient(PayPalClient):
         """
         self._ensure_token()
         status, order = self._http("GET", f"/v2/checkout/orders/{order_id}")
-        assert status == 200, f"order fetch failed: {status} {order}"
+        if status != 200:
+            raise SandboxAPIError("order fetch", status, order)
         return order["status"]
 
     def wait_for_approval(self, order_id: str, timeout_s: float = 120,
@@ -270,7 +286,8 @@ class SandboxPayPalClient(PayPalClient):
             # idempotently from the order instead of failing.
             pass
         else:
-            assert status in (200, 201), f"authorize failed: {status} {auth_body}"
+            if status not in (200, 201):
+                raise SandboxAPIError("authorize", status, auth_body)
 
         # Trust-bind against the GET order response: it is the source of
         # truth and carries the full purchase-unit shape (the POST
@@ -322,7 +339,8 @@ class SandboxPayPalClient(PayPalClient):
         status, body = self._http(
             "GET", f"/v2/payments/authorizations/{auth_id}"
         )
-        assert status == 200, f"authorization fetch failed: {status} {body}"
+        if status != 200:
+            raise SandboxAPIError("authorization fetch", status, body)
         amount = body.get("amount", {})
         return Authorization(
             auth_id=body.get("id", auth_id),
@@ -371,5 +389,6 @@ class SandboxPayPalClient(PayPalClient):
         status, body = self._http(
             "POST", f"/v2/payments/authorizations/{auth_id}/void", {})
         # Void answers 204 with an empty body on success.
-        assert status in (200, 201, 204), f"void failed: {status} {body}"
+        if status not in (200, 201, 204):
+            raise SandboxAPIError("void", status, body)
         return Void(auth_id=auth_id, status="VOIDED")

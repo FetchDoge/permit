@@ -5,6 +5,7 @@ no PayPal traffic. Approval re-runs the authority check at completion
 (fail-closed if the budget moved).
 """
 import hashlib
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -270,3 +271,49 @@ def test_remaining_cents_reflects_tightened_cap():
     store.tighten(permit.permit_id, cap_cents=7000)
     # The principal sees the enforced remainder, not the granted cap.
     assert store.get(permit.permit_id).remaining_cents() == 1000
+
+
+def test_approval_single_use_under_concurrency():
+    """F2: N threads race the same approval_id; exactly one ALLOWED."""
+    n_threads = 8
+    n_trials = 30
+    for trial in range(n_trials):
+        store, ledger, permit = make_store(cap=100_000, threshold=100)
+        flow, paypal = make_flow(store, ledger)
+        pending = flow.spend(
+            permit.permit_id, 500, "m1", PredicateType.D, ah()
+        )
+        assert pending.reason == "pending_principal_approval"
+        flow.approve_approval(pending.approval_id)
+        barrier = threading.Barrier(n_threads)
+        results: list = []
+        lock = threading.Lock()
+
+        def worker():
+            barrier.wait()
+            attempt = flow.spend(
+                permit.permit_id,
+                500,
+                "m1",
+                PredicateType.D,
+                ah(),
+                approval_id=pending.approval_id,
+            )
+            with lock:
+                results.append(attempt)
+
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        allowed = [r for r in results if r.allowed]
+        blocked = [r for r in results if not r.allowed]
+        assert len(allowed) == 1, (
+            f"trial {trial}: expected 1 ALLOWED, got {len(allowed)}"
+        )
+        assert len(blocked) == n_threads - 1
+        assert all(r.reason == "invalid_approval" for r in blocked)
+        assert store.get_approval(pending.approval_id).status == "consumed"
+        assert len(paypal.authorize_calls) == 1

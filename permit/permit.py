@@ -139,7 +139,7 @@ class PendingApproval:
     merchant_id: str
     predicate_type: str  # PredicateType value, e.g. "D"
     artifact_hash: str
-    # pending | approved | denied | expired | consumed
+    # pending | approved | claimed | denied | expired | consumed
     status: str = "pending"
     created_at: str = ""
     expires_at: str = ""
@@ -542,11 +542,46 @@ class PermitStore:
             )
             return approval
 
-    def consume_approval(self, approval_id: str) -> None:
-        """Mark an approved request consumed after its spend reserves."""
+    def claim_approval(
+        self,
+        approval_id: str,
+        *,
+        permit_id: str,
+        amount_cents: int,
+        merchant_id: str,
+    ) -> bool:
+        """
+        Atomically claim an approved request for one spend attempt.
+        Under _store_lock, moves approved → claimed only when the id
+        binds the exact (permit, amount, merchant). Returns True iff
+        claimed. Caller must restore_approval() on BLOCKED or
+        consume_approval() on ALLOWED.
+        """
         with self._store_lock:
             approval = self._approvals.get(approval_id)
-            if approval is not None and approval.status == "approved":
+            if (
+                approval is None
+                or approval.status != "approved"
+                or approval.permit_id != permit_id
+                or approval.amount_cents != amount_cents
+                or approval.merchant_id != merchant_id
+            ):
+                return False
+            approval.status = "claimed"
+            return True
+
+    def restore_approval(self, approval_id: str) -> None:
+        """Return a claimed approval to approved after a BLOCKED check."""
+        with self._store_lock:
+            approval = self._approvals.get(approval_id)
+            if approval is not None and approval.status == "claimed":
+                approval.status = "approved"
+
+    def consume_approval(self, approval_id: str) -> None:
+        """Mark a claimed approval consumed after its spend reserves."""
+        with self._store_lock:
+            approval = self._approvals.get(approval_id)
+            if approval is not None and approval.status == "claimed":
                 approval.status = "consumed"
 
     def pending_approvals(
@@ -602,7 +637,8 @@ class PermitStore:
             with ancestor._lock:
                 if ancestor.revoked:
                     return "ancestor_revoked"
-                if now >= ancestor.expiry:
+                # Honor tightened expiry (min-gate), not only the grant.
+                if now >= PermitStore._effective(ancestor)[3]:
                     return "ancestor_expired"
         return None
 
@@ -1219,8 +1255,12 @@ class PermitStore:
         with permit._lock:
             if permit.revoked:
                 return "revoked"
-            if now >= permit.expiry:
-                return "expired"
+            # Honor tightened expiry (min-gate), not only the grant.
+            _, _, _, expiry, expiry_tightened = self._effective(permit)
+            if now >= expiry:
+                return (
+                    "tightened_expiry_passed" if expiry_tightened else "expired"
+                )
         return self._lineage_block_reason(chain, now)
 
     def revoke_subtree(

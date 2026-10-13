@@ -203,15 +203,16 @@ class SpendPipeline:
             return SpendAttempt(False, "merchant_not_bound", None, (receipt,))
 
         # (6a2) Principal-approval gate. Runs BEFORE check() so a pending
-        # request never reserves cap.
+        # request never reserves cap. claim_approval() is atomic under
+        # _store_lock (approved → claimed) so two concurrent spends cannot
+        # both observe the same approval as approved.
+        claimed = False
         if approval_id is not None:
-            approval = self.permits.get_approval(approval_id)
-            if (
-                approval is None
-                or approval.status != "approved"
-                or approval.permit_id != permit_id
-                or approval.amount_cents != amount_cents
-                or approval.merchant_id != merchant_id
+            if not self.permits.claim_approval(
+                approval_id,
+                permit_id=permit_id,
+                amount_cents=amount_cents,
+                merchant_id=merchant_id,
             ):
                 receipt = self.ledger.append(
                     "BLOCKED",
@@ -226,6 +227,7 @@ class SpendPipeline:
                     },
                 )
                 return SpendAttempt(False, "invalid_approval", None, (receipt,))
+            claimed = True
         else:
             threshold = self.permits.approval_threshold(permit_id)
             if (
@@ -276,12 +278,14 @@ class SpendPipeline:
         check = self.permits.check(permit_id, amount_cents, merchant_id)
         if not check.allowed:
             # BLOCKED: receipt written by check(). PayPal is never called.
-            # An unconsumed approval stays approved: the principal's word
-            # stands; only the authority recheck failed. The agent may
-            # retry complete_approved_spend() later.
+            # Restore a claimed approval so the principal's word stands;
+            # only the authority recheck failed. The agent may retry
+            # complete_approved_spend() later.
+            if claimed:
+                self.permits.restore_approval(approval_id)
             return SpendAttempt(False, check.reason, None, (check.receipt,))
 
-        if approval_id is not None:
+        if claimed:
             # The principal's word is now spent: single-consumption, so one
             # approval can never authorize two holds.
             self.permits.consume_approval(approval_id)
