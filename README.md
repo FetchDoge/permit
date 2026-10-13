@@ -71,8 +71,9 @@ Permit fails closed. When state is uncertain, money does not move.
 | Tampered delivery evidence | Release refused, hold voided |
 
 **What it does not defend (production boundaries):**
-- All authoritative state lives in memory. A restart loses permits, escrows, revocations, and the ledger.
-- The HTTP service has no caller authentication (localhost demo boundary).
+- With `--db PATH`, the SQLite ledger is durable (#24): survives crashes, restarts and a second writer on one machine; after some crashes an operator step is needed (rate unmeasured). Durable mode restores permits and reservations from receipts, but does not restore escrows, pending ops, or approvals (F3). Default (in-memory) mode still loses permits, escrows, revocations, and the ledger on restart.
+- HTTP POSTs require a single shared bearer token (`PERMIT_API_TOKEN`, #23) with no role split between principal and agent (F5). GETs, including `/api/ledger`, are unauthenticated; the server binds to 127.0.0.1.
+- Predicate A acceptance falls back to a hardcoded demo key when `PERMIT_ACCEPTANCE_KEY` is unset (F12).
 - The ledger is a hash chain, not a signature. It detects edits and reordering, but it cannot detect removal of final entries without an external checkpoint.
 - It is a single-merchant sandbox prototype, not a claim about all agent payments.
 - E-stop voids uncaptured authorizations. A completed capture needs a refund path, which is out of scope.
@@ -94,13 +95,15 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 **Service verbs (JSON):** issue (`POST /api/permits`), delegate (`POST /api/permits/<id>/delegate`), tighten (`POST /api/permits/<id>/tighten`: narrows cap, merchants, expiry, or approval threshold, never widens), check (read-only: no reservation, no receipt), spend, resume, release, reconcile, retry cleanup, e-stop, revoke a subtree (`POST /api/permits/<id>/revoke-cascade`), and read the ledger (`GET /api/ledger`). Mock mode is the default. `--sandbox` arms the real PayPal sandbox rail (needs `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET`).
 
+**Calibration score (advisory).** `permit/calibration.py` computes an advisory score S in [0, 1] (Sol 6.1). `check()` records S, the permit's tau and a MEETS/BELOW verdict on its ALLOWED and BLOCKED receipts, and the dashboard shows them. S never blocks a spend: the four-clause gate is unchanged, and a spend with S = 0 gets the same decision as before. Tau starts at 0.70 at grant and can only be raised; a lowering is refused with a `TAU_REFUSED` receipt. The weights and scales are uncalibrated fixtures.
+
 **Actors:** the **payer** approves, the **merchant** delivers, the **Permit operator** issues permits and holds the e-stop, and the **credential owner** holds the PayPal secret. The agent never holds credentials.
 
 **Lineage:** [Interlock](https://github.com/marsojuji-cmyk/interlock) is the conceptual origin of the leased-authority model. This repo's ledger is standalone.
 
 ## Evidence
 
-- **187 tests pass:** `python -m pytest -q`, run 2026-10-09 on the admission-gating branch (184 on main at 39a7a0c + 3 new). CI runs the same suite plus `python demo.py` on every push.
+- **337 tests pass:** `python -m pytest -q`, run 2026-10-13 on the REA F1/F2/F4 branch (332 on main at 9af721d + 5 new). CI runs the same suite plus `python demo.py` on every push.
 - **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (15 receipts)` (run 2026-10-07 at `dc0f3a5`).
 - **Mock rail vs sandbox, kept separate:**
   - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_GROK_CLI` or a recorded transcript.

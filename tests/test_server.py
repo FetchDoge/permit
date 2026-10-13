@@ -387,3 +387,25 @@ def test_sweep_reaps_without_resume_hit(approval_server):
     assert op_id not in server.PENDING_OPS
     _, state = call(base, "GET", f"/api/permits/{pid}")
     assert state["reserved_cents"] == 0
+
+
+def test_advisory_calibration_visible_read_only_and_spend_unblocked(live_server):
+    """A fresh permit scores S = 0 (empty ledger); the spend is still
+    allowed and the advisory score is visible on the ledger receipt."""
+    base, _ = live_server
+    _, grant = call(base, "POST", "/api/permits",
+                    {"agent_id": "a", "cap_cents": 10000,
+                     "allowlist": ["m"], "expiry_hours": 1})
+    pid = grant["permit_id"]
+    _, permit = call(base, "GET", f"/api/permits/{pid}")
+    assert permit["calibration_tau"] == 0.70
+    _, spend = call(base, "POST", f"/api/permits/{pid}/spend",
+                    {"amount_cents": 1000, "merchant_id": "m",
+                     "predicate": "delivery_hash", "artifact_hash": "x" * 64})
+    assert spend["allowed"] and spend["reason"] == "allowed"
+    _, led = call(base, "GET", "/api/ledger")
+    assert led["chain"]["ok"]
+    allowed = [r for r in led["receipts"] if r["event"] == "ALLOWED"]
+    assert len(allowed) == 1
+    cal = allowed[0]["payload"]["calibration"]
+    assert cal["advisory"] is True and cal["S"] == 0.0 and cal["verdict"] == "BELOW"

@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import threading
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -178,6 +179,37 @@ class ReleaseVerifier:
         """
         return f"{escrow.permit_id}:{escrow.auth_id}:capture"
 
+    def _original_refusal_id(self, escrow_id: str) -> str | None:
+        """Hash of the first terminal denial for this escrow (original REFUSED,
+        else escrow-level VOIDED). Retry denials reference this id."""
+        original_refused: str | None = None
+        original_voided: str | None = None
+        for r in self.ledger.receipts():
+            if r.payload.get("escrow_id") != escrow_id:
+                continue
+            if r.event_type == "REFUSED":
+                reason = r.payload.get("reason", "")
+                if isinstance(reason, str) and reason.startswith("already_"):
+                    continue
+                if original_refused is None:
+                    original_refused = r.hash
+            elif r.event_type == "VOIDED" and original_voided is None:
+                original_voided = r.hash
+        return original_refused or original_voided
+
+    def _append_retry_denial(self, escrow_id: str, reason: str) -> Receipt:
+        """REA F6: unique denial receipt for a refused retry; never captures."""
+        original = self._original_refusal_id(escrow_id)
+        return self.ledger.append(
+            "REFUSED",
+            {
+                "escrow_id": escrow_id,
+                "reason": reason,
+                "receipt_id": f"den_{uuid.uuid4().hex}",
+                "original_refusal_id": original,
+            },
+        )
+
     def _predicate_passes(self, escrow: Escrow, evidence: Evidence) -> tuple[bool, str]:
         if escrow.predicate_type is PredicateType.D:
             if evidence.delivered_bytes is None:
@@ -251,7 +283,11 @@ class ReleaseVerifier:
             if escrow.state == "CAPTURED":
                 return VerifyResult(True, "already_captured")
             if escrow.state in ("VOIDED", "REFUSED"):
-                return VerifyResult(False, f"already_{escrow.state.lower()}")
+                # REA F6: every refused retry writes a unique denial receipt
+                # referencing the original refusal; money is never captured.
+                reason = f"already_{escrow.state.lower()}"
+                self._append_retry_denial(escrow_id, reason)
+                return VerifyResult(False, reason)
             # Indeterminate states need an explicit operator step first:
             # reconcile() for UNKNOWN, retry_cleanup() for CLEANUP_PENDING.
             if escrow.state == "UNKNOWN":

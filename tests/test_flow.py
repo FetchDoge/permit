@@ -1,6 +1,7 @@
 """Spend-pipeline tests: the check->hold->escrow path, e-stop wiring, resume."""
 
 import hashlib
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -12,7 +13,7 @@ from settlement.paypal_client import MockPayPalClient
 from settlement.verifier import Evidence, PredicateType, ReleaseVerifier
 
 
-def _pipeline(cap_cents=5000, merchants=("merchant_1",)):
+def _pipeline(cap_cents=5000, merchants=("merchant_1",), hours=1):
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     paypal = MockPayPalClient()
@@ -22,7 +23,7 @@ def _pipeline(cap_cents=5000, merchants=("merchant_1",)):
         agent_id="agent_1",
         cap_cents=cap_cents,
         allowlist=list(merchants),
-        expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+        expiry=datetime.now(timezone.utc) + timedelta(hours=hours),
     )
     return flow, paypal, permits, permit
 
@@ -189,6 +190,51 @@ def test_release_refused_when_ancestor_revoked():
     refused = [r for r in permits.ledger.receipts() if r.event_type == "REFUSED"]
     assert refused[-1].payload == {
         "escrow_id": attempt.escrow_id, "reason": "ancestor_revoked"}
+
+
+def test_release_refused_after_tightened_expiry():
+    """F1: grant 2h, spend, tighten(expiry=now+1s), wait, release → refuse."""
+    flow, paypal, permits, permit = _pipeline(hours=2)
+    artifact, digest = _artifact()
+    attempt = flow.spend(
+        permit.permit_id, 500, "merchant_1", PredicateType.D, digest
+    )
+    assert attempt.allowed
+    permits.tighten(
+        permit.permit_id,
+        expiry=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+    time.sleep(1.1)
+    result = flow.release(attempt.escrow_id, Evidence(delivered_bytes=artifact))
+    assert not result.released
+    assert result.reason == "tightened_expiry_passed"
+    assert len(paypal.capture_calls) == 0
+    assert permit.reserved_cents == 0
+
+
+def test_release_refused_after_ancestor_tightened_expiry():
+    """F1: same tighten→wait→release on an ancestor; lineage gate refuses."""
+    flow, paypal, permits, parent = _pipeline(hours=2)
+    child = _child(flow, permits, parent)
+    artifact, digest = _artifact()
+    attempt = flow.spend(
+        child.permit_id, 200, "merchant_1", PredicateType.D, digest
+    )
+    assert attempt.allowed
+    permits.tighten(
+        parent.permit_id,
+        expiry=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+    # Cascade also overlays the child; clear it so only the ancestor's
+    # effective expiry is past — exercising _lineage_block_reason.
+    with child._lock:
+        child.tighten_expiry = None
+    time.sleep(1.1)
+    result = flow.release(attempt.escrow_id, Evidence(delivered_bytes=artifact))
+    assert not result.released
+    assert result.reason == "ancestor_expired"
+    assert len(paypal.capture_calls) == 0
+    assert child.reserved_cents == 0
 
 
 def test_estop_between_admission_and_capture_refuses_capture():

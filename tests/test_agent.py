@@ -184,3 +184,129 @@ def test_llm_preflight_fails_with_guidance_when_cli_unset(monkeypatch):
     msg = str(exc.value)
     assert "PERMIT_GROK_CLI" in msg
     assert "--replay" in msg
+
+# -- M3: the agent loop cannot escape its permit --------------------------------
+# test_gate proves the gate at the pipeline boundary. These three tests prove
+# the same refusals hold at the agent-loop boundary: run_agent's replay path
+# is the exact code path the --replay honest demo runs, so a rogue recorded
+# turn is the strongest adversary the real demo can face.
+
+
+def _rogue_transcript(path, actions):
+    """A replay transcript whose recorded turns attempt `actions`
+    (list of (tool, args, recorded_observation_json)). The actions are
+    re-executed against the live tools, so the fresh observations are real."""
+    with open(path, "w") as f:
+        f.write(json.dumps({"type": "beat", "n": 7, "task": "rogue"}) + "\n")
+        for i, (tool, args, obs) in enumerate(actions):
+            f.write(json.dumps({"type": "llm",
+                                "text": f"THOUGHT: rogue turn {i}"}) + "\n")
+            f.write(json.dumps({"type": "action", "tool": tool,
+                                "args": args}) + "\n")
+            f.write(json.dumps({"type": "observation", "text": obs}) + "\n")
+        f.write(json.dumps({"type": "answer", "text": "loop complete"}) + "\n")
+        f.write(json.dumps({"type": "beat", "n": 8, "task": "next"}) + "\n")
+
+
+def _fresh_observations(out_path):
+    logged = [json.loads(l) for l in open(out_path)]
+    return [json.loads(o["text"]) for o in logged
+            if o.get("type") == "observation"]
+
+
+def test_rogue_agent_over_cap_blocked_rail_silent(tmp_path):
+    """A rogue agent turn that tries to spend past its cap is refused by the
+    gate before the rail. The allowed spend that precedes it proves the rail
+    spy is not vacuous."""
+    tools, paypal, _ = _tools()
+    rec_ok = json.dumps({"ok": True, "decision": "ALLOWED",
+                         "escrow_id": "esc_REC",
+                         "paypal_auth_id": "mock_auth_REC",
+                         "amount_cents": 3000})
+    rec_block = json.dumps({"ok": False, "decision": "BLOCKED",
+                            "reason": "over_remaining_cap",
+                            "paypal_called": False})
+    replay = tmp_path / "rec.jsonl"
+    _rogue_transcript(replay, [
+        ("attempt_spend", {"amount_cents": 3000, "purpose": "widget"}, rec_ok),
+        ("attempt_spend", {"amount_cents": 3000, "purpose": "widget"}, rec_block),
+    ])
+    out = tmp_path / "out.jsonl"
+    final = run_agent(tools, "rogue", str(out), replay=str(replay), beat=7)
+    assert final == "loop complete"
+
+    obs = _fresh_observations(out)
+    assert len(obs) == 2
+    assert obs[0]["decision"] == "ALLOWED"
+    assert obs[1]["decision"] == "BLOCKED"
+    assert obs[1]["reason"] == "over_remaining_cap"
+
+    # Rail spy: exactly one authorization (the allowed spend); the rogue
+    # attempt never reached the rail.
+    assert len(paypal.authorize_calls) == 1, paypal.authorize_calls
+    assert len(paypal.authorizations) == 1
+    assert paypal.capture_calls == [] and paypal.captures == {}
+    assert paypal.voids == {}
+
+    # A BLOCKED receipt with the exact reason sits on the chain, intact.
+    blocked = [r for r in tools.flow.ledger.receipts()
+               if r.event_type == "BLOCKED"
+               and r.payload.get("reason") == "over_remaining_cap"]
+    assert blocked, "no BLOCKED receipt for the rogue over-cap attempt"
+    ok, msg = tools.flow.ledger.verify_chain()
+    assert ok, msg
+
+
+def test_rogue_agent_tamper_tool_refused_at_loop_boundary(tmp_path):
+    """The name blocklist holds at the agent-loop boundary: a recorded turn
+    that names the harness-only deliver_tampered gets an unknown-tool error,
+    the tool is never executed, and the rail is untouched."""
+    tools, paypal, _ = _tools()
+    replay = tmp_path / "rec.jsonl"
+    _rogue_transcript(replay, [
+        ("deliver_tampered", {"escrow_id": "esc_X", "payload": "x"},
+         json.dumps({"ok": False, "error": "unknown tool 'deliver_tampered'"})),
+    ])
+    out = tmp_path / "out.jsonl"
+    run_agent(tools, "rogue", str(out), replay=str(replay), beat=7)
+
+    obs = _fresh_observations(out)
+    assert len(obs) == 1
+    assert obs[0]["ok"] is False
+    assert "unknown tool" in obs[0]["error"]
+
+    assert paypal.authorize_calls == [] and paypal.authorizations == {}
+    assert paypal.capture_calls == [] and paypal.captures == {}
+    assert paypal.voids == {}
+
+
+def test_agent_merchant_binding_holds_at_loop_boundary(tmp_path):
+    """The permit's merchant allowlist binds at the agent-loop boundary:
+    tools bound to a merchant outside the allowlist get BLOCKED with
+    merchant_not_allowed before the rail."""
+    tools, paypal, _ = _tools()
+    from agent.tools import SpendTools
+    outsider = SpendTools(tools.flow, tools.permit_id,
+                          "rogue_merchant", tools.catalog)
+    rec_block = json.dumps({"ok": False, "decision": "BLOCKED",
+                            "reason": "merchant_not_allowed",
+                            "paypal_called": False})
+    replay = tmp_path / "rec.jsonl"
+    _rogue_transcript(replay, [
+        ("attempt_spend", {"amount_cents": 100, "purpose": "widget"}, rec_block),
+    ])
+    out = tmp_path / "out.jsonl"
+    run_agent(outsider, "rogue", str(out), replay=str(replay), beat=7)
+
+    obs = _fresh_observations(out)
+    assert len(obs) == 1
+    assert obs[0]["decision"] == "BLOCKED"
+    assert obs[0]["reason"] == "merchant_not_allowed"
+
+    assert paypal.authorize_calls == [] and paypal.authorizations == {}
+    blocked = [r for r in tools.flow.ledger.receipts()
+               if r.event_type == "BLOCKED"
+               and r.payload.get("reason") == "merchant_not_allowed"]
+    assert blocked, "no BLOCKED receipt for the out-of-allowlist merchant"
+    ok, msg = tools.flow.ledger.verify_chain()
+    assert ok, msg

@@ -45,6 +45,18 @@ subtree obeys the tightened mandate with no ancestor walk at check time.
 Every tighten writes a TIGHTEN receipt with old→new per narrowed clause;
 cascaded applications carry cascade_from. A tighten that would widen or
 leave authority unchanged is rejected.
+
+Calibration tau (Sol 6.1, ADVISORY): each permit carries the tau its
+advisory calibration score is compared against (permit/calibration.py).
+The grant-time tau is the floor; raise_calibration_tau() may only raise
+it. A lowering, a no-op or an out-of-range value is refused with a
+TAU_REFUSED receipt and the stored tau is unchanged. Tau is NOT an
+authority clause: _evaluate() never reads it.
+
+check() records the advisory score on the ALLOWED/BLOCKED receipt it
+writes (payload key "calibration"), computed AFTER the authority decision
+is made. Any failure computing it is recorded as unavailable; it can
+never change, block or allow a spend.
 """
 
 from __future__ import annotations
@@ -54,6 +66,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from . import calibration as _calibration
+from .calibration import TAU_DEFAULT, validate_tau
 from .ledger import Ledger, Receipt
 
 
@@ -107,6 +121,15 @@ class DelegateResult:
 
 
 @dataclass
+class TauResult:
+    """Outcome of raise_calibration_tau(). The receipt is always written."""
+    ok: bool
+    reason: str
+    tau: float | None
+    receipt: Receipt
+
+
+@dataclass
 class PendingApproval:
     """A principal-approval request for an above-threshold spend."""
     approval_id: str
@@ -116,7 +139,7 @@ class PendingApproval:
     merchant_id: str
     predicate_type: str  # PredicateType value, e.g. "D"
     artifact_hash: str
-    # pending | approved | denied | expired | consumed
+    # pending | approved | claimed | denied | expired | consumed
     status: str = "pending"
     created_at: str = ""
     expires_at: str = ""
@@ -150,6 +173,9 @@ class Permit:
     # None = no threshold. Tighten-only via tighten().
     approval_threshold_cents: int | None = None
     tighten_approval_threshold_cents: int | None = None
+    # Advisory calibration tau (Sol 6.1). Raise-only after grant; never
+    # read by the authority check.
+    calibration_tau: float = TAU_DEFAULT
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def remaining_cents(self) -> int:
@@ -191,10 +217,12 @@ class PermitStore:
         allowlist: list[str],
         expiry: datetime,
         approval_threshold_cents: int | None = None,
+        calibration_tau: float = TAU_DEFAULT,
     ) -> tuple[Permit, Receipt]:
         _validate_amount(cap_cents)
         if approval_threshold_cents is not None:
             _validate_amount(approval_threshold_cents)
+        calibration_tau = validate_tau(calibration_tau)
         permit = Permit(
             permit_id=f"prm_{uuid.uuid4().hex[:12]}",
             agent_id=agent_id,
@@ -202,6 +230,7 @@ class PermitStore:
             allowlist=tuple(allowlist),
             expiry=expiry,
             approval_threshold_cents=approval_threshold_cents,
+            calibration_tau=calibration_tau,
         )
         with self._store_lock:
             self._permits[permit.permit_id] = permit
@@ -214,6 +243,7 @@ class PermitStore:
                 "allowlist": list(allowlist),
                 "expiry": expiry.isoformat(),
                 "approval_threshold_cents": approval_threshold_cents,
+                "calibration_tau": calibration_tau,
             },
         )
         return permit, receipt
@@ -350,6 +380,8 @@ class PermitStore:
                     expiry=expiry,
                     parent_id=parent.permit_id,
                     depth=parent.depth + 1,
+                    # Advisory tau: a carve starts at the parent's tau.
+                    calibration_tau=parent.calibration_tau,
                 )
                 self._permits[child.permit_id] = child
                 self._children.setdefault(parent.permit_id, []).append(
@@ -510,11 +542,46 @@ class PermitStore:
             )
             return approval
 
-    def consume_approval(self, approval_id: str) -> None:
-        """Mark an approved request consumed after its spend reserves."""
+    def claim_approval(
+        self,
+        approval_id: str,
+        *,
+        permit_id: str,
+        amount_cents: int,
+        merchant_id: str,
+    ) -> bool:
+        """
+        Atomically claim an approved request for one spend attempt.
+        Under _store_lock, moves approved → claimed only when the id
+        binds the exact (permit, amount, merchant). Returns True iff
+        claimed. Caller must restore_approval() on BLOCKED or
+        consume_approval() on ALLOWED.
+        """
         with self._store_lock:
             approval = self._approvals.get(approval_id)
-            if approval is not None and approval.status == "approved":
+            if (
+                approval is None
+                or approval.status != "approved"
+                or approval.permit_id != permit_id
+                or approval.amount_cents != amount_cents
+                or approval.merchant_id != merchant_id
+            ):
+                return False
+            approval.status = "claimed"
+            return True
+
+    def restore_approval(self, approval_id: str) -> None:
+        """Return a claimed approval to approved after a BLOCKED check."""
+        with self._store_lock:
+            approval = self._approvals.get(approval_id)
+            if approval is not None and approval.status == "claimed":
+                approval.status = "approved"
+
+    def consume_approval(self, approval_id: str) -> None:
+        """Mark a claimed approval consumed after its spend reserves."""
+        with self._store_lock:
+            approval = self._approvals.get(approval_id)
+            if approval is not None and approval.status == "claimed":
                 approval.status = "consumed"
 
     def pending_approvals(
@@ -570,7 +637,8 @@ class PermitStore:
             with ancestor._lock:
                 if ancestor.revoked:
                     return "ancestor_revoked"
-                if now >= ancestor.expiry:
+                # Honor tightened expiry (min-gate), not only the grant.
+                if now >= PermitStore._effective(ancestor)[3]:
                     return "ancestor_expired"
         return None
 
@@ -740,6 +808,74 @@ class PermitStore:
             )
         return permit, first_receipt
 
+    def raise_calibration_tau(
+        self, permit_id: str, tau, actor: str = "human"
+    ) -> TauResult:
+        """
+        Raise the ADVISORY calibration tau on a live permit. Raise-only:
+        the grant-time tau is the floor. Refusals (lowering, no-op, out
+        of (0, 1], non-number, unknown/revoked/expired permit) write a
+        TAU_REFUSED receipt and leave the stored tau unchanged; success
+        writes TAU_RAISED with from/to. Never changes authority: tau is
+        not a clause of the 4-clause check.
+        """
+        now = datetime.now(timezone.utc)
+        actor = actor.strip() if isinstance(actor, str) and actor.strip() else "human"
+        try:
+            new_tau: float | None = validate_tau(tau)
+        except ValueError:
+            new_tau = None
+        # Out-of-range / non-number requests are recorded by repr (keeps
+        # NaN/inf out of the hashed JSON payload).
+        requested = new_tau if new_tau is not None else repr(tau)
+
+        def refuse(reason: str, current: float | None) -> TauResult:
+            receipt = self.ledger.append(
+                "TAU_REFUSED",
+                {
+                    "permit_id": permit_id,
+                    "actor": actor,
+                    "requested_tau": requested,
+                    "current_tau": current,
+                    "reason": reason,
+                },
+            )
+            return TauResult(False, reason, current, receipt)
+
+        permit = self.get(permit_id)
+        if permit is None:
+            return refuse("unknown_permit", None)
+        if new_tau is None:
+            with permit._lock:
+                current = permit.calibration_tau
+            return refuse("tau_out_of_range", current)
+        with permit._lock:
+            current = permit.calibration_tau
+            if permit.revoked:
+                reason = "revoked"
+            elif now >= self._effective(permit)[3]:
+                reason = "expired"
+            elif new_tau < current:
+                reason = "tau_lowering_refused"
+            elif new_tau == current:
+                reason = "tau_unchanged"
+            else:
+                reason = None
+            if reason is not None:
+                return refuse(reason, current)
+            permit.calibration_tau = new_tau
+            receipt = self.ledger.append(
+                "TAU_RAISED",
+                {
+                    "permit_id": permit.permit_id,
+                    "agent_id": permit.agent_id,
+                    "actor": actor,
+                    "from": current,
+                    "to": new_tau,
+                },
+            )
+            return TauResult(True, "raised", new_tau, receipt)
+
     @staticmethod
     def _effective(
         permit: Permit,
@@ -786,6 +922,57 @@ class PermitStore:
         if amount_cents > cap - permit.reserved_cents - permit.captured_cents:
             return "tightened_cap_exceeded" if cap_tightened else "over_remaining_cap"
         return None
+
+    def _advisory_calibration(self, permit: Permit, now: datetime) -> dict:
+        """
+        ADVISORY calibration record for a receipt payload. Called by check()
+        only after the authority decision is final; the result is data on
+        the receipt, never an input to the decision. Caller holds
+        permit._lock. Never raises: a failure is recorded as unavailable.
+
+        n_receipts = CAPTURED receipts on this permit (verified captures);
+        chain_ok = the ledger's own verify_chain(). Fixture weights/scales.
+        """
+        try:
+            cap, _, allow, expiry, _ = self._effective(permit)
+            granted = set(permit.allowlist)
+            coverage = len(allow & granted) / len(granted) if granted else 0.0
+            x = _calibration.features(
+                permit.remaining_cents(),
+                permit.cap_cents,
+                (expiry - now).total_seconds() / 3600.0,
+                coverage,
+            )
+            n = sum(
+                1
+                for r in self.ledger.receipts()
+                if r.event_type == "CAPTURED"
+                and r.payload.get("permit_id") == permit.permit_id
+            )
+            chain_ok, _ = self.ledger.verify_chain()
+            S = _calibration.score(
+                x,
+                _calibration.FIXTURE_SPEC_X,
+                _calibration.FIXTURE_WEIGHTS,
+                _calibration.FIXTURE_SCALES,
+                n,
+                chain_ok,
+            )
+            tau = permit.calibration_tau
+            return {
+                "advisory": True,
+                "S": S,
+                "tau": tau,
+                "verdict": _calibration.advisory_verdict(S, tau),
+                "n_receipts": n,
+                "chain_ok": chain_ok,
+            }
+        except Exception as exc:  # advisory: must never affect the spend
+            return {
+                "advisory": True,
+                "status": "unavailable",
+                "error": type(exc).__name__,
+            }
 
     def eligible(
         self,
@@ -879,6 +1066,9 @@ class PermitStore:
                 # child -> ancestor order (cannot cycle: delegation depth
                 # strictly increases).
                 reason = self._lineage_block_reason(chain, now)
+            # The authority decision (reason) is final above. The advisory
+            # calibration score is recorded on the receipt and never read.
+            calibration = self._advisory_calibration(permit, now)
             if reason is not None:
                 receipt = self.ledger.append(
                     "BLOCKED",
@@ -889,6 +1079,7 @@ class PermitStore:
                         "merchant_id": merchant_id,
                         "reason": reason,
                         "remaining_cents": permit.remaining_cents(),
+                        "calibration": calibration,
                     },
                 )
                 return CheckResult(False, reason, receipt)
@@ -906,6 +1097,7 @@ class PermitStore:
                     "merchant_id": merchant_id,
                     "auth_id": auth_id,
                     "remaining_cents": permit.remaining_cents(),
+                    "calibration": calibration,
                 },
             )
             return CheckResult(True, "allowed", receipt)
@@ -1063,8 +1255,12 @@ class PermitStore:
         with permit._lock:
             if permit.revoked:
                 return "revoked"
-            if now >= permit.expiry:
-                return "expired"
+            # Honor tightened expiry (min-gate), not only the grant.
+            _, _, _, expiry, expiry_tightened = self._effective(permit)
+            if now >= expiry:
+                return (
+                    "tightened_expiry_passed" if expiry_tightened else "expired"
+                )
         return self._lineage_block_reason(chain, now)
 
     def revoke_subtree(

@@ -1,0 +1,14 @@
+# Gitleaks config for Permit.
+# Historical launch ledgers under runs/ recorded PayPal authorization IDs
+# (provider resource IDs, not credentials). Those false-positive on
+# generic-api-key; client secrets never belong in-repo.
+title = "permit"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Historical sandbox ledger transcripts (PayPal auth/capture IDs, not secrets)"
+paths = [
+  '''(^|/)runs/.*''',
+]
