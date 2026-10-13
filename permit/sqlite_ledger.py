@@ -18,8 +18,14 @@ import json
 import sqlite3
 import threading
 
-from .ledger import GENESIS_HASH, Receipt, _canonical, _utcnow_iso
-from .retry_rate_store import SqliteRetryRateStore
+from .ledger import (
+    GENESIS_HASH,
+    Receipt,
+    _canonical,
+    _rate_tally_key,
+    _utcnow_iso,
+)
+from .retry_rate_store import _DDL_RETRY_RATE, SqliteRetryRateStore
 
 
 _DDL_TABLE = """
@@ -65,12 +71,25 @@ ON receipts (json_extract(payload, '$.idempotency_key'))
 WHERE json_extract(payload, '$.idempotency_key') IS NOT NULL
 """
 
+# F7: at most one rate_limited tally receipt per (escrow_id, window_id).
+_DDL_RATE_TALLY_UNIQUE = """
+CREATE UNIQUE INDEX IF NOT EXISTS receipts_rate_limited_window
+ON receipts (
+  json_extract(payload, '$.escrow_id'),
+  json_extract(payload, '$.window_id')
+)
+WHERE event_type = 'REFUSED'
+  AND json_extract(payload, '$.reason') = 'rate_limited'
+"""
+
 _DDL = (
     _DDL_TABLE,
     _DDL_NO_UPDATE,
     _DDL_NO_DELETE,
     _DDL_LINK,
     _DDL_IDEMPOTENCY,
+    _DDL_RATE_TALLY_UNIQUE,
+    _DDL_RETRY_RATE,
 )
 
 
@@ -133,6 +152,14 @@ class SqliteLedger:
                     allowed[auth_id] = receipt
             self._receipts = receipts
             self._allowed_by_auth = allowed
+            rate_tallies: dict[tuple[str, str], Receipt] = {}
+            for receipt in receipts:
+                if receipt.event_type != "REFUSED":
+                    continue
+                key = _rate_tally_key(receipt.payload)
+                if key is not None:
+                    rate_tallies[key] = receipt
+            self._rate_tally_by_window = rate_tallies
             ok, detail = self._verify_receipts(receipts)
             if not ok:
                 raise RuntimeError(
@@ -179,8 +206,20 @@ class SqliteLedger:
             expected_prev = r.hash
         return True, "ok"
 
+    def find_rate_limited_tally(
+        self, escrow_id: str, window_id: str
+    ) -> Receipt | None:
+        """Existing rate_limited tally for (escrow_id, window_id), if any."""
+        with self._lock:
+            return self._rate_tally_by_window.get((escrow_id, window_id))
+
     def append(self, event_type: str, payload: dict) -> Receipt:
         with self._lock:
+            tally_key = (
+                _rate_tally_key(payload) if event_type == "REFUSED" else None
+            )
+            if tally_key is not None and tally_key in self._rate_tally_by_window:
+                return self._rate_tally_by_window[tally_key]
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 tip = self._conn.execute(
@@ -216,11 +255,50 @@ class SqliteLedger:
                         ),
                     )
                 except sqlite3.IntegrityError as exc:
+                    err = str(exc)
+                    # Idempotent re-append of a rate_limited tally window
+                    # (crash replay or a second writer on the same DB file).
+                    if tally_key is not None and "UNIQUE constraint failed" in err:
+                        self._conn.execute("ROLLBACK")
+                        existing = self._rate_tally_by_window.get(tally_key)
+                        if existing is not None:
+                            return existing
+                        row = self._conn.execute(
+                            "SELECT seq, prev_hash, event_type, payload,"
+                            " timestamp, hash FROM receipts"
+                            " WHERE event_type = 'REFUSED'"
+                            " AND json_extract(payload, '$.reason') = 'rate_limited'"
+                            " AND json_extract(payload, '$.escrow_id') = ?"
+                            " AND json_extract(payload, '$.window_id') = ?",
+                            tally_key,
+                        ).fetchone()
+                        if row is None:
+                            raise RuntimeError(
+                                "rate_limited window conflict with no existing row"
+                            ) from exc
+                        seq, prev_hash, et, payload_text, ts, stored_hash = row
+                        if seq < len(self._receipts):
+                            existing = self._receipts[seq]
+                            self._rate_tally_by_window[tally_key] = existing
+                            return existing
+                        receipt = Receipt(
+                            seq=seq,
+                            prev_hash=prev_hash,
+                            event_type=et,
+                            payload=json.loads(payload_text),
+                            timestamp=ts,
+                        )
+                        if receipt.hash != stored_hash:
+                            raise RuntimeError(
+                                "rate_limited conflict row hash mismatch"
+                            ) from exc
+                        self._rate_tally_by_window[tally_key] = receipt
+                        return receipt
                     # Either the link trigger fired (fail closed) or the
                     # idempotency index caught a re-append: return the
                     # existing row instead of writing a duplicate.
                     if payload.get("idempotency_key") is not None and (
-                        "UNIQUE constraint failed" in str(exc)
+                        "UNIQUE constraint failed" in err
                     ):
                         self._conn.execute("ROLLBACK")
                         row = self._conn.execute(
@@ -245,6 +323,14 @@ class SqliteLedger:
                     raise RuntimeError(
                         "receipt insert rejected: %s" % (exc,)
                     ) from exc
+                # Same transaction: mark side-table row flushed for this tally.
+                if tally_key is not None:
+                    self._conn.execute(
+                        "UPDATE retry_rate_windows SET tally_flushed = 1,"
+                        " rate_limited = ?"
+                        " WHERE escrow_id = ? AND window_id = ?",
+                        (int(payload.get("count", 0)), tally_key[0], tally_key[1]),
+                    )
                 self._conn.execute("COMMIT")
             except Exception:
                 try:
@@ -258,6 +344,8 @@ class SqliteLedger:
                 auth_id = payload.get("auth_id")
                 if isinstance(auth_id, str):
                     self._allowed_by_auth[auth_id] = receipt
+            if tally_key is not None:
+                self._rate_tally_by_window[tally_key] = receipt
             return receipt
 
     def allowed_receipt(self, auth_id: str) -> Receipt | None:

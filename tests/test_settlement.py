@@ -13,6 +13,7 @@ from settlement.verifier import (
     Evidence,
     PredicateType,
     ReleaseVerifier,
+    RetryRateIntegrityError,
     sign_acceptance,
 )
 
@@ -623,6 +624,416 @@ def test_retry_rate_limit_restart_keeps_counter_and_f6_link():
     last = _rate_limited_receipts(ledger, "esc_1")[-1]
     assert last.payload["count"] == 38
     assert last.payload["original_refusal_id"] == original
+
+
+def test_retry_rate_limit_crash_between_tally_append_and_done_mark():
+    """Crash after tally append but before side-table done-mark: no duplicate."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import RetryRateRow
+    from permit.sqlite_ledger import SqliteLedger
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    over = 50
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        ledger = SqliteLedger(path)
+        permits = PermitStore(ledger=ledger)
+        paypal = MockPayPalClient()
+        clock = [1_000_000.0]
+
+        def now():
+            return clock[0]
+
+        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, clock=now)
+        permit, _ = permits.grant(
+            agent_id="agent_1",
+            cap_cents=5000,
+            allowlist=["merchant_1"],
+            expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        check = permits.check(permit.permit_id, 3000, "merchant_1")
+        auth_id = check.receipt.payload["auth_id"]
+        pp_auth = paypal.authorize(3000, "merchant_1")
+        artifact = b"delivered work product"
+        escrow = Escrow(
+            escrow_id="esc_1",
+            permit_id=permit.permit_id,
+            auth_id=auth_id,
+            paypal_auth_id=pp_auth.auth_id,
+            amount_cents=3000,
+            merchant_id="merchant_1",
+            predicate_type=PredicateType.D,
+            artifact_hash=hashlib.sha256(artifact).hexdigest(),
+        )
+        verifier.register(escrow)
+        _refuse_escrow(verifier)
+        evidence = Evidence(delivered_bytes=artifact)
+        before = len(ledger)
+        for _ in range(n + over):
+            verifier.verify_and_capture("esc_1", evidence)
+        verifier.flush_retry_rate_limits("esc_1")
+        assert len(_rate_limited_receipts(ledger, "esc_1")) == 1
+        assert _tally_count_sum(ledger, "esc_1") == over
+        assert len(ledger) - before == n + 1
+
+        # Simulate crash after append, before done-mark: tally on chain,
+        # side row still tally_flushed=0 (same count).
+        side = ledger.retry_rate_store.load_all()[0]
+        assert side.tally_flushed is True
+        ledger.retry_rate_store.upsert(
+            RetryRateRow(
+                escrow_id=side.escrow_id,
+                window_id=side.window_id,
+                window_start=side.window_start,
+                individual=side.individual,
+                rate_limited=side.rate_limited,
+                covered_reason=side.covered_reason,
+                tally_flushed=False,
+            )
+        )
+        del verifier
+        ledger.close()
+
+        ledger2 = SqliteLedger(path)
+        permits2 = PermitStore(ledger=ledger2)
+        paypal2 = MockPayPalClient()
+        verifier2 = ReleaseVerifier(paypal2, permits2, ledger=ledger2, clock=now)
+        # Rebuild must not append a second tally.
+        assert len(_rate_limited_receipts(ledger2, "esc_1")) == 1
+        assert _tally_count_sum(ledger2, "esc_1") == over
+        assert len(ledger2) - before == n + 1
+        side2 = [
+            r
+            for r in ledger2.retry_rate_store.load_all()
+            if r.escrow_id == "esc_1"
+        ][0]
+        assert side2.tally_flushed is True
+        assert side2.rate_limited == over
+        ok, reason = ledger2.verify_chain()
+        assert ok, reason
+        ledger2.close()
+
+
+def test_retry_rate_limit_two_writers_one_sqlite_file():
+    """Two writers on one Sqlite file: exactly one tally, exact count, N+1."""
+    import tempfile
+    import threading
+
+    import settlement.verifier as vmod
+    from permit.sqlite_ledger import SqliteLedger
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    over = 50
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        ledger = SqliteLedger(path)
+        permits = PermitStore(ledger=ledger)
+        paypal = MockPayPalClient()
+        clock = [1_000_000.0]
+
+        def now():
+            return clock[0]
+
+        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, clock=now)
+        permit, _ = permits.grant(
+            agent_id="agent_1",
+            cap_cents=5000,
+            allowlist=["merchant_1"],
+            expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        check = permits.check(permit.permit_id, 3000, "merchant_1")
+        auth_id = check.receipt.payload["auth_id"]
+        pp_auth = paypal.authorize(3000, "merchant_1")
+        artifact = b"delivered work product"
+        escrow = Escrow(
+            escrow_id="esc_1",
+            permit_id=permit.permit_id,
+            auth_id=auth_id,
+            paypal_auth_id=pp_auth.auth_id,
+            amount_cents=3000,
+            merchant_id="merchant_1",
+            predicate_type=PredicateType.D,
+            artifact_hash=hashlib.sha256(artifact).hexdigest(),
+        )
+        verifier.register(escrow)
+        _refuse_escrow(verifier)
+        evidence = Evidence(delivered_bytes=artifact)
+        before = len(ledger)
+        for _ in range(n + over):
+            assert verifier.verify_and_capture("esc_1", evidence).reason in (
+                "already_refused",
+                "rate_limited",
+            )
+        # Expire the window so rebuild materializes the tally.
+        clock[0] += getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_W", 60.0) + 1.0
+        side = ledger.retry_rate_store.load_all()[0]
+        window_id = side.window_id
+        assert side.tally_flushed is False
+        assert side.rate_limited == over
+        ledger.close()
+
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(2)
+
+        def writer():
+            try:
+                led = SqliteLedger(path)
+                per = PermitStore(ledger=led)
+                pp = MockPayPalClient()
+                barrier.wait(timeout=10)
+                # Both rebuild concurrently; expired unflushed window → tally.
+                ReleaseVerifier(pp, per, ledger=led, clock=now)
+                led.close()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t1 = threading.Thread(target=writer)
+        t2 = threading.Thread(target=writer)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        assert errors == []
+
+        final = SqliteLedger(path)
+        rl = _rate_limited_receipts(final, "esc_1")
+        assert len(rl) == 1
+        assert rl[0].payload["window_id"] == window_id
+        assert rl[0].payload["count"] == over
+        assert _tally_count_sum(final, "esc_1") == over
+        # N individual denials + 1 tally (+ prior grant/check/auth/refuse).
+        assert len(final) - before == n + 1
+        ok, reason = final.verify_chain()
+        assert ok, reason
+        final.close()
+
+
+def test_retry_rate_limit_side_table_tamper_count_edited():
+    """Edited side-table count vs chain tally → refuse to start."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import RetryRateRow
+    from permit.sqlite_ledger import SqliteLedger
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        ledger = SqliteLedger(path)
+        permits = PermitStore(ledger=ledger)
+        paypal = MockPayPalClient()
+        clock = [1_000_000.0]
+
+        def now():
+            return clock[0]
+
+        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, clock=now)
+        permit, _ = permits.grant(
+            agent_id="agent_1",
+            cap_cents=5000,
+            allowlist=["merchant_1"],
+            expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        check = permits.check(permit.permit_id, 3000, "merchant_1")
+        auth_id = check.receipt.payload["auth_id"]
+        pp_auth = paypal.authorize(3000, "merchant_1")
+        artifact = b"delivered work product"
+        escrow = Escrow(
+            escrow_id="esc_1",
+            permit_id=permit.permit_id,
+            auth_id=auth_id,
+            paypal_auth_id=pp_auth.auth_id,
+            amount_cents=3000,
+            merchant_id="merchant_1",
+            predicate_type=PredicateType.D,
+            artifact_hash=hashlib.sha256(artifact).hexdigest(),
+        )
+        verifier.register(escrow)
+        _refuse_escrow(verifier)
+        evidence = Evidence(delivered_bytes=artifact)
+        for _ in range(n + 20):
+            verifier.verify_and_capture("esc_1", evidence)
+        verifier.flush_retry_rate_limits("esc_1")
+        side = ledger.retry_rate_store.load_all()[0]
+        ledger.retry_rate_store.upsert(
+            RetryRateRow(
+                escrow_id=side.escrow_id,
+                window_id=side.window_id,
+                window_start=side.window_start,
+                individual=side.individual,
+                rate_limited=side.rate_limited + 99,  # tamper
+                covered_reason=side.covered_reason,
+                tally_flushed=True,
+            )
+        )
+        ledger.close()
+        ledger2 = SqliteLedger(path)
+        permits2 = PermitStore(ledger=ledger2)
+        paypal2 = MockPayPalClient()
+        with pytest.raises(RetryRateIntegrityError, match="count mismatch"):
+            ReleaseVerifier(paypal2, permits2, ledger=ledger2, clock=now)
+        ledger2.close()
+
+
+def test_retry_rate_limit_side_table_tamper_done_flag_without_tally():
+    """tally_flushed=1 with no chain tally → refuse to start."""
+    import tempfile
+
+    from permit.retry_rate_store import RetryRateRow
+    from permit.sqlite_ledger import SqliteLedger
+
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        ledger = SqliteLedger(path)
+        permits = PermitStore(ledger=ledger)
+        paypal = MockPayPalClient()
+        clock = [1_000_000.0]
+
+        def now():
+            return clock[0]
+
+        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, clock=now)
+        permit, _ = permits.grant(
+            agent_id="agent_1",
+            cap_cents=5000,
+            allowlist=["merchant_1"],
+            expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        check = permits.check(permit.permit_id, 3000, "merchant_1")
+        auth_id = check.receipt.payload["auth_id"]
+        pp_auth = paypal.authorize(3000, "merchant_1")
+        artifact = b"delivered work product"
+        escrow = Escrow(
+            escrow_id="esc_1",
+            permit_id=permit.permit_id,
+            auth_id=auth_id,
+            paypal_auth_id=pp_auth.auth_id,
+            amount_cents=3000,
+            merchant_id="merchant_1",
+            predicate_type=PredicateType.D,
+            artifact_hash=hashlib.sha256(artifact).hexdigest(),
+        )
+        verifier.register(escrow)
+        _refuse_escrow(verifier)
+        # Tamper: claim flushed without ever writing a tally.
+        ledger.retry_rate_store.upsert(
+            RetryRateRow(
+                escrow_id="esc_1",
+                window_id="rw_orphan",
+                window_start=clock[0],
+                individual=0,
+                rate_limited=7,
+                covered_reason="already_refused",
+                tally_flushed=True,
+            )
+        )
+        ledger.close()
+        ledger2 = SqliteLedger(path)
+        permits2 = PermitStore(ledger=ledger2)
+        paypal2 = MockPayPalClient()
+        with pytest.raises(RetryRateIntegrityError, match="tally_flushed=1"):
+            ReleaseVerifier(paypal2, permits2, ledger=ledger2, clock=now)
+        ledger2.close()
+
+
+def test_retry_rate_limit_side_table_tamper_row_deleted():
+    """Side row deleted while chain tally remains → refuse to start."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.sqlite_ledger import SqliteLedger
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        ledger = SqliteLedger(path)
+        permits = PermitStore(ledger=ledger)
+        paypal = MockPayPalClient()
+        clock = [1_000_000.0]
+
+        def now():
+            return clock[0]
+
+        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, clock=now)
+        permit, _ = permits.grant(
+            agent_id="agent_1",
+            cap_cents=5000,
+            allowlist=["merchant_1"],
+            expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        check = permits.check(permit.permit_id, 3000, "merchant_1")
+        auth_id = check.receipt.payload["auth_id"]
+        pp_auth = paypal.authorize(3000, "merchant_1")
+        artifact = b"delivered work product"
+        escrow = Escrow(
+            escrow_id="esc_1",
+            permit_id=permit.permit_id,
+            auth_id=auth_id,
+            paypal_auth_id=pp_auth.auth_id,
+            amount_cents=3000,
+            merchant_id="merchant_1",
+            predicate_type=PredicateType.D,
+            artifact_hash=hashlib.sha256(artifact).hexdigest(),
+        )
+        verifier.register(escrow)
+        _refuse_escrow(verifier)
+        evidence = Evidence(delivered_bytes=artifact)
+        for _ in range(n + 10):
+            verifier.verify_and_capture("esc_1", evidence)
+        verifier.flush_retry_rate_limits("esc_1")
+        side = ledger.retry_rate_store.load_all()[0]
+        ledger.retry_rate_store.delete(side.escrow_id, side.window_id)
+        ledger.close()
+        ledger2 = SqliteLedger(path)
+        permits2 = PermitStore(ledger=ledger2)
+        paypal2 = MockPayPalClient()
+        with pytest.raises(RetryRateIntegrityError, match="missing row"):
+            ReleaseVerifier(paypal2, permits2, ledger=ledger2, clock=now)
+        ledger2.close()
+
+
+def test_retry_rate_limit_wall_clock_step_backwards():
+    """Wall-clock stepping backwards must not reset the window or counters."""
+    import settlement.verifier as vmod
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    wall = [1_000_000.0]
+
+    def wall_clock():
+        return wall[0]
+
+    verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
+    verifier = ReleaseVerifier(
+        paypal, permits, ledger=verifier.ledger, clock=wall_clock
+    )
+    with verifier._lock:
+        verifier._escrows[escrow.escrow_id] = escrow
+    _refuse_escrow(verifier)
+    evidence = Evidence(delivered_bytes=artifact)
+    for _ in range(n):
+        assert verifier.verify_and_capture("esc_1", evidence).reason == "already_refused"
+    for _ in range(10):
+        assert verifier.verify_and_capture("esc_1", evidence).reason == "rate_limited"
+    state = verifier._retry_rate_windows["esc_1"]
+    wid = state.window_id
+    assert state.individual == n
+    assert state.rate_limited == 10
+
+    # Step wall clock backwards (NTP skew / manual set).
+    wall[0] -= 10_000.0
+    r = verifier.verify_and_capture("esc_1", evidence)
+    assert r.reason == "rate_limited"
+    state2 = verifier._retry_rate_windows["esc_1"]
+    assert state2.window_id == wid
+    assert state2.individual == n
+    assert state2.rate_limited == 11
+    # Still no mid-window tally on the chain.
+    assert _rate_limited_receipts(verifier.ledger, "esc_1") == []
+    verifier.flush_retry_rate_limits("esc_1")
+    assert len(_rate_limited_receipts(verifier.ledger, "esc_1")) == 1
+    assert _tally_count_sum(verifier.ledger, "esc_1") == 11
 
 
 def test_only_verifier_calls_capture():
