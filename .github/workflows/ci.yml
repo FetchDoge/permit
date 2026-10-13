@@ -147,6 +147,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # actions: read is required for CodeQL analyze on pull_request;
+      # no actions: write anywhere in this workflow.
+      actions: read
       security-events: write
     strategy:
       fail-fast: false
