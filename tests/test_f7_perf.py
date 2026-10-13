@@ -517,14 +517,34 @@ def test_perf_f7_sqlite_hostile_on_100k_log():
             finally:
                 ledger.close()
 
-    median_100 = _hostile_median_ns(100)
-    median_100k = _hostile_median_ns(100_000)
-    ratio = median_100k / median_100 if median_100 else float("inf")
+    # Warmup: discard. The first hostile pair otherwise pays cold import /
+    # SQLite / CPU-governor cost on whichever size runs first (a 100-first
+    # cold run made local ratio≈0.5 look like 100k was faster).
+    _ = _hostile_median_ns(100)
+
+    # Order A: 100 then 100k (same order as the historical cold-first path).
+    median_100_a = _hostile_median_ns(100)
+    median_100k_a = _hostile_median_ns(100_000)
+    ratio_a = median_100k_a / median_100_a if median_100_a else float("inf")
+
+    # Order B: 100k then 100 (interleaved opposite order).
+    median_100k_b = _hostile_median_ns(100_000)
+    median_100_b = _hostile_median_ns(100)
+    ratio_b = median_100k_b / median_100_b if median_100_b else float("inf")
+
     print(
-        f"perf_f7_sqlite_hostile ratio_100k_vs_100={ratio:.3f} "
-        f"median_100={median_100} median_100k={median_100k}"
+        f"perf_f7_sqlite_hostile after_warmup "
+        f"order_100_then_100k median_100={median_100_a} "
+        f"median_100k={median_100k_a} ratio={ratio_a:.3f}; "
+        f"order_100k_then_100 median_100={median_100_b} "
+        f"median_100k={median_100k_b} ratio={ratio_b:.3f}"
     )
-    assert median_100k <= THRESHOLD_X * median_100, (
-        f"SqliteLedger hostile median@100k={median_100k} ns exceeds "
-        f"{THRESHOLD_X}x @100={median_100} (ratio={ratio:.3f})"
+    # Threshold unchanged: each ordering's 100k median must be ≤ 2× its 100.
+    assert median_100k_a <= THRESHOLD_X * median_100_a, (
+        f"SqliteLedger hostile (100→100k) median@100k={median_100k_a} ns "
+        f"exceeds {THRESHOLD_X}x @100={median_100_a} (ratio={ratio_a:.3f})"
+    )
+    assert median_100k_b <= THRESHOLD_X * median_100_b, (
+        f"SqliteLedger hostile (100k→100) median@100k={median_100k_b} ns "
+        f"exceeds {THRESHOLD_X}x @100={median_100_b} (ratio={ratio_b:.3f})"
     )
