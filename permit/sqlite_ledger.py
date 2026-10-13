@@ -158,6 +158,9 @@ class SqliteLedger:
                     raise RuntimeError(
                         "journal_mode WAL not engaged: %r" % (mode,)
                     )
+            # Concurrent writers (multiprocess flood) wait instead of
+            # raising OperationalError('database is locked') immediately.
+            self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             for stmt in _DDL:

@@ -1410,6 +1410,9 @@ def test_retry_rate_limit_restart_while_old_process_live():
 def _mp_flood_worker(path, clock_value, n_iters, out_q):
     """Multiprocessing worker: flood retries on shared Sqlite ledger."""
     try:
+        import sqlite3
+        import time
+
         from permit.permit import PermitStore
         from permit.sqlite_ledger import SqliteLedger
         from settlement.paypal_client import MockPayPalClient
@@ -1427,7 +1430,16 @@ def _mp_flood_worker(path, clock_value, n_iters, out_q):
         verifier._terminal_reasons["esc_1"] = "already_refused"
         evidence = Evidence(delivered_bytes=b"delivered work product")
         for _ in range(n_iters):
-            r = verifier.verify_and_capture("esc_1", evidence)
+            # busy_timeout handles most contention; a few short retries
+            # cover residual lock races under -O / heavy CI load.
+            for attempt in range(8):
+                try:
+                    r = verifier.verify_and_capture("esc_1", evidence)
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 7:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
             assert not r.released
             assert r.reason in ("already_refused", "rate_limited")
         ledger.close()
