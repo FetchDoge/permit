@@ -13,13 +13,21 @@ The HMAC key and a monotonic high-water sidecar live OUTSIDE the database
 in the repo or the DB. Each ``rate_mac`` binds the previous MAC, the latest
 denial hash, escrow, window, count, and the sidecar high-water.
 
-Crash ordering: the SQL count is committed first, then the sidecar
-high-water is raised (locked + fsynced) to match under the same file
-lock as the increment. A crash can leave exactly one step of skew
-either way (DB one ahead after COMMIT-before-sidecar, or sidecar one
-ahead); both are allowed and reconciled on the next honest step. A gap
-larger than one → ``RetryRateIntegrityError`` (sidecar/chain wins —
-rollback of an old saved pair).
+Crash ordering: production increments commit SQL first, then raise the
+sidecar (exclusive flock → temp file → fsync → atomic rename →
+directory fsync). A crash can leave exactly one step of skew either
+way (DB one ahead, or sidecar one ahead); both are allowed and
+reconciled on the next honest step with no lost counts. A gap larger
+than one → ``RetryRateIntegrityError`` (sidecar/chain wins).
+
+Fail-closed sidecar: deleted, truncated, unreadable, or corrupt counter
+files raise ``RetryRateIntegrityError`` and never restart from 0. Only
+creating a brand-new rate window (or a fresh DB with no rate rows) may
+create a new file. If the DB has rate rows and any sidecar is missing
+at startup → refuse. Operator recovery: stop writers, restore each
+missing ``{HW}.d/<digest>.hw`` from backup (or rewrite with the row's
+``rate_limited`` under mode 0600 owned by the service uid), then
+restart.
 
 Threat model: an attacker with DB write but not the key+sidecar cannot
 forge a valid tag or roll the counter back. An attacker who has the DB,
@@ -186,163 +194,229 @@ def _hw_map_key(escrow_id: str, window_id: str) -> str:
     return f"{escrow_id}|{window_id}"
 
 
+def _hw_root_dir() -> str:
+    """Directory that holds per-window ``.hw`` counter files."""
+    base = retry_rate_hw_path()
+    if os.path.isdir(base):
+        return base
+    root = base + ".d"
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    return root
+
+
 def _hw_entry_path(escrow_id: str, window_id: str) -> str:
     """
     Per-(escrow, window) sidecar file under the HW path directory.
 
     ``PERMIT_RETRY_RATE_MAC_HW_FILE`` / ``{KEY_FILE}.hw`` names a directory
-    (or a base path whose ``.d`` sibling directory holds entries). Using one
-    file per window avoids JSON whole-map rewrite races under multiprocess.
+    (or a base path whose ``.d`` sibling directory holds entries).
     """
-    base = retry_rate_hw_path()
-    # Prefer a directory: if base exists as a file (legacy JSON map), use
-    # ``base + ".d"``; if base has no extension-as-dir yet, create ``base`` as dir.
-    if os.path.isdir(base):
-        root = base
-    else:
-        root = base + ".d"
-        os.makedirs(root, mode=0o700, exist_ok=True)
-        try:
-            os.chmod(root, 0o700)
-        except OSError:
-            pass
     digest = hashlib.sha256(_hw_map_key(escrow_id, window_id).encode()).hexdigest()[
         :32
     ]
-    return os.path.join(root, digest + ".hw")
+    return os.path.join(_hw_root_dir(), digest + ".hw")
 
 
-def _ensure_hw_entry(path: str) -> None:
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, mode=0o700, exist_ok=True)
-        try:
-            os.chmod(parent, 0o700)
-        except OSError:
-            pass
-    if os.path.exists(path):
-        st = os.stat(path)
-        mode = st.st_mode & 0o777
-        if mode & 0o077:
-            raise RetryRateIntegrityError(
-                f"high-water sidecar {path!r} must be mode 0600 "
-                f"(got {oct(mode)}); refuse"
-            )
-        return
+def _hw_lock_path(data_path: str) -> str:
+    return data_path + ".lock"
+
+
+def _assert_hw_file_meta(path: str) -> None:
+    """Require mode 0600 and owner == current euid; else refuse."""
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        # Lost the create race to another process; re-check mode.
         st = os.stat(path)
-        mode = st.st_mode & 0o777
-        if mode & 0o077:
-            raise RetryRateIntegrityError(
-                f"high-water sidecar {path!r} must be mode 0600 "
-                f"(got {oct(mode)}); refuse"
-            )
-        return
+    except OSError as exc:
+        raise RetryRateIntegrityError(
+            f"high-water sidecar unreadable at {path!r}: {exc}; refuse"
+        ) from exc
+    mode = st.st_mode & 0o777
+    if mode != 0o600:
+        raise RetryRateIntegrityError(
+            f"high-water sidecar {path!r} must be mode 0600 "
+            f"(got {oct(mode)}); refuse"
+        )
+    euid = os.geteuid()
+    if st.st_uid != euid:
+        raise RetryRateIntegrityError(
+            f"high-water sidecar {path!r} owner uid={st.st_uid} "
+            f"!= current euid={euid}; refuse"
+        )
+
+
+def _parse_hw_payload(raw: bytes, *, path: str) -> int:
+    if not raw or not raw.strip():
+        raise RetryRateIntegrityError(
+            f"high-water sidecar truncated/empty at {path!r}; refuse "
+            "(never restart from 0)"
+        )
     try:
-        os.write(fd, b"0")
+        text = raw.strip().decode("utf-8")
+        val = int(text)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RetryRateIntegrityError(
+            f"high-water sidecar corrupt at {path!r}; refuse "
+            "(never restart from 0)"
+        ) from exc
+    if val < 0:
+        raise RetryRateIntegrityError(
+            f"high-water sidecar corrupt at {path!r} (negative); refuse"
+        )
+    return val
+
+
+def _read_hw_file(path: str) -> int:
+    """Fail-closed read: missing/unreadable/corrupt → RetryRateIntegrityError."""
+    if not os.path.exists(path):
+        raise RetryRateIntegrityError(
+            f"high-water sidecar missing at {path!r}; refuse "
+            "(never restart from 0; restore from backup or rewrite "
+            "from DB rate_limited under mode 0600, then restart)"
+        )
+    _assert_hw_file_meta(path)
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        raise RetryRateIntegrityError(
+            f"high-water sidecar unreadable at {path!r}: {exc}; refuse"
+        ) from exc
+    return _parse_hw_payload(raw, path=path)
+
+
+def _atomic_write_hw_file(path: str, value: int) -> None:
+    """
+    Write temp → fsync → atomic rename → fsync dir.
+    Caller must hold the exclusive ``.lock`` flock.
+    """
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    payload = str(int(value)).encode("utf-8")
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, payload)
         os.fsync(fd)
     finally:
         os.close(fd)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    dir_fd = os.open(parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+    _assert_hw_file_meta(path)
 
 
-def _read_hw_int_unlocked(fh) -> int:
-    fh.seek(0)
-    raw = fh.read().strip()
-    if not raw:
-        return 0
-    return int(raw.decode("utf-8"))
+def create_high_water(
+    escrow_id: str, window_id: str, *, initial: int = 0
+) -> int:
+    """
+    Create a new per-window counter file at ``initial`` (default 0).
 
-
-def _write_hw_int_unlocked(fh, value: int) -> None:
-    payload = str(int(value)).encode("utf-8")
-    fh.seek(0)
-    fh.truncate(0)
-    fh.write(payload)
-    fh.flush()
-    os.fsync(fh.fileno())
+    Only for a brand-new rate window (caller inserting the DB row) or a
+    fresh DB with no rate rows. If the file already exists, verify and
+    return its value (never reset to 0).
+    """
+    path = _hw_entry_path(escrow_id, window_id)
+    lock_path = _hw_lock_path(path)
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+    lock_fh = open(lock_path, "a+b")
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        if os.path.exists(path):
+            val = _read_hw_file(path)
+        else:
+            _atomic_write_hw_file(path, int(initial))
+            val = int(initial)
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        lock_fh.close()
+    with _hw_mem_guard:
+        _hw_mem[_hw_map_key(escrow_id, window_id)] = val
+    return val
 
 
 def get_high_water(escrow_id: str, window_id: str) -> int:
-    """Read the sidecar high-water for (escrow, window). Missing → 0."""
+    """Read the sidecar high-water; missing/corrupt → refuse (never 0-reset)."""
     mk = _hw_map_key(escrow_id, window_id)
-    with _hw_mem_guard:
-        cached = _hw_mem.get(mk)
-        if cached is not None:
-            return cached
     path = _hw_entry_path(escrow_id, window_id)
     if not os.path.exists(path):
-        return 0
-    _ensure_hw_entry(path)
-    with open(path, "r+b") as fh:
+        raise RetryRateIntegrityError(
+            f"high-water sidecar missing for escrow_id={escrow_id!r} "
+            f"window_id={window_id!r} path={path!r}; refuse "
+            "(never restart from 0)"
+        )
+    lock_path = _hw_lock_path(path)
+    lock_fh = open(lock_path, "a+b")
+    try:
         if fcntl is not None:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
-        try:
-            val = _read_hw_int_unlocked(fh)
-        finally:
-            if fcntl is not None:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_SH)
+        val = _read_hw_file(path)
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        lock_fh.close()
     with _hw_mem_guard:
-        cur = _hw_mem.get(mk, 0)
-        if val > cur:
-            _hw_mem[mk] = val
-            return val
-        return cur
+        _hw_mem[mk] = val
+    return val
 
 
 def set_high_water(escrow_id: str, window_id: str, value: int) -> int:
     """
     Raise the sidecar high-water to at least ``value`` (monotonic).
-    Locked + fsynced. Returns the stored value after update.
+    Exclusive flock → atomic temp/fsync/rename/dir-fsync.
+    File must already exist (create via ``create_high_water`` only).
     """
     path = _hw_entry_path(escrow_id, window_id)
-    _ensure_hw_entry(path)
+    if not os.path.exists(path):
+        raise RetryRateIntegrityError(
+            f"high-water sidecar missing at {path!r}; refuse to set "
+            "(never create from set_high_water / never restart from 0)"
+        )
     want = int(value)
-    with open(path, "r+b") as fh:
-        if fcntl is not None:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        try:
-            cur = _read_hw_int_unlocked(fh)
-            if want > cur:
-                _write_hw_int_unlocked(fh, want)
-                cur = want
-            mode = os.stat(path).st_mode & 0o777
-            if mode & 0o077:
-                os.chmod(path, 0o600)
-        finally:
-            if fcntl is not None:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-    with _hw_mem_guard:
-        mk = _hw_map_key(escrow_id, window_id)
-        prev = _hw_mem.get(mk, 0)
-        if cur > prev:
-            _hw_mem[mk] = cur
-        else:
-            cur = prev
-    return cur
+    with high_water_lock(escrow_id, window_id) as hwlock:
+        return hwlock.set(want)
 
 
 def check_high_water(
     escrow_id: str, window_id: str, db_count: int
 ) -> int:
     """
-    Sidecar vs DB count (SQL-then-sidecar ordering).
+    Sidecar vs DB count.
 
-    - db_count < hw → ``RetryRateIntegrityError`` (rollback of an old pair).
-    - db_count == hw + 1 → crash: SQL committed, sidecar not yet raised;
-      allowed — caller should ``reconcile_high_water``.
-    - db_count > hw + 1 → refuse / lost sidecar → refuse.
-    - otherwise OK.
-
-    Returns the sidecar high-water.
+    Allows exactly one step of skew either way (crash window). A larger
+    gap → ``RetryRateIntegrityError``.
     """
     hw = get_high_water(escrow_id, window_id)
     count = int(db_count)
     if count < hw:
         if hw == count + 1:
-            return hw  # one-step crash skew; reconcile on increment
+            return hw
         raise RetryRateIntegrityError(
             "retry rate high-water sidecar ahead of DB count for "
             f"escrow_id={escrow_id!r} window_id={window_id!r}: "
@@ -361,12 +435,29 @@ def check_high_water(
 def reconcile_high_water(
     escrow_id: str, window_id: str, db_count: int
 ) -> int:
-    """
-    After a successful SQL commit (or when DB is one ahead of the sidecar),
-    raise the sidecar to ``db_count``. Crash between COMMIT and this call
-    leaves the sidecar exactly one behind — the next honest step reconciles.
-    """
+    """Raise the sidecar to ``db_count`` after a successful SQL commit."""
     return set_high_water(escrow_id, window_id, int(db_count))
+
+
+def assert_high_water_files_for_rows(
+    rows: list[tuple[str, str]],
+) -> None:
+    """
+    Startup: every DB rate row must have a valid sidecar file (mode 0600,
+    correct owner, parseable). Missing/corrupt → refuse to start.
+    """
+    for escrow_id, window_id in rows:
+        path = _hw_entry_path(escrow_id, window_id)
+        if not os.path.exists(path):
+            raise RetryRateIntegrityError(
+                "high-water sidecar missing at startup for "
+                f"escrow_id={escrow_id!r} window_id={window_id!r} "
+                f"path={path!r}; refuse to start (DB has rate rows; "
+                "never recreate from 0 — restore sidecar from backup or "
+                "rewrite with the row's rate_limited under mode 0600 "
+                "owned by the service uid, then restart)"
+            )
+        _read_hw_file(path)
 
 
 def mac_high_water_for_verify(
@@ -374,11 +465,41 @@ def mac_high_water_for_verify(
 ) -> int:
     """
     High-water value bound into the stored MAC at mint time equals ``db_count``.
-    Sidecar may be one behind after a crash; MAC verify still uses ``db_count``.
-    Does not mutate the sidecar — reconcile only after a successful SQL commit.
+    Does not mutate the sidecar.
     """
     check_high_water(escrow_id, window_id, db_count)
     return int(db_count)
+
+
+# Test-only crash / ordering hooks (None = disabled).
+_crash_hook: str | None = None
+_increment_hw_first: bool = False
+
+
+def set_hw_test_hooks(
+    *,
+    crash_after: str | None = None,
+    hw_first: bool = False,
+) -> None:
+    """Test helper: inject crash points / HW-before-SQL ordering."""
+    global _crash_hook, _increment_hw_first
+    _crash_hook = crash_after
+    _increment_hw_first = bool(hw_first)
+
+
+def clear_hw_test_hooks() -> None:
+    set_hw_test_hooks(crash_after=None, hw_first=False)
+
+
+def _maybe_crash(point: str) -> None:
+    if _crash_hook == point:
+        raise RetryRateIntegrityError(
+            f"injected crash at {point} (test hook)"
+        )
+
+
+def hw_increment_hw_first() -> bool:
+    return _increment_hw_first
 
 
 def rate_limited_mac(
@@ -485,18 +606,31 @@ def bump_high_water_for_increment(
 
 
 class high_water_lock:
-    """Exclusive flock on the per-window sidecar entry for an increment."""
+    """
+    Exclusive flock on a sibling ``.lock`` file (not the data inode).
+
+    Data file must already exist (``create_high_water`` only). Writes go
+    through ``_atomic_write_hw_file`` (temp → fsync → rename → dir fsync).
+    """
 
     def __init__(self, escrow_id: str, window_id: str) -> None:
         self.escrow_id = escrow_id
         self.window_id = window_id
         self._path = ""
+        self._lock_path = ""
         self._fh = None
 
     def __enter__(self):
         self._path = _hw_entry_path(self.escrow_id, self.window_id)
-        _ensure_hw_entry(self._path)
-        self._fh = open(self._path, "r+b")
+        if not os.path.exists(self._path):
+            raise RetryRateIntegrityError(
+                f"high-water sidecar missing at {self._path!r}; refuse "
+                "(never create under lock / never restart from 0)"
+            )
+        parent = os.path.dirname(self._path) or "."
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        self._lock_path = _hw_lock_path(self._path)
+        self._fh = open(self._lock_path, "a+b")
         if fcntl is not None:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
         return self
@@ -512,7 +646,7 @@ class high_water_lock:
 
     def get(self) -> int:
         assert self._fh is not None
-        file_val = _read_hw_int_unlocked(self._fh)
+        file_val = _read_hw_file(self._path)
         with _hw_mem_guard:
             mk = _hw_map_key(self.escrow_id, self.window_id)
             mem = _hw_mem.get(mk, 0)
@@ -524,13 +658,10 @@ class high_water_lock:
     def set(self, value: int) -> int:
         assert self._fh is not None
         want = int(value)
-        cur = _read_hw_int_unlocked(self._fh)
+        cur = _read_hw_file(self._path)
         if want > cur:
-            _write_hw_int_unlocked(self._fh, want)
+            _atomic_write_hw_file(self._path, want)
             cur = want
-        mode = os.stat(self._path).st_mode & 0o777
-        if mode & 0o077:
-            os.chmod(self._path, 0o600)
         with _hw_mem_guard:
             mk = _hw_map_key(self.escrow_id, self.window_id)
             prev = _hw_mem.get(mk, 0)
@@ -543,7 +674,8 @@ class high_water_lock:
     def check(self, db_count: int) -> int:
         """
         Compare DB count to sidecar. Does **not** mutate the sidecar —
-        callers raise HW only after a successful SQL COMMIT.
+        callers raise HW only after a successful SQL COMMIT (or, under
+        the hw_first test hook, before SQL).
         Allows exactly one step of skew either way (crash window).
         """
         hw = self.get()

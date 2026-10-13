@@ -33,7 +33,11 @@ from .retry_rate_store import (
     _DDL_RETRY_RATE,
     SqliteRetryRateStore,
     _ensure_rate_mac_column,
+    _maybe_crash,
+    assert_high_water_files_for_rows,
+    create_high_water,
     high_water_lock,
+    hw_increment_hw_first,
     rate_limited_mac,
     verify_rate_limited_mac,
 )
@@ -223,6 +227,14 @@ class SqliteLedger:
             # escrow is enforced by retry_rate_one_open_window.
             self.retry_rate_store = SqliteRetryRateStore(
                 self._conn, lock=self._lock
+            )
+            # Fail-closed: DB rate rows require matching 0600 sidecars.
+            # Missing/corrupt → refuse to start (never recreate from 0).
+            hw_rows = self._conn.execute(
+                "SELECT escrow_id, window_id FROM retry_rate_windows"
+            ).fetchall()
+            assert_high_water_files_for_rows(
+                [(str(r[0]), str(r[1])) for r in hw_rows]
             )
         except Exception:
             self._conn.close()
@@ -871,8 +883,34 @@ class SqliteLedger:
         BEGIN IMMEDIATE → UPDATE → COMMIT → raise sidecar. Flock is per
         (escrow, window), so a flood on escrow A does not wait on B's flock;
         the ledger lock is held only for the short SQL write (bar 4).
+
+        Production order is SQL-then-HW. Test hook ``hw_increment_hw_first``
+        reverses that to exercise the other crash window. Injected crashes
+        via ``set_hw_test_hooks(crash_after=...)`` raise after the named
+        step so recovery (one-step skew) can be asserted.
         """
+        hw_first = hw_increment_hw_first()
         with high_water_lock(escrow_id, wid) as hwlock:
+            if hw_first:
+                # Test-only ordering: raise sidecar, then SQL commit.
+                with self._lock:
+                    open_peek = self._conn.execute(
+                        "SELECT rate_limited FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?"
+                        " AND tally_flushed = 0",
+                        (escrow_id, wid),
+                    ).fetchone()
+                    if open_peek is None:
+                        raise RuntimeError(
+                            "open window disappeared under high-water "
+                            f"lock escrow_id={escrow_id!r} "
+                            f"window_id={wid!r}"
+                        )
+                    rlim_peek = int(open_peek[0])
+                    hwlock.check(rlim_peek)
+                    hwlock.set(rlim_peek + 1)
+                _maybe_crash("after_hw_before_sql")
+
             with self._lock:
                 try:
                     self._conn.execute("BEGIN IMMEDIATE")
@@ -893,7 +931,8 @@ class SqliteLedger:
                     rlim2 = int(open2[0])
                     cur_mac2 = open2[1] or ""
                     prev_mac2 = open2[2] or ""
-                    hwlock.check(rlim2)
+                    if not hw_first:
+                        hwlock.check(rlim2)
                     anchor = self._latest_denial_hash_unlocked(escrow_id, wid)
                     verify_rate_limited_mac(
                         anchor,
@@ -945,8 +984,15 @@ class SqliteLedger:
                     except Exception:
                         pass
                     raise
-            # Sidecar after SQL commit; still under flock.
-            hwlock.set(committed)
+            if not hw_first:
+                _maybe_crash("after_sql_before_hw")
+                # Sidecar after SQL commit; still under flock.
+                hwlock.set(committed)
+                _maybe_crash("after_hw")
+            else:
+                # HW already at committed (or one ahead from prior crash).
+                hwlock.set(committed)
+                _maybe_crash("after_sql")
         return "rate_limited", None
 
     def _ensure_open_window_unlocked(
@@ -1023,9 +1069,12 @@ class SqliteLedger:
 
         # No open window: insert one (or adopt a concurrent writer's).
         # rate_mac stays empty until the first denial anchors it.
+        # Sidecar created only for brand-new windows (never from 0 when
+        # a DB row already exists without a file).
         for _ in range(3):
             wid = f"rw_{uuid.uuid4().hex}"
             try:
+                create_high_water(escrow_id, wid, initial=0)
                 self._conn.execute(
                     "INSERT INTO retry_rate_windows"
                     " (escrow_id, window_id, window_start, individual,"

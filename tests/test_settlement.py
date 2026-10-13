@@ -927,6 +927,11 @@ def test_retry_rate_limit_side_table_tamper_done_flag_without_tally():
         verifier.register(escrow)
         _refuse_escrow(verifier)
         # Tamper: claim flushed without ever writing a tally.
+        # Sidecar must exist so SqliteLedger can open; integrity then
+        # refuses on tally_flushed=1 without a chain tally.
+        from permit.retry_rate_store import create_high_water
+
+        create_high_water("esc_1", "rw_orphan", initial=7)
         ledger.retry_rate_store.upsert(
             RetryRateRow(
                 escrow_id="esc_1",
@@ -2358,3 +2363,302 @@ def test_concurrent_capture_same_escrow_single_flight():
     assert len(paypal.capture_calls) == 1, "double capture!"
     reasons = sorted(r.reason for r in results)
     assert reasons == ["release_in_flight", "released"], reasons
+
+
+def test_hw_sidecar_missing_with_db_rows_refuses_start():
+    """DB has rate rows + missing sidecar → refuse to open (never recreate from 0)."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        RetryRateIntegrityError,
+        _hw_entry_path,
+        clear_retry_rate_mac_key_cache,
+    )
+    from permit.sqlite_ledger import SqliteLedger
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=1
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
+        assert os.path.exists(hw_path)
+        ledger.close()
+        os.remove(hw_path)
+        clear_retry_rate_mac_key_cache()
+        with pytest.raises(RetryRateIntegrityError, match="missing|refuse to start"):
+            SqliteLedger(path)
+
+
+def test_hw_sidecar_truncated_corrupt_unreadable_fail_closed():
+    """Truncated / corrupt sidecar → RetryRateIntegrityError (never restart from 0)."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        RetryRateIntegrityError,
+        _hw_entry_path,
+        get_high_water,
+    )
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=1
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
+
+        with open(hw_path, "wb") as fh:
+            fh.write(b"")
+        os.chmod(hw_path, 0o600)
+        with pytest.raises(RetryRateIntegrityError, match="truncated|empty|refuse"):
+            get_high_water(side.escrow_id, side.window_id)
+
+        with open(hw_path, "wb") as fh:
+            fh.write(b"not-an-int\n")
+        os.chmod(hw_path, 0o600)
+        with pytest.raises(RetryRateIntegrityError, match="corrupt|refuse"):
+            get_high_water(side.escrow_id, side.window_id)
+
+        ledger.close()
+
+
+def test_hw_sidecar_wrong_mode_refuses():
+    """Startup / read: sidecar mode != 0600 → refuse."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        RetryRateIntegrityError,
+        _hw_entry_path,
+        get_high_water,
+    )
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=1
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
+        os.chmod(hw_path, 0o644)
+        with pytest.raises(RetryRateIntegrityError, match="0600|mode"):
+            get_high_water(side.escrow_id, side.window_id)
+        # Wrong owner (spoof euid) also refuses.
+        import permit.retry_rate_store as rrs
+
+        real_euid = os.geteuid()
+        os.chmod(hw_path, 0o600)
+        orig = os.geteuid
+        os.geteuid = lambda: real_euid + 1  # type: ignore[assignment]
+        try:
+            with pytest.raises(RetryRateIntegrityError, match="owner|euid"):
+                get_high_water(side.escrow_id, side.window_id)
+        finally:
+            os.geteuid = orig  # type: ignore[assignment]
+        ledger.close()
+
+
+def test_hw_crash_after_sql_before_hw_no_lost_counts():
+    """Crash between SQL COMMIT and sidecar write: recover without lost counts."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        clear_hw_test_hooks,
+        get_high_water,
+        set_hw_test_hooks,
+    )
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=5
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        before = side.rate_limited
+        hw_before = get_high_water(side.escrow_id, side.window_id)
+        assert hw_before == before
+
+        set_hw_test_hooks(crash_after="after_sql_before_hw", hw_first=False)
+        try:
+            with pytest.raises(RetryRateIntegrityError, match="injected crash"):
+                verifier.verify_and_capture("esc_1", evidence)
+        finally:
+            clear_hw_test_hooks()
+
+        side2 = ledger.retry_rate_store.get_open("esc_1")
+        assert side2 is not None
+        # SQL committed; HW still one behind — allowed skew.
+        assert side2.rate_limited == before + 1
+        assert get_high_water(side2.escrow_id, side2.window_id) == before
+
+        # Next honest step reconciles; no false refusal; count advances.
+        assert (
+            verifier.verify_and_capture("esc_1", evidence).reason == "rate_limited"
+        )
+        side3 = ledger.retry_rate_store.get_open("esc_1")
+        assert side3 is not None
+        assert side3.rate_limited == before + 2
+        assert get_high_water(side3.escrow_id, side3.window_id) == before + 2
+        ledger.close()
+
+
+def test_hw_crash_after_hw_before_sql_no_false_refusal():
+    """Crash between sidecar write and SQL commit (hw_first): no false refusal."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        clear_hw_test_hooks,
+        get_high_water,
+        set_hw_test_hooks,
+    )
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=5
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        before = side.rate_limited
+
+        set_hw_test_hooks(crash_after="after_hw_before_sql", hw_first=True)
+        try:
+            with pytest.raises(RetryRateIntegrityError, match="injected crash"):
+                verifier.verify_and_capture("esc_1", evidence)
+        finally:
+            clear_hw_test_hooks()
+
+        side2 = ledger.retry_rate_store.get_open("esc_1")
+        assert side2 is not None
+        # SQL rolled back / not committed; HW one ahead — allowed skew.
+        assert side2.rate_limited == before
+        assert get_high_water(side2.escrow_id, side2.window_id) == before + 1
+
+        # Next honest step (normal SQL-then-HW) reconciles without refusal.
+        assert (
+            verifier.verify_and_capture("esc_1", evidence).reason == "rate_limited"
+        )
+        side3 = ledger.retry_rate_store.get_open("esc_1")
+        assert side3 is not None
+        assert side3.rate_limited == before + 1
+        assert get_high_water(side3.escrow_id, side3.window_id) == before + 1
+        ledger.close()
+
+
+def _mp_hw_concurrency_worker(path, clock_value, n_iters, out_q, hw_path, mac_key):
+    """Two-process worker: flood over-limit increments on shared DB+sidecar."""
+    try:
+        import sqlite3
+
+        from permit.permit import PermitStore
+        from permit.retry_rate_store import clear_retry_rate_mac_key_cache
+        from permit.sqlite_ledger import SqliteLedger
+        from settlement.paypal_client import MockPayPalClient
+        from settlement.verifier import Evidence, ReleaseVerifier
+
+        os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = mac_key
+        os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = hw_path
+        clear_retry_rate_mac_key_cache()
+
+        ledger = SqliteLedger(path)
+        permits = PermitStore(ledger=ledger)
+        paypal = MockPayPalClient()
+
+        def now():
+            return clock_value
+
+        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, clock=now)
+        verifier._terminal_reasons["esc_1"] = "already_refused"
+        evidence = Evidence(delivered_bytes=b"delivered work product")
+        ok = 0
+        for _ in range(n_iters):
+            for attempt in range(8):
+                try:
+                    r = verifier.verify_and_capture("esc_1", evidence)
+                    assert r.reason == "rate_limited"
+                    ok += 1
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 7:
+                        raise
+                    import time
+
+                    time.sleep(0.01 * (attempt + 1))
+        ledger.close()
+        out_q.put(("ok", ok))
+    except BaseException as exc:  # noqa: BLE001
+        out_q.put(("err", repr(exc)))
+
+
+def test_hw_two_process_concurrency_atomic_updates():
+    """Two processes: exclusive flock + atomic rename; final DB == HW == total."""
+    import multiprocessing as mp
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import get_high_water
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    per = 40
+    mac_key = os.environ["PERMIT_RETRY_RATE_MAC_KEY"]
+    hw_path = os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"]
+
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [3_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=0
+        )
+        side0 = ledger.retry_rate_store.get_open("esc_1")
+        assert side0 is not None and side0.rate_limited == 0
+        ledger.close()
+
+        ctx = mp.get_context("spawn")
+        q = ctx.Queue()
+        procs = [
+            ctx.Process(
+                target=_mp_hw_concurrency_worker,
+                args=(path, clock[0], per, q, hw_path, mac_key),
+            )
+            for _ in range(2)
+        ]
+        for p in procs:
+            p.start()
+        results = [q.get(timeout=120) for _ in procs]
+        for p in procs:
+            p.join(timeout=60)
+            assert p.exitcode == 0, p.exitcode
+
+        errs = [r for r in results if r[0] == "err"]
+        assert not errs, errs
+        total_ok = sum(r[1] for r in results if r[0] == "ok")
+        assert total_ok == 2 * per
+
+        from permit.sqlite_ledger import SqliteLedger
+
+        final = SqliteLedger(path)
+        side = final.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        assert side.rate_limited == 2 * per
+        assert get_high_water(side.escrow_id, side.window_id) == 2 * per
+        final.close()

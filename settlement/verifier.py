@@ -51,6 +51,7 @@ from permit.retry_rate_store import (
     InMemoryRetryRateStore,
     RetryRateIntegrityError,
     RetryRateRow,
+    create_high_water,
     high_water_lock,
     rate_limited_mac,
     verify_rate_limited_mac,
@@ -754,6 +755,9 @@ class ReleaseVerifier:
                 window_start=now,
             )
             try:
+                # Brand-new window only — never recreate a missing sidecar
+                # for an existing DB/side row.
+                create_high_water(escrow_id, state.window_id, initial=0)
                 self._persist_rate_window(escrow_id, state)
             except RuntimeError:
                 adopted = self._refresh_open_window_from_store(escrow_id)
