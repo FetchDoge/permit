@@ -210,6 +210,10 @@ def _ensure_hw_entry(path: str) -> None:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(parent, 0o700)
+        except OSError:
+            pass
     if os.path.exists(path):
         st = os.stat(path)
         mode = st.st_mode & 0o777
@@ -219,7 +223,18 @@ def _ensure_hw_entry(path: str) -> None:
                 f"(got {oct(mode)}); refuse"
             )
         return
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        # Lost the create race to another process; re-check mode.
+        st = os.stat(path)
+        mode = st.st_mode & 0o777
+        if mode & 0o077:
+            raise RetryRateIntegrityError(
+                f"high-water sidecar {path!r} must be mode 0600 "
+                f"(got {oct(mode)}); refuse"
+            )
+        return
     try:
         os.write(fd, b"0")
         os.fsync(fd)
