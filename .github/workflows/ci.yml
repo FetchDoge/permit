@@ -54,7 +54,7 @@ jobs:
           --cov-report=term-missing:skip-covered
       - name: mock demo smoke
         if: matrix.python-version == '3.12'
-        run: python demo.py --allow-demo-mac-key
+        run: python demo.py
 
   test-optimized:
     name: pytest (python -O)
