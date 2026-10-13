@@ -67,7 +67,6 @@ jobs:
   lint:
     name: ruff
     runs-on: ubuntu-latest
-    continue-on-error: true # report-only until baseline is cleared (see PR notes)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -75,8 +74,16 @@ jobs:
           python-version: "3.12"
       - name: install ruff
         run: python -m pip install --upgrade pip "ruff>=0.8"
-      - name: ruff check
-        run: ruff check permit settlement tests agent scenarios server.py demo.py trace.py launch_sandbox.py
+      - name: ruff check (report-only)
+        # Report-only until the 34-finding baseline is cleared (listed in PR body).
+        run: |
+          set +e
+          ruff check permit settlement tests agent scenarios server.py demo.py trace.py launch_sandbox.py
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::ruff found issues (report-only; see PR body)"
+          fi
+          exit 0
 
   security:
     name: security (bandit, pip-audit, gitleaks)
@@ -90,9 +97,16 @@ jobs:
           python-version: "3.12"
       - name: install bandit
         run: python -m pip install --upgrade pip "bandit>=1.7"
-      - name: bandit (permit/, settlement/)
-        continue-on-error: true # report-only until assert/urlopen findings are triaged
-        run: bandit -r permit settlement -f txt
+      - name: bandit (permit/, settlement/) (report-only)
+        # Report-only until assert/urlopen findings are triaged (listed in PR body).
+        run: |
+          set +e
+          bandit -r permit settlement -f txt
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::bandit found issues (report-only; see PR body)"
+          fi
+          exit 0
       - name: pip-audit
         run: |
           # Fresh venv so only the project + test extra graph is audited (no
@@ -109,4 +123,4 @@ jobs:
             | tar -xz gitleaks
           ./gitleaks version
       - name: gitleaks
-        run: ./gitleaks detect --source . --verbose --redact
+        run: ./gitleaks detect --source . --verbose --redact --config .gitleaks.toml
