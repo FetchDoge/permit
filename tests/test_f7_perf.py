@@ -12,6 +12,7 @@ SqliteLedger path (indexed chain COUNT + side-row MAC) at 100k / 200 / 2x.
 from __future__ import annotations
 
 import hashlib
+import os
 import statistics
 import tempfile
 import threading
@@ -33,6 +34,18 @@ from settlement.verifier import (
 
 SAMPLES = 200
 THRESHOLD_X = 2.0
+
+
+def _isolated_sqlite_ledger(td: str, name: str = "ledger.sqlite") -> SqliteLedger:
+    """Open SqliteLedger with a per-temp-dir HW root (no shared-suite orphans)."""
+    import permit.retry_rate_store as rrs
+
+    hw_base = os.path.join(td, "retry_rate.hw")
+    os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = hw_base
+    rrs.clear_retry_rate_mac_key_cache()
+    rrs.load_retry_rate_mac_key(refresh=True)
+    return SqliteLedger(os.path.join(td, name))
+
 
 
 def _setup(ledger=None):
@@ -347,7 +360,7 @@ def test_perf_f7_sqlite_over_limit_median_100k_vs_100():
 
     def _median_over_limit_ns(target_len: int) -> float:
         with tempfile.TemporaryDirectory() as td:
-            ledger = SqliteLedger(td + "/ledger.sqlite")
+            ledger = _isolated_sqlite_ledger(td, "ledger.sqlite")
             try:
                 verifier, paypal, permits, escrow, artifact = _setup(ledger)
                 verifier.verify_and_capture(
@@ -390,7 +403,7 @@ def test_perf_f7_sqlite_individual_receipt_path_100k_vs_100():
         samples = []
         while len(samples) < SAMPLES:
             with tempfile.TemporaryDirectory() as td:
-                ledger = SqliteLedger(td + "/ledger.sqlite")
+                ledger = _isolated_sqlite_ledger(td, "ledger.sqlite")
                 try:
                     verifier, paypal, permits, escrow, artifact = _setup(ledger)
                     verifier.verify_and_capture(
@@ -430,7 +443,7 @@ def test_perf_f7_sqlite_hostile_on_100k_log():
 
     def _hostile_median_ns(target_len: int) -> float:
         with tempfile.TemporaryDirectory() as td:
-            ledger = SqliteLedger(td + f"/ledger_{target_len}.sqlite")
+            ledger = _isolated_sqlite_ledger(td, f"ledger_{target_len}.sqlite")
             try:
                 verifier, paypal, permits, escrow_a, artifact = _setup(ledger)
                 escrow_b = _second_escrow(verifier, paypal, permits, escrow_a)
