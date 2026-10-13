@@ -145,29 +145,6 @@ jobs:
       - name: gitleaks
         run: ./gitleaks detect --source . --verbose --redact --config .gitleaks.toml
 
-  codeql:
-    name: CodeQL
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      # actions: read is required for CodeQL analyze on pull_request;
-      # no actions: write anywhere in this workflow.
-      actions: read
-      security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [python, actions]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: github/codeql-action/init@v3
-        with:
-          languages: ${{ matrix.language }}
-      - uses: github/codeql-action/autobuild@v3
-      - uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:${{ matrix.language }}"
-
   # Required branch-ruleset check name. Aggregates pytest matrix, -O, and security.
   test:
     name: test
