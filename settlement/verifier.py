@@ -49,7 +49,10 @@ from permit.ledger import Ledger, Receipt
 from permit.permit import PermitStore
 from permit.retry_rate_store import (
     InMemoryRetryRateStore,
+    RetryRateIntegrityError,
     RetryRateRow,
+    rate_limited_mac,
+    verify_rate_limited_mac,
 )
 
 from .paypal_client import PayPalClient, PayPalTimeout, Capture
@@ -57,22 +60,25 @@ from .paypal_client import PayPalClient, PayPalTimeout, Capture
 # REA F7: per-escrow retry denial rate limit.
 #   N = max individual F6 denial receipts per escrow per window
 #   W = window length (seconds; wall / injectable non-rewinding clock)
-# The SQLite side row is the cross-process source of truth: at most one
-# OPEN window per escrow (UNIQUE partial index), atomic SQL increments
-# decide allowed vs rate_limited inside BEGIN IMMEDIATE, and denial
-# receipt + individual+1 share that transaction. Process memory is never
-# the authority. window_start comes from the row and is NOT reset on
-# restart; a window closes when any writer sees now >= start + W.
-# Tallies are idempotent on (escrow_id, window_id). On rebuild and on
-# window close, chain individual-denial counts are compared to the side
-# row; mismatch / deleted / zeroed rows raise RetryRateIntegrityError
+# Decisions do NOT trust the side row for allow/limit: inside the same
+# BEGIN IMMEDIATE, ``individual`` is an indexed COUNT of chain already_*
+# denial receipts for (escrow, window_id). The side table holds window_id,
+# window_start, and a chain-keyed HMAC (rate_mac) over rate_limited so
+# mid-window tampering is detectable before the tally. At most one OPEN
+# window per escrow (UNIQUE partial index). Process memory is never the
+# authority. window_start comes from the row and is NOT reset on restart;
+# a window closes when any writer sees now >= start + W. Tallies are
+# idempotent on (escrow_id, window_id). Disagreement → RetryRateIntegrityError
 # (chain wins; no anomaly receipt). Log growth ≤ N+1 per window.
+# Bound on rate_limited protection: undetected tamper requires forging
+# HMAC-SHA256 keyed by the original refusal receipt hash.
 DEFAULT_RETRY_RATE_LIMIT_N = 100
 DEFAULT_RETRY_RATE_LIMIT_W = 60.0  # seconds
 
 
-class RetryRateIntegrityError(RuntimeError):
-    """Side store disagrees with the hash chain — refuse to start / close."""
+# Re-exported from permit.retry_rate_store for call-site / test compat.
+# Policy: on disagreement, raise RetryRateIntegrityError (chain wins;
+# no anomaly receipt).
 
 
 class PredicateType(str, Enum):
@@ -210,7 +216,7 @@ class ReleaseVerifier:
         self._clock = _non_rewinding_clock(raw_clock)
         self._original_refusal_by_escrow: dict[str, str] = {}
         # Soft mirror of open windows for tests / flush targets only —
-        # never the authority for counts (side store / SQL is).
+        # never the authority for counts (chain COUNT + MAC-protected side).
         self._retry_rate_windows: dict[str, _RetryRateWindow] = {}
         self._rate_locks: dict[str, threading.Lock] = {}
         self._rate_locks_guard = threading.Lock()
@@ -259,6 +265,7 @@ class ReleaseVerifier:
 
     def _persist_rate_window(self, escrow_id: str, state: _RetryRateWindow) -> None:
         """Write window counters to the side store (durable on Sqlite)."""
+        orig = self._original_refusal_id(escrow_id)
         self._rate_store.upsert(
             RetryRateRow(
                 escrow_id=escrow_id,
@@ -268,6 +275,9 @@ class ReleaseVerifier:
                 rate_limited=state.rate_limited,
                 covered_reason=state.last_already_reason,
                 tally_flushed=state.tally_flushed,
+                rate_mac=rate_limited_mac(
+                    orig, escrow_id, state.window_id, state.rate_limited
+                ),
             )
         )
 
@@ -348,6 +358,7 @@ class ReleaseVerifier:
         """
         Tamper checks for an open (or about-to-close) side row.
         Chain individual denials are the expected `individual`.
+        rate_limited is checked via chain-keyed HMAC (rate_mac).
         rate_limited>0 while individual < N is also refused.
         """
         key = (row.escrow_id, row.window_id)
@@ -355,6 +366,13 @@ class ReleaseVerifier:
             return
         self._assert_side_matches_chain_individuals(
             row.escrow_id, row.window_id, row.individual, chain_denials
+        )
+        verify_rate_limited_mac(
+            self._original_refusal_id(row.escrow_id),
+            row.escrow_id,
+            row.window_id,
+            row.rate_limited,
+            row.rate_mac,
         )
         if row.rate_limited > 0 and row.individual < self.retry_rate_limit_n:
             raise RetryRateIntegrityError(
@@ -369,11 +387,19 @@ class ReleaseVerifier:
     def _rebuild_retry_state(self) -> None:
         """
         Rebuild original_refusal_id from the ledger; reconcile the side store
-        against the chain. window_start is taken from the row (never rebased).
-        Expired open windows get at most one tally. Missing/zeroed/edited
-        side rows vs chain denials raise RetryRateIntegrityError.
+        against the chain inside one read snapshot when SqliteLedger provides
+        check_retry_rate_integrity. window_start is never rebased. Expired
+        open windows get at most one tally. Disagreement → RetryRateIntegrityError
+        (chain wins; no anomaly receipt).
         """
         self._rebuild_original_refusals_from_ledger()
+        checker = getattr(self.ledger, "check_retry_rate_integrity", None)
+        if checker is not None:
+            checker(
+                original_refusal_id_for=self._original_refusal_id,
+                limit_n=self.retry_rate_limit_n,
+            )
+
         now = self._clock()
         chain_tallies = self._chain_rate_tallies()
         chain_denials = self._chain_individual_denials()
@@ -381,37 +407,35 @@ class ReleaseVerifier:
         side_by_key = {(row.escrow_id, row.window_id): row for row in side_rows}
         side_keys = set(side_by_key)
 
-        # Derive expected open windows from chain denials (no tally yet).
-        open_from_chain: dict[tuple[str, str], int] = {}
-        for key, count in chain_denials.items():
-            if key not in chain_tallies:
-                open_from_chain[key] = count
-
-        for key, count in open_from_chain.items():
-            row = side_by_key.get(key)
-            if row is None:
-                raise RetryRateIntegrityError(
-                    "retry rate side table missing open row derived from chain "
-                    f"denials escrow_id={key[0]!r} window_id={key[1]!r} "
-                    f"(chain_individual={count}); refuse to start"
+        # In-memory path (no SQL snapshot helper): same checks.
+        if checker is None:
+            open_from_chain: dict[tuple[str, str], int] = {}
+            for key, count in chain_denials.items():
+                if key not in chain_tallies:
+                    open_from_chain[key] = count
+            for key, count in open_from_chain.items():
+                row = side_by_key.get(key)
+                if row is None:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table missing open row derived from chain "
+                        f"denials escrow_id={key[0]!r} window_id={key[1]!r} "
+                        f"(chain_individual={count}); refuse to start"
+                    )
+                if row.tally_flushed:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table marked flushed but chain has no tally "
+                        f"for escrow_id={key[0]!r} window_id={key[1]!r}; refuse"
+                    )
+                self._reconcile_open_window_integrity(
+                    row, chain_tallies, chain_denials
                 )
-            if row.tally_flushed:
-                raise RetryRateIntegrityError(
-                    "retry rate side table marked flushed but chain has no tally "
-                    f"for escrow_id={key[0]!r} window_id={key[1]!r}; refuse"
-                )
-            self._reconcile_open_window_integrity(
-                row, chain_tallies, chain_denials
-            )
-
-        # Side row deleted while the chain still has a tally → refuse.
-        for key, receipt in chain_tallies.items():
-            if key not in side_keys:
-                raise RetryRateIntegrityError(
-                    "retry rate side table missing row for chain tally "
-                    f"escrow_id={key[0]!r} window_id={key[1]!r} "
-                    f"(seq={receipt.seq}); refuse to start"
-                )
+            for key, receipt in chain_tallies.items():
+                if key not in side_keys:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table missing row for chain tally "
+                        f"escrow_id={key[0]!r} window_id={key[1]!r} "
+                        f"(seq={receipt.seq}); refuse to start"
+                    )
 
         restored: dict[str, _RetryRateWindow] = {}
         for row in side_rows:
@@ -449,9 +473,14 @@ class ReleaseVerifier:
             self._reconcile_open_window_integrity(
                 row, chain_tallies, chain_denials
             )
+            verify_rate_limited_mac(
+                self._original_refusal_id(row.escrow_id),
+                row.escrow_id,
+                row.window_id,
+                row.rate_limited,
+                row.rate_mac,
+            )
 
-            # Do NOT rebase window_start — row value is authoritative across
-            # restarts. Close when now >= start + W.
             expired = (now - state.window_start) >= self.retry_rate_limit_w
             if expired:
                 self._reconcile_open_window_integrity(
@@ -549,6 +578,17 @@ class ReleaseVerifier:
         # Integrity vs chain before closing (individual denials must match).
         chain_denials = self._chain_individual_denials()
         chain_tallies = self._chain_rate_tallies()
+        side = self._rate_store.get_open(escrow_id)
+        rate_mac = (
+            side.rate_mac
+            if side is not None and side.window_id == state.window_id
+            else rate_limited_mac(
+                self._original_refusal_id(escrow_id),
+                escrow_id,
+                state.window_id,
+                state.rate_limited,
+            )
+        )
         row = RetryRateRow(
             escrow_id=escrow_id,
             window_id=state.window_id,
@@ -557,6 +597,7 @@ class ReleaseVerifier:
             rate_limited=state.rate_limited,
             covered_reason=state.last_already_reason,
             tally_flushed=state.tally_flushed,
+            rate_mac=rate_mac,
         )
         self._reconcile_open_window_integrity(
             row, chain_tallies, chain_denials, closing=True
@@ -692,9 +733,9 @@ class ReleaseVerifier:
         denial receipts per window W; further retries return rate_limited.
 
         When the ledger supports record_terminal_retry (SqliteLedger), the
-        side-table row + denial receipt share one BEGIN IMMEDIATE — side
-        store is the cross-process authority. Otherwise (in-memory), the
-        per-escrow lock covers receipt-first + side upsert.
+        denial receipt + side sync share one BEGIN IMMEDIATE; the allow/
+        limit decision uses chain COUNT (not side.individual). Otherwise
+        (in-memory), the per-escrow lock covers the same checks.
         """
         record = getattr(self.ledger, "record_terminal_retry", None)
         if record is not None:
@@ -712,18 +753,55 @@ class ReleaseVerifier:
 
         with self._rate_lock_for(escrow_id):
             now = self._clock()
+            # Live mid-window: deleted side row with chain denials → refuse now.
+            open_row = self._rate_store.get_open(escrow_id)
+            chain_denials = self._chain_individual_denials()
+            chain_tallies = self._chain_rate_tallies()
+            if open_row is None:
+                for (eid, wid), n in chain_denials.items():
+                    if eid != escrow_id:
+                        continue
+                    if (eid, wid) in chain_tallies:
+                        continue
+                    raise RetryRateIntegrityError(
+                        "retry rate side table missing open row mid-window for "
+                        f"escrow_id={eid!r} window_id={wid!r} "
+                        f"(chain_individual={n}); refuse"
+                    )
+            else:
+                verify_rate_limited_mac(
+                    self._original_refusal_id(escrow_id),
+                    open_row.escrow_id,
+                    open_row.window_id,
+                    open_row.rate_limited,
+                    open_row.rate_mac,
+                )
+                expected = chain_denials.get(
+                    (open_row.escrow_id, open_row.window_id), 0
+                )
+                if open_row.individual != expected:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table individual mismatch for "
+                        f"escrow_id={open_row.escrow_id!r} "
+                        f"window_id={open_row.window_id!r}: "
+                        f"side={open_row.individual} chain={expected}; refuse"
+                    )
+
             state = self._retry_rate_window_locked(escrow_id, now)
             state.last_already_reason = already_reason
+            # Decision from chain COUNT, not side.individual.
+            chain_indiv = chain_denials.get(
+                (escrow_id, state.window_id), 0
+            )
 
-            if state.individual < self.retry_rate_limit_n:
-                # Receipt first, then side-store increment (reconcile on rebuild).
+            if chain_indiv < self.retry_rate_limit_n:
                 self._append_retry_denial(
                     escrow_id,
                     already_reason,
                     window_id=state.window_id,
                     window_start=state.window_start,
                 )
-                state.individual += 1
+                state.individual = chain_indiv + 1
                 self._persist_rate_window(escrow_id, state)
                 return VerifyResult(False, already_reason)
 

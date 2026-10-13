@@ -697,6 +697,7 @@ def test_retry_rate_limit_crash_between_tally_append_and_done_mark():
                 rate_limited=side.rate_limited,
                 covered_reason=side.covered_reason,
                 tally_flushed=False,
+                rate_mac=side.rate_mac,
             )
         )
         del verifier
@@ -1115,7 +1116,7 @@ def test_retry_rate_limit_side_table_tamper_rate_limited_before_n():
     """Setting rate_limited=3 before individual reaches N → refuse."""
     import tempfile
 
-    from permit.retry_rate_store import RetryRateRow
+    from permit.retry_rate_store import RetryRateRow, rate_limited_mac
     from permit.sqlite_ledger import SqliteLedger
 
     with tempfile.TemporaryDirectory() as td:
@@ -1157,6 +1158,8 @@ def test_retry_rate_limit_side_table_tamper_rate_limited_before_n():
         side = ledger.retry_rate_store.get_open("esc_1")
         assert side is not None
         assert side.individual == 5
+        orig = verifier._original_refusal_id("esc_1")
+        # Forge a valid MAC so the before-N check (not MAC) is what fires.
         ledger.retry_rate_store.upsert(
             RetryRateRow(
                 escrow_id=side.escrow_id,
@@ -1166,6 +1169,7 @@ def test_retry_rate_limit_side_table_tamper_rate_limited_before_n():
                 rate_limited=3,  # tamper before N
                 covered_reason=side.covered_reason,
                 tally_flushed=False,
+                rate_mac=rate_limited_mac(orig, side.escrow_id, side.window_id, 3),
             )
         )
         ledger.close()
@@ -1509,6 +1513,293 @@ def test_retry_rate_limit_two_multiprocess_writers_one_sqlite_file():
         assert len(final) - before == n + 1
         ok, reason = final.verify_chain()
         assert ok, reason
+        final.close()
+
+
+def _sqlite_refused_setup(td_path, clock, *, n_denials=0, over=0):
+    """Shared helper: SqliteLedger escrow refused, optional denials/over."""
+    from permit.sqlite_ledger import SqliteLedger
+
+    ledger = SqliteLedger(td_path)
+
+    def now():
+        return clock[0]
+
+    permits = PermitStore(ledger=ledger)
+    paypal = MockPayPalClient()
+    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, clock=now)
+    permit, _ = permits.grant(
+        agent_id="agent_1",
+        cap_cents=5000,
+        allowlist=["merchant_1"],
+        expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    check = permits.check(permit.permit_id, 3000, "merchant_1")
+    auth_id = check.receipt.payload["auth_id"]
+    pp_auth = paypal.authorize(3000, "merchant_1")
+    artifact = b"delivered work product"
+    escrow = Escrow(
+        escrow_id="esc_1",
+        permit_id=permit.permit_id,
+        auth_id=auth_id,
+        paypal_auth_id=pp_auth.auth_id,
+        amount_cents=3000,
+        merchant_id="merchant_1",
+        predicate_type=PredicateType.D,
+        artifact_hash=hashlib.sha256(artifact).hexdigest(),
+    )
+    verifier.register(escrow)
+    _refuse_escrow(verifier)
+    evidence = Evidence(delivered_bytes=artifact)
+    for _ in range(n_denials):
+        assert verifier.verify_and_capture("esc_1", evidence).reason == "already_refused"
+    for _ in range(over):
+        assert verifier.verify_and_capture("esc_1", evidence).reason == "rate_limited"
+    return verifier, ledger, evidence
+
+
+def test_retry_rate_limit_live_tamper_individual_zero():
+    """Live mid-window: individual=0 while chain has denials → next decision refuses."""
+    import tempfile
+
+    from permit.retry_rate_store import RetryRateRow
+
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(path, clock, n_denials=10)
+        before = len(ledger)
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        ledger.retry_rate_store.upsert(
+            RetryRateRow(
+                escrow_id=side.escrow_id,
+                window_id=side.window_id,
+                window_start=side.window_start,
+                individual=0,
+                rate_limited=side.rate_limited,
+                covered_reason=side.covered_reason,
+                tally_flushed=False,
+                rate_mac=side.rate_mac,
+            )
+        )
+        with pytest.raises(RetryRateIntegrityError, match="individual mismatch"):
+            verifier.verify_and_capture("esc_1", evidence)
+        assert len(ledger) == before
+        assert _rate_limited_receipts(ledger, "esc_1") == []
+        ledger.close()
+
+
+def test_retry_rate_limit_live_tamper_individual_50():
+    """Live mid-window: individual=50 vs chain=10 → next decision refuses."""
+    import tempfile
+
+    from permit.retry_rate_store import RetryRateRow
+
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(path, clock, n_denials=10)
+        before = len(ledger)
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        ledger.retry_rate_store.upsert(
+            RetryRateRow(
+                escrow_id=side.escrow_id,
+                window_id=side.window_id,
+                window_start=side.window_start,
+                individual=50,
+                rate_limited=side.rate_limited,
+                covered_reason=side.covered_reason,
+                tally_flushed=False,
+                rate_mac=side.rate_mac,
+            )
+        )
+        with pytest.raises(RetryRateIntegrityError, match="individual mismatch"):
+            verifier.verify_and_capture("esc_1", evidence)
+        assert len(ledger) == before
+        ledger.close()
+
+
+def test_retry_rate_limit_live_tamper_delete_row():
+    """Live mid-window: delete side row → next decision refuses (not only at restart)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(path, clock, n_denials=10)
+        before = len(ledger)
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        ledger.retry_rate_store.delete(side.escrow_id, side.window_id)
+        with pytest.raises(RetryRateIntegrityError, match="missing open row mid-window"):
+            verifier.verify_and_capture("esc_1", evidence)
+        assert len(ledger) == before
+        assert _rate_limited_receipts(ledger, "esc_1") == []
+        ledger.close()
+
+
+def test_retry_rate_limit_live_tamper_rate_limited_zero():
+    """Live mid-window: rate_limited=0 with stale MAC after over-limit → refuse."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import RetryRateRow
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=11
+        )
+        before = len(ledger)
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        assert side.rate_limited == 11
+        # Zero the counter but leave the old MAC → detectable.
+        ledger.retry_rate_store.upsert(
+            RetryRateRow(
+                escrow_id=side.escrow_id,
+                window_id=side.window_id,
+                window_start=side.window_start,
+                individual=side.individual,
+                rate_limited=0,
+                covered_reason=side.covered_reason,
+                tally_flushed=False,
+                rate_mac=side.rate_mac,
+            )
+        )
+        with pytest.raises(RetryRateIntegrityError, match="rate_mac mismatch"):
+            verifier.verify_and_capture("esc_1", evidence)
+        assert len(ledger) == before
+        assert _tally_count_sum(ledger, "esc_1") == 0
+        ledger.close()
+
+
+def test_retry_rate_limit_live_tamper_rate_limited_three():
+    """Live mid-window: rate_limited=3 with wrong MAC → refuse; no wrong tally."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import RetryRateRow
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=5
+        )
+        before = len(ledger)
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        ledger.retry_rate_store.upsert(
+            RetryRateRow(
+                escrow_id=side.escrow_id,
+                window_id=side.window_id,
+                window_start=side.window_start,
+                individual=side.individual,
+                rate_limited=3,
+                covered_reason=side.covered_reason,
+                tally_flushed=False,
+                rate_mac="0" * 64,  # not a valid MAC
+            )
+        )
+        with pytest.raises(RetryRateIntegrityError, match="rate_mac mismatch"):
+            verifier.verify_and_capture("esc_1", evidence)
+        assert len(ledger) == before
+        with pytest.raises(RetryRateIntegrityError, match="rate_mac mismatch"):
+            verifier.flush_retry_rate_limits("esc_1")
+        # Restore honest row and flush for N+1 bound check path.
+        ledger.retry_rate_store.upsert(side)
+        verifier.flush_retry_rate_limits("esc_1")
+        assert len(_rate_limited_receipts(ledger, "esc_1")) == 1
+        assert _tally_count_sum(ledger, "esc_1") == 5
+        assert len(ledger) - before == 1  # one tally; never > N+1 denials+tally
+        ledger.close()
+
+
+def test_retry_rate_limit_eight_processes_no_false_integrity_error():
+    """8 processes × 2000 retries: zero false RetryRateIntegrityError."""
+    import multiprocessing as mp
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.sqlite_ledger import SqliteLedger
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    per = 2000
+    n_proc = 8
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock_value = 2_000_000.0
+        ledger = SqliteLedger(path)
+        permits = PermitStore(ledger=ledger)
+        paypal = MockPayPalClient()
+
+        def now():
+            return clock_value
+
+        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, clock=now)
+        permit, _ = permits.grant(
+            agent_id="agent_1",
+            cap_cents=5000,
+            allowlist=["merchant_1"],
+            expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        check = permits.check(permit.permit_id, 3000, "merchant_1")
+        auth_id = check.receipt.payload["auth_id"]
+        pp_auth = paypal.authorize(3000, "merchant_1")
+        artifact = b"delivered work product"
+        escrow = Escrow(
+            escrow_id="esc_1",
+            permit_id=permit.permit_id,
+            auth_id=auth_id,
+            paypal_auth_id=pp_auth.auth_id,
+            amount_cents=3000,
+            merchant_id="merchant_1",
+            predicate_type=PredicateType.D,
+            artifact_hash=hashlib.sha256(artifact).hexdigest(),
+        )
+        verifier.register(escrow)
+        _refuse_escrow(verifier)
+        before = len(ledger)
+        ledger.close()
+
+        ctx = mp.get_context("spawn")
+        q = ctx.Queue()
+        procs = [
+            ctx.Process(
+                target=_mp_flood_worker, args=(path, clock_value, per, q)
+            )
+            for _ in range(n_proc)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=120)
+            assert p.exitcode == 0
+        results = [q.get(timeout=5) for _ in range(n_proc)]
+        assert all(status == "ok" for status, _ in results), results
+
+        final = SqliteLedger(path)
+        # Startup integrity in one read snapshot — must not false-refuse.
+        final.check_retry_rate_integrity(limit_n=n)
+        permits_f = PermitStore(ledger=final)
+        paypal_f = MockPayPalClient()
+        verifier_f = ReleaseVerifier(paypal_f, permits_f, ledger=final, clock=now)
+        open_row = final.retry_rate_store.get_open("esc_1")
+        assert open_row is not None
+        assert open_row.individual == n
+        total = n_proc * per
+        assert open_row.rate_limited == total - n
+        verifier_f.flush_retry_rate_limits("esc_1")
+        final.sync_receipts_from_db()
+        assert len(_rate_limited_receipts(final, "esc_1")) == 1
+        assert _tally_count_sum(final, "esc_1") == total - n
+        assert len(final) - before == n + 1
         final.close()
 
 

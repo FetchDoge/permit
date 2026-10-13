@@ -27,21 +27,35 @@ from .ledger import (
     _utcnow_iso,
 )
 from .retry_rate_store import (
+    RetryRateIntegrityError,
     _DDL_ONE_OPEN,
     _DDL_RETRY_RATE,
     SqliteRetryRateStore,
+    _ensure_rate_mac_column,
+    rate_limited_mac,
+    verify_rate_limited_mac,
 )
 
 
 _DDL_TABLE = """
 CREATE TABLE IF NOT EXISTS receipts (
-  seq        INTEGER PRIMARY KEY,
-  prev_hash  TEXT    NOT NULL,
-  event_type TEXT    NOT NULL,
-  payload    TEXT    NOT NULL,
-  timestamp  TEXT    NOT NULL,
-  hash       TEXT    NOT NULL UNIQUE
+  seq          INTEGER PRIMARY KEY,
+  prev_hash    TEXT    NOT NULL,
+  event_type   TEXT    NOT NULL,
+  payload      TEXT    NOT NULL,
+  timestamp    TEXT    NOT NULL,
+  hash         TEXT    NOT NULL UNIQUE,
+  escrow_id    TEXT,
+  window_id    TEXT,
+  refusal_kind TEXT
 )
+"""
+
+# Indexed denial lookup: O(log n) COUNT for (escrow_id, window_id).
+_DDL_ALREADY_DENIAL_IDX = """
+CREATE INDEX IF NOT EXISTS receipts_already_denial_idx
+ON receipts (escrow_id, window_id)
+WHERE event_type = 'REFUSED' AND refusal_kind = 'already'
 """
 
 _DDL_NO_UPDATE = """
@@ -94,9 +108,32 @@ _DDL = (
     _DDL_LINK,
     _DDL_IDEMPOTENCY,
     _DDL_RATE_TALLY_UNIQUE,
+    _DDL_ALREADY_DENIAL_IDX,
     _DDL_RETRY_RATE,
     _DDL_ONE_OPEN,
 )
+
+
+def _refusal_kind(event_type: str, payload: dict) -> str | None:
+    if event_type != "REFUSED":
+        return None
+    reason = payload.get("reason")
+    if not isinstance(reason, str):
+        return None
+    if reason.startswith("already_"):
+        return "already"
+    if reason == "rate_limited":
+        return "rate_tally"
+    return None
+
+
+def _payload_escrow_window(payload: dict) -> tuple[str | None, str | None]:
+    eid = payload.get("escrow_id")
+    wid = payload.get("window_id")
+    return (
+        eid if isinstance(eid, str) else None,
+        wid if isinstance(wid, str) else None,
+    )
 
 
 class SqliteLedger:
@@ -125,6 +162,8 @@ class SqliteLedger:
             self._conn.execute("PRAGMA foreign_keys=ON")
             for stmt in _DDL:
                 self._conn.execute(stmt)
+            self._migrate_receipt_index_columns()
+            _ensure_rate_mac_column(self._conn)
             integrity = self._conn.execute("PRAGMA integrity_check").fetchall()
             if integrity != [("ok",)]:
                 raise RuntimeError("integrity_check failed: %r" % (integrity,))
@@ -183,6 +222,54 @@ class SqliteLedger:
             self._conn.close()
             raise
 
+    def _migrate_receipt_index_columns(self) -> None:
+        """Add escrow_id/window_id/refusal_kind and backfill from payload."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(receipts)")}
+        added = False
+        for col, decl in (
+            ("escrow_id", "TEXT"),
+            ("window_id", "TEXT"),
+            ("refusal_kind", "TEXT"),
+        ):
+            if col not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE receipts ADD COLUMN {col} {decl}"
+                )
+                added = True
+        # One-time backfill only when columns were just added, OR when a
+        # REFUSED row still lacks its indexed escrow_id (payload has one).
+        # Do NOT treat "any NULL escrow_id" as dirty — GRANTED/ALLOWED/etc.
+        # legitimately leave the column NULL, and re-running UPDATE on every
+        # open races the append-only trigger across processes.
+        need = self._conn.execute(
+            "SELECT 1 FROM receipts"
+            " WHERE event_type = 'REFUSED'"
+            " AND escrow_id IS NULL"
+            " AND json_extract(payload, '$.escrow_id') IS NOT NULL"
+            " LIMIT 1"
+        ).fetchone()
+        if added or need is not None:
+            self._conn.execute("DROP TRIGGER IF EXISTS receipts_no_update")
+            try:
+                self._conn.execute(
+                    "UPDATE receipts SET"
+                    " escrow_id = json_extract(payload, '$.escrow_id'),"
+                    " window_id = json_extract(payload, '$.window_id'),"
+                    " refusal_kind = CASE"
+                    "  WHEN event_type = 'REFUSED'"
+                    "   AND json_extract(payload, '$.reason') LIKE 'already_%'"
+                    "  THEN 'already'"
+                    "  WHEN event_type = 'REFUSED'"
+                    "   AND json_extract(payload, '$.reason') = 'rate_limited'"
+                    "  THEN 'rate_tally'"
+                    "  ELSE NULL END"
+                    " WHERE escrow_id IS NULL"
+                    " AND json_extract(payload, '$.escrow_id') IS NOT NULL"
+                )
+            finally:
+                self._conn.execute(_DDL_NO_UPDATE)
+        self._conn.execute(_DDL_ALREADY_DENIAL_IDX)
+
     @staticmethod
     def _verify_receipts(receipts: list[Receipt]) -> tuple[bool, str]:
         """Same semantics as Ledger.verify_chain: never raises on a broken chain."""
@@ -214,22 +301,144 @@ class SqliteLedger:
     def count_individual_denials(self) -> dict[tuple[str, str], int]:
         """
         Count already_* denial receipts per (escrow_id, window_id) from SQL.
-        Cross-process safe (does not trust the in-memory receipt cache).
+        Uses indexed columns (O(log n) per group).
         """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT json_extract(payload, '$.escrow_id'),"
-                " json_extract(payload, '$.window_id'), COUNT(*)"
+                "SELECT escrow_id, window_id, COUNT(*)"
                 " FROM receipts"
-                " WHERE event_type = 'REFUSED'"
-                " AND json_extract(payload, '$.reason') LIKE 'already_%'"
-                " AND json_extract(payload, '$.escrow_id') IS NOT NULL"
-                " AND json_extract(payload, '$.window_id') IS NOT NULL"
-                " GROUP BY 1, 2"
+                " WHERE event_type = 'REFUSED' AND refusal_kind = 'already'"
+                " AND escrow_id IS NOT NULL AND window_id IS NOT NULL"
+                " GROUP BY escrow_id, window_id"
             ).fetchall()
         return {
             (str(eid), str(wid)): int(n) for eid, wid, n in rows if eid and wid
         }
+
+    def _count_already_denials_unlocked(
+        self, escrow_id: str, window_id: str
+    ) -> int:
+        """Indexed COUNT inside an open transaction."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM receipts"
+            " WHERE event_type = 'REFUSED' AND refusal_kind = 'already'"
+            " AND escrow_id = ? AND window_id = ?",
+            (escrow_id, window_id),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def check_retry_rate_integrity(
+        self, *, original_refusal_id_for=None, limit_n: int = 100
+    ) -> None:
+        """
+        Startup / snapshot integrity: one read transaction (WAL snapshot).
+        Raises RetryRateIntegrityError on disagreement. Never mutates.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                self._check_retry_rate_integrity_unlocked(
+                    original_refusal_id_for=original_refusal_id_for,
+                    limit_n=limit_n,
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+    def _original_refusal_hash_unlocked(self, escrow_id: str) -> str | None:
+        """
+        Chain-derived MAC key: hash of the first terminal REFUSED (non-already,
+        non-rate_limited) for escrow_id, else the first VOIDED. Same rule as
+        ReleaseVerifier._rebuild_original_refusals_from_ledger.
+        """
+        row = self._conn.execute(
+            "SELECT hash FROM receipts"
+            " WHERE json_extract(payload, '$.escrow_id') = ?"
+            " AND ("
+            "   (event_type = 'REFUSED'"
+            "    AND COALESCE(refusal_kind, '') NOT IN ('already', 'rate_tally')"
+            "    AND COALESCE(json_extract(payload, '$.reason'), '')"
+            "        NOT LIKE 'already_%'"
+            "    AND COALESCE(json_extract(payload, '$.reason'), '')"
+            "        <> 'rate_limited')"
+            "   OR event_type = 'VOIDED'"
+            " )"
+            " ORDER BY seq LIMIT 1",
+            (escrow_id,),
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def _check_retry_rate_integrity_unlocked(
+        self, *, original_refusal_id_for=None, limit_n: int = 100
+    ) -> None:
+        """Caller holds lock; runs inside an open transaction."""
+        side_rows = self._conn.execute(
+            "SELECT escrow_id, window_id, window_start, individual,"
+            " rate_limited, covered_reason, tally_flushed, rate_mac"
+            " FROM retry_rate_windows"
+        ).fetchall()
+        side_by_key = {
+            (r[0], r[1]): r for r in side_rows
+        }
+        chain_denials = self._conn.execute(
+            "SELECT escrow_id, window_id, COUNT(*)"
+            " FROM receipts"
+            " WHERE event_type = 'REFUSED' AND refusal_kind = 'already'"
+            " AND escrow_id IS NOT NULL AND window_id IS NOT NULL"
+            " GROUP BY escrow_id, window_id"
+        ).fetchall()
+        tallies = {
+            (r[0], r[1])
+            for r in self._conn.execute(
+                "SELECT escrow_id, window_id FROM receipts"
+                " WHERE event_type = 'REFUSED' AND refusal_kind = 'rate_tally'"
+                " AND escrow_id IS NOT NULL AND window_id IS NOT NULL"
+            ).fetchall()
+        }
+        for eid, wid, n in chain_denials:
+            key = (eid, wid)
+            if key in tallies:
+                continue
+            side = side_by_key.get(key)
+            if side is None:
+                raise RetryRateIntegrityError(
+                    "retry rate side table missing open row derived from chain "
+                    f"denials escrow_id={eid!r} window_id={wid!r} "
+                    f"(chain_individual={int(n)}); refuse"
+                )
+            if int(side[6]):  # tally_flushed
+                raise RetryRateIntegrityError(
+                    "retry rate side table marked flushed but chain has no tally "
+                    f"for escrow_id={eid!r} window_id={wid!r}; refuse"
+                )
+            if int(side[3]) != int(n):
+                raise RetryRateIntegrityError(
+                    "retry rate side table individual mismatch for "
+                    f"escrow_id={eid!r} window_id={wid!r}: "
+                    f"side={int(side[3])} chain={int(n)}; refuse"
+                )
+            if original_refusal_id_for is not None:
+                orig = original_refusal_id_for(eid)
+            else:
+                orig = self._original_refusal_hash_unlocked(eid)
+            verify_rate_limited_mac(
+                orig, eid, wid, int(side[4]), side[7] or ""
+            )
+            if int(side[4]) > 0 and int(side[3]) < limit_n:
+                raise RetryRateIntegrityError(
+                    "retry rate side table rate_limited set before exhausting N "
+                    f"for escrow_id={eid!r} window_id={wid!r}; refuse"
+                )
+        for key in tallies:
+            if key not in side_by_key:
+                raise RetryRateIntegrityError(
+                    "retry rate side table missing row for chain tally "
+                    f"escrow_id={key[0]!r} window_id={key[1]!r}; refuse"
+                )
 
     def sync_receipts_from_db(self) -> None:
         """Reload in-memory receipt cache from SQLite (after foreign writers)."""
@@ -285,10 +494,13 @@ class SqliteLedger:
             payload=payload,
             timestamp=_utcnow_iso(),
         )
+        eid, wid = _payload_escrow_window(payload)
+        kind = _refusal_kind(event_type, payload)
         self._conn.execute(
             "INSERT INTO receipts"
-            " (seq, prev_hash, event_type, payload, timestamp, hash)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            " (seq, prev_hash, event_type, payload, timestamp, hash,"
+            "  escrow_id, window_id, refusal_kind)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 receipt.seq,
                 receipt.prev_hash,
@@ -298,6 +510,9 @@ class SqliteLedger:
                 ),
                 receipt.timestamp,
                 receipt.hash,
+                eid,
+                wid,
+                kind,
             ),
         )
         return receipt
@@ -316,10 +531,33 @@ class SqliteLedger:
     def _load_open_window_unlocked(self, escrow_id: str):
         return self._conn.execute(
             "SELECT window_id, window_start, individual, rate_limited,"
-            " covered_reason FROM retry_rate_windows"
+            " covered_reason, rate_mac FROM retry_rate_windows"
             " WHERE escrow_id = ? AND tally_flushed = 0",
             (escrow_id,),
         ).fetchone()
+
+    def _orphan_open_windows_from_chain_unlocked(
+        self, escrow_id: str
+    ) -> list[tuple[str, int]]:
+        """(window_id, chain_individual) with denials but no tally and no side row."""
+        rows = self._conn.execute(
+            "SELECT r.window_id, COUNT(*)"
+            " FROM receipts r"
+            " WHERE r.event_type = 'REFUSED' AND r.refusal_kind = 'already'"
+            " AND r.escrow_id = ?"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM receipts t"
+            "   WHERE t.event_type = 'REFUSED' AND t.refusal_kind = 'rate_tally'"
+            "   AND t.escrow_id = r.escrow_id AND t.window_id = r.window_id"
+            " )"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM retry_rate_windows s"
+            "   WHERE s.escrow_id = r.escrow_id AND s.window_id = r.window_id"
+            " )"
+            " GROUP BY r.window_id",
+            (escrow_id,),
+        ).fetchall()
+        return [(str(wid), int(n)) for wid, n in rows]
 
     def _close_open_window_unlocked(
         self,
@@ -329,8 +567,25 @@ class SqliteLedger:
         rate_limited: int,
         covered_reason: str,
         original_refusal_id: str | None,
+        rate_mac: str = "",
     ) -> Receipt | None:
         """Append tally if needed and mark flushed. Inside an open transaction."""
+        # Protect rate_limited via chain-keyed MAC before trusting the count.
+        verify_rate_limited_mac(
+            original_refusal_id, escrow_id, window_id, rate_limited, rate_mac
+        )
+        chain_indiv = self._count_already_denials_unlocked(escrow_id, window_id)
+        side_indiv = self._conn.execute(
+            "SELECT individual FROM retry_rate_windows"
+            " WHERE escrow_id = ? AND window_id = ?",
+            (escrow_id, window_id),
+        ).fetchone()
+        if side_indiv is not None and int(side_indiv[0]) != chain_indiv:
+            raise RetryRateIntegrityError(
+                "retry rate side table individual mismatch on close for "
+                f"escrow_id={escrow_id!r} window_id={window_id!r}: "
+                f"side={int(side_indiv[0])} chain={chain_indiv}; refuse"
+            )
         tally: Receipt | None = None
         existing_key = (escrow_id, window_id)
         if existing_key in self._rate_tally_by_window:
@@ -419,13 +674,15 @@ class SqliteLedger:
         original_refusal_id: str | None,
     ) -> tuple[str, Receipt | None]:
         """
-        Cross-process rate limit: side-table row is the authority.
+        Cross-process rate limit. Inside one BEGIN IMMEDIATE:
 
-        Inside one BEGIN IMMEDIATE:
-          - close the open window when now >= window_start + W
-          - ensure exactly one open window for this escrow
-          - if individual < N: INSERT denial receipt + individual+1
-          - else: rate_limited+1 (no receipt)
+          - Detect a deleted mid-window side row (chain denials, no tally)
+          - Derive ``individual`` from an indexed COUNT of chain denials —
+            never trust the side row for the allow/limit decision
+          - If the side row disagrees with the chain → RetryRateIntegrityError
+          - ``rate_limited`` is protected by a chain-keyed HMAC (rate_mac)
+          - if chain_individual < N: INSERT denial + sync side.individual
+          - else: rate_limited+1 with updated MAC
 
         Returns (result_reason, denial_receipt_or_None).
         """
@@ -433,17 +690,18 @@ class SqliteLedger:
             cached: list[Receipt] = []
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                wid, wstart_f, indiv = self._ensure_open_window_unlocked(
-                    escrow_id,
-                    already_reason=already_reason,
-                    window_w=window_w,
-                    now=now,
-                    original_refusal_id=original_refusal_id,
-                    cached=cached,
+                wid, wstart_f, chain_indiv, rlim = (
+                    self._ensure_open_window_unlocked(
+                        escrow_id,
+                        already_reason=already_reason,
+                        window_w=window_w,
+                        now=now,
+                        original_refusal_id=original_refusal_id,
+                        cached=cached,
+                    )
                 )
 
-                if indiv < limit_n:
-                    # Denial receipt FIRST, then individual+1 — same transaction.
+                if chain_indiv < limit_n:
                     denial = self._insert_receipt_unlocked(
                         "REFUSED",
                         {
@@ -455,18 +713,19 @@ class SqliteLedger:
                             "original_refusal_id": original_refusal_id,
                         },
                     )
+                    new_indiv = chain_indiv + 1
                     cur = self._conn.execute(
                         "UPDATE retry_rate_windows"
-                        " SET individual = individual + 1,"
+                        " SET individual = ?,"
                         " covered_reason = ?"
                         " WHERE escrow_id = ? AND window_id = ?"
                         " AND tally_flushed = 0"
                         " RETURNING individual",
-                        (already_reason, escrow_id, wid),
+                        (new_indiv, already_reason, escrow_id, wid),
                     ).fetchone()
                     if cur is None:
                         raise RuntimeError(
-                            "individual increment missed open window "
+                            "individual sync missed open window "
                             f"escrow_id={escrow_id!r} window_id={wid!r}"
                         )
                     self._conn.execute("COMMIT")
@@ -475,14 +734,19 @@ class SqliteLedger:
                     self._cache_receipt_unlocked(denial)
                     return already_reason, denial
 
+                new_rl = int(rlim) + 1
+                new_mac = rate_limited_mac(
+                    original_refusal_id, escrow_id, wid, new_rl
+                )
                 cur = self._conn.execute(
                     "UPDATE retry_rate_windows"
-                    " SET rate_limited = rate_limited + 1,"
+                    " SET rate_limited = ?,"
+                    " rate_mac = ?,"
                     " covered_reason = ?"
                     " WHERE escrow_id = ? AND window_id = ?"
                     " AND tally_flushed = 0"
                     " RETURNING rate_limited",
-                    (already_reason, escrow_id, wid),
+                    (new_rl, new_mac, already_reason, escrow_id, wid),
                 ).fetchone()
                 if cur is None:
                     raise RuntimeError(
@@ -509,15 +773,32 @@ class SqliteLedger:
         now: float,
         original_refusal_id: str | None,
         cached: list[Receipt],
-    ) -> tuple[str, float, int]:
+    ) -> tuple[str, float, int, int]:
         """
-        Return (window_id, window_start, individual) for the open window.
+        Return (window_id, window_start, chain_individual, rate_limited).
+        ``chain_individual`` comes from an indexed COUNT — not the side row.
         Closes an expired open window first. Caller holds lock + transaction.
         """
         open_row = self._load_open_window_unlocked(escrow_id)
-        if open_row is not None:
-            wid, wstart, indiv, rlim, covered = open_row
+        if open_row is None:
+            orphans = self._orphan_open_windows_from_chain_unlocked(escrow_id)
+            if orphans:
+                wid, n = orphans[0]
+                raise RetryRateIntegrityError(
+                    "retry rate side table missing open row mid-window for "
+                    f"escrow_id={escrow_id!r} window_id={wid!r} "
+                    f"(chain_individual={n}); refuse"
+                )
+        else:
+            wid, wstart, side_indiv, rlim, covered, rate_mac = open_row
             wstart_f = float(wstart)
+            verify_rate_limited_mac(
+                original_refusal_id,
+                escrow_id,
+                str(wid),
+                int(rlim),
+                rate_mac or "",
+            )
             if (now - wstart_f) >= window_w:
                 tally = self._close_open_window_unlocked(
                     escrow_id,
@@ -526,31 +807,49 @@ class SqliteLedger:
                     int(rlim),
                     covered or "",
                     original_refusal_id,
+                    rate_mac=rate_mac or "",
                 )
                 if tally is not None:
                     cached.append(tally)
                 open_row = None
             else:
-                return str(wid), wstart_f, int(indiv)
+                chain_indiv = self._count_already_denials_unlocked(
+                    escrow_id, str(wid)
+                )
+                if int(side_indiv) != chain_indiv:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table individual mismatch for "
+                        f"escrow_id={escrow_id!r} window_id={str(wid)!r}: "
+                        f"side={int(side_indiv)} chain={chain_indiv}; refuse"
+                    )
+                return str(wid), wstart_f, chain_indiv, int(rlim)
 
         # No open window: insert one (or adopt a concurrent writer's).
         for _ in range(3):
             wid = f"rw_{uuid.uuid4().hex}"
+            zero_mac = rate_limited_mac(original_refusal_id, escrow_id, wid, 0)
             try:
                 self._conn.execute(
                     "INSERT INTO retry_rate_windows"
                     " (escrow_id, window_id, window_start, individual,"
-                    "  rate_limited, covered_reason, tally_flushed)"
-                    " VALUES (?, ?, ?, 0, 0, ?, 0)",
-                    (escrow_id, wid, now, already_reason),
+                    "  rate_limited, covered_reason, tally_flushed, rate_mac)"
+                    " VALUES (?, ?, ?, 0, 0, ?, 0, ?)",
+                    (escrow_id, wid, now, already_reason, zero_mac),
                 )
-                return wid, now, 0
+                return wid, now, 0, 0
             except sqlite3.IntegrityError:
                 open_row = self._load_open_window_unlocked(escrow_id)
                 if open_row is None:
                     continue
-                wid, wstart, indiv, rlim, covered = open_row
+                wid, wstart, side_indiv, rlim, covered, rate_mac = open_row
                 wstart_f = float(wstart)
+                verify_rate_limited_mac(
+                    original_refusal_id,
+                    escrow_id,
+                    str(wid),
+                    int(rlim),
+                    rate_mac or "",
+                )
                 if (now - wstart_f) >= window_w:
                     tally = self._close_open_window_unlocked(
                         escrow_id,
@@ -559,11 +858,21 @@ class SqliteLedger:
                         int(rlim),
                         covered or "",
                         original_refusal_id,
+                        rate_mac=rate_mac or "",
                     )
                     if tally is not None:
                         cached.append(tally)
                     continue
-                return str(wid), wstart_f, int(indiv)
+                chain_indiv = self._count_already_denials_unlocked(
+                    escrow_id, str(wid)
+                )
+                if int(side_indiv) != chain_indiv:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table individual mismatch for "
+                        f"escrow_id={escrow_id!r} window_id={str(wid)!r}: "
+                        f"side={int(side_indiv)} chain={chain_indiv}; refuse"
+                    )
+                return str(wid), wstart_f, chain_indiv, int(rlim)
         raise RuntimeError(
             f"unable to open retry-rate window for escrow_id={escrow_id!r}"
         )
@@ -585,18 +894,18 @@ class SqliteLedger:
                 if escrow_id is None:
                     rows = self._conn.execute(
                         "SELECT escrow_id, window_id, window_start,"
-                        " individual, rate_limited, covered_reason"
+                        " individual, rate_limited, covered_reason, rate_mac"
                         " FROM retry_rate_windows WHERE tally_flushed = 0"
                     ).fetchall()
                 else:
                     rows = self._conn.execute(
                         "SELECT escrow_id, window_id, window_start,"
-                        " individual, rate_limited, covered_reason"
+                        " individual, rate_limited, covered_reason, rate_mac"
                         " FROM retry_rate_windows"
                         " WHERE tally_flushed = 0 AND escrow_id = ?",
                         (escrow_id,),
                     ).fetchall()
-                for eid, wid, wstart, _indiv, rlim, covered in rows:
+                for eid, wid, wstart, _indiv, rlim, covered, rate_mac in rows:
                     # Flush closes even if W has not elapsed (clean shutdown).
                     tally = self._close_open_window_unlocked(
                         eid,
@@ -605,6 +914,7 @@ class SqliteLedger:
                         int(rlim),
                         covered or "",
                         original_refusal_id_for(eid),
+                        rate_mac=rate_mac or "",
                     )
                     if tally is not None:
                         cached.append(tally)
@@ -642,10 +952,13 @@ class SqliteLedger:
                     timestamp=_utcnow_iso(),
                 )
                 try:
+                    eid, wid = _payload_escrow_window(payload)
+                    kind = _refusal_kind(event_type, payload)
                     self._conn.execute(
                         "INSERT INTO receipts"
-                        " (seq, prev_hash, event_type, payload, timestamp, hash)"
-                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        " (seq, prev_hash, event_type, payload, timestamp, hash,"
+                        "  escrow_id, window_id, refusal_kind)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             receipt.seq,
                             receipt.prev_hash,
@@ -657,6 +970,9 @@ class SqliteLedger:
                             ),
                             receipt.timestamp,
                             receipt.hash,
+                            eid,
+                            wid,
+                            kind,
                         ),
                     )
                 except sqlite3.IntegrityError as exc:

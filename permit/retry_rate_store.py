@@ -1,17 +1,26 @@
 """
-REA F7: durable per-escrow retry rate-limit counters, outside the hash chain.
+REA F7: durable per-escrow retry rate-limit side table, outside the hash chain.
 
-The receipt log stays append-only (at most one rate_limited tally receipt per
-escrow per window). Live counters live here so crashes and multi-writer
-processes share one source of truth. At most one OPEN window (tally_flushed=0)
-per escrow — enforced by a UNIQUE partial index on SQLite.
+Decisions do NOT trust this table's counters as authority: `individual` is
+derived from an indexed COUNT of chain denial receipts inside the same
+BEGIN IMMEDIATE as the allow/limit choice. This table holds window_id,
+window_start, and a MAC-protected rate_limited counter so mid-window
+tampering is detectable before the tally.
+
+At most one OPEN window (tally_flushed=0) per escrow — UNIQUE partial index.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import sqlite3
 import threading
 from dataclasses import dataclass
+
+
+class RetryRateIntegrityError(RuntimeError):
+    """Side store disagrees with the hash chain — refuse the operation."""
 
 
 @dataclass
@@ -23,6 +32,41 @@ class RetryRateRow:
     rate_limited: int
     covered_reason: str
     tally_flushed: bool
+    rate_mac: str = ""
+
+
+def rate_limited_mac(
+    original_refusal_id: str | None,
+    escrow_id: str,
+    window_id: str,
+    rate_limited: int,
+) -> str:
+    """
+    Running integrity tag for rate_limited, keyed from a chain value
+    (original refusal receipt hash). Bound: any undetected tamper of
+    rate_limited requires forging this HMAC (SHA-256) without the key.
+    """
+    key = (original_refusal_id or ("0" * 64)).encode("utf-8")
+    msg = f"{escrow_id}|{window_id}|{int(rate_limited)}".encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def verify_rate_limited_mac(
+    original_refusal_id: str | None,
+    escrow_id: str,
+    window_id: str,
+    rate_limited: int,
+    rate_mac: str,
+) -> None:
+    expected = rate_limited_mac(
+        original_refusal_id, escrow_id, window_id, rate_limited
+    )
+    if not hmac.compare_digest(expected, rate_mac or ""):
+        raise RetryRateIntegrityError(
+            "retry rate side table rate_mac mismatch for "
+            f"escrow_id={escrow_id!r} window_id={window_id!r} "
+            f"rate_limited={rate_limited}; refuse (chain-keyed MAC)"
+        )
 
 
 _DDL_RETRY_RATE = """
@@ -34,11 +78,11 @@ CREATE TABLE IF NOT EXISTS retry_rate_windows (
   rate_limited   INTEGER NOT NULL DEFAULT 0,
   covered_reason TEXT    NOT NULL DEFAULT '',
   tally_flushed  INTEGER NOT NULL DEFAULT 0,
+  rate_mac       TEXT    NOT NULL DEFAULT '',
   PRIMARY KEY (escrow_id, window_id)
 )
 """
 
-# Cross-process: exactly one open window per escrow.
 _DDL_ONE_OPEN = """
 CREATE UNIQUE INDEX IF NOT EXISTS retry_rate_one_open_window
 ON retry_rate_windows (escrow_id)
@@ -46,11 +90,17 @@ WHERE tally_flushed = 0
 """
 
 
+def _ensure_rate_mac_column(conn: sqlite3.Connection) -> None:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(retry_rate_windows)")}
+    if "rate_mac" not in cols:
+        conn.execute(
+            "ALTER TABLE retry_rate_windows"
+            " ADD COLUMN rate_mac TEXT NOT NULL DEFAULT ''"
+        )
+
+
 class InMemoryRetryRateStore:
-    """
-    Process-local side store (not durable across process death).
-    Still enforces one open window per escrow under a lock.
-    """
+    """Process-local side store; still enforces one open window per escrow."""
 
     def __init__(self) -> None:
         self._rows: dict[tuple[str, str], RetryRateRow] = {}
@@ -86,6 +136,7 @@ class InMemoryRetryRateStore:
                 rate_limited=row.rate_limited,
                 covered_reason=row.covered_reason,
                 tally_flushed=row.tally_flushed,
+                rate_mac=row.rate_mac,
             )
 
     def get_open(self, escrow_id: str) -> RetryRateRow | None:
@@ -100,6 +151,7 @@ class InMemoryRetryRateStore:
                         rate_limited=row.rate_limited,
                         covered_reason=row.covered_reason,
                         tally_flushed=row.tally_flushed,
+                        rate_mac=row.rate_mac,
                     )
             return None
 
@@ -115,6 +167,7 @@ class InMemoryRetryRateStore:
                 rate_limited=r.rate_limited,
                 covered_reason=r.covered_reason,
                 tally_flushed=r.tally_flushed,
+                rate_mac=r.rate_mac,
             )
             for r in items
         ]
@@ -125,11 +178,7 @@ class InMemoryRetryRateStore:
 
 
 class SqliteRetryRateStore:
-    """
-    SQLite side table — source of truth for open-window counters.
-    Prefer the same connection as the receipt log so denial+increment can
-    share one BEGIN IMMEDIATE transaction (see SqliteLedger.record_terminal_retry).
-    """
+    """SQLite side table on the receipt-log connection (shared transactions)."""
 
     def __init__(
         self,
@@ -141,6 +190,7 @@ class SqliteRetryRateStore:
         self._lock = lock if lock is not None else threading.Lock()
         with self._lock:
             self._conn.execute(_DDL_RETRY_RATE)
+            _ensure_rate_mac_column(self._conn)
             self._conn.execute(_DDL_ONE_OPEN)
 
     def upsert(self, row: RetryRateRow) -> None:
@@ -150,14 +200,15 @@ class SqliteRetryRateStore:
                 self._conn.execute(
                     "INSERT INTO retry_rate_windows"
                     " (escrow_id, window_id, window_start, individual,"
-                    "  rate_limited, covered_reason, tally_flushed)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                    "  rate_limited, covered_reason, tally_flushed, rate_mac)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(escrow_id, window_id) DO UPDATE SET"
                     " window_start=excluded.window_start,"
                     " individual=excluded.individual,"
                     " rate_limited=excluded.rate_limited,"
                     " covered_reason=excluded.covered_reason,"
-                    " tally_flushed=excluded.tally_flushed",
+                    " tally_flushed=excluded.tally_flushed,"
+                    " rate_mac=excluded.rate_mac",
                     (
                         row.escrow_id,
                         row.window_id,
@@ -166,6 +217,7 @@ class SqliteRetryRateStore:
                         row.rate_limited,
                         row.covered_reason,
                         1 if row.tally_flushed else 0,
+                        row.rate_mac or "",
                     ),
                 )
                 self._conn.execute("COMMIT")
@@ -180,7 +232,7 @@ class SqliteRetryRateStore:
         with self._lock:
             r = self._conn.execute(
                 "SELECT escrow_id, window_id, window_start, individual,"
-                " rate_limited, covered_reason, tally_flushed"
+                " rate_limited, covered_reason, tally_flushed, rate_mac"
                 " FROM retry_rate_windows"
                 " WHERE escrow_id = ? AND tally_flushed = 0",
                 (escrow_id,),
@@ -195,13 +247,14 @@ class SqliteRetryRateStore:
             rate_limited=int(r[4]),
             covered_reason=r[5] or "",
             tally_flushed=bool(r[6]),
+            rate_mac=r[7] or "",
         )
 
     def load_all(self) -> list[RetryRateRow]:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT escrow_id, window_id, window_start, individual,"
-                " rate_limited, covered_reason, tally_flushed"
+                " rate_limited, covered_reason, tally_flushed, rate_mac"
                 " FROM retry_rate_windows"
             ).fetchall()
         return [
@@ -213,6 +266,7 @@ class SqliteRetryRateStore:
                 rate_limited=int(r[4]),
                 covered_reason=r[5] or "",
                 tally_flushed=bool(r[6]),
+                rate_mac=r[7] or "",
             )
             for r in rows
         ]

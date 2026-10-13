@@ -5,19 +5,22 @@ separately from the functional suite.
 
 Bars mirrored here: 200 samples, a real 100k-receipt log, individual-receipt
 path timing, hostile concurrent load on the 100k log, escrow B's first N
-denials get receipts, isolation, 2x threshold.
+denials get receipts, isolation, 2x threshold. Also the shipping
+SqliteLedger path (indexed chain COUNT + side-row MAC) at 100k / 200 / 2x.
 """
 
 from __future__ import annotations
 
 import hashlib
 import statistics
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 
 from permit.ledger import Ledger
 from permit.permit import PermitStore
+from permit.sqlite_ledger import SqliteLedger
 from settlement.paypal_client import MockPayPalClient
 from settlement.verifier import (
     DEFAULT_RETRY_RATE_LIMIT_N,
@@ -32,8 +35,9 @@ SAMPLES = 200
 THRESHOLD_X = 2.0
 
 
-def _setup():
-    ledger = Ledger()
+def _setup(ledger=None):
+    if ledger is None:
+        ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     paypal = MockPayPalClient()
     verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
@@ -80,7 +84,7 @@ def _second_escrow(verifier, paypal, permits, escrow_a, escrow_id: str = "esc_2"
     return escrow_b
 
 
-def _pad_to_receipt_count(ledger: Ledger, target: int) -> None:
+def _pad_to_receipt_count(ledger, target: int) -> None:
     """Grow the hash chain to exactly `target` receipts (real log length)."""
     while len(ledger) < target:
         i = len(ledger)
@@ -348,3 +352,81 @@ def test_perf_f7_hostile_flood_isolation_and_b_receipts():
     )
     assert escrow_b.state == "REFUSED"
     assert escrow_a.state == "REFUSED"
+
+
+def test_perf_f7_sqlite_over_limit_median_100k_vs_100():
+    """Shipping SqliteLedger path: over-limit median @100k ≤ 2x @100 (200 samples)."""
+    n = DEFAULT_RETRY_RATE_LIMIT_N
+
+    def _median_over_limit_ns(target_len: int) -> float:
+        with tempfile.TemporaryDirectory() as td:
+            ledger = SqliteLedger(td + "/ledger.sqlite")
+            try:
+                verifier, paypal, permits, escrow, artifact = _setup(ledger)
+                verifier.verify_and_capture(
+                    "esc_1", Evidence(delivered_bytes=b"tampered")
+                )
+                _pad_to_receipt_count(verifier.ledger, target_len)
+                assert len(verifier.ledger) == target_len
+                evidence = Evidence(delivered_bytes=artifact)
+                for _ in range(n):
+                    r = verifier.verify_and_capture("esc_1", evidence)
+                    assert r.reason == "already_refused"
+                warm = verifier.verify_and_capture("esc_1", evidence)
+                assert warm.reason == "rate_limited"
+                samples = []
+                for _ in range(SAMPLES):
+                    t0 = time.perf_counter_ns()
+                    result = verifier.verify_and_capture("esc_1", evidence)
+                    t1 = time.perf_counter_ns()
+                    assert result.reason == "rate_limited"
+                    samples.append(t1 - t0)
+                assert len(samples) == SAMPLES
+                return statistics.median(samples)
+            finally:
+                ledger.close()
+
+    median_100 = _median_over_limit_ns(100)
+    median_100k = _median_over_limit_ns(100_000)
+    assert median_100 > 0
+    assert median_100k <= THRESHOLD_X * median_100, (
+        f"SqliteLedger over-limit median@100k={median_100k} ns exceeds "
+        f"{THRESHOLD_X}x @100={median_100} ns"
+    )
+
+
+def test_perf_f7_sqlite_individual_receipt_path_100k_vs_100():
+    """Shipping SqliteLedger path: individual-denial median @100k ≤ 2x @100."""
+    n = DEFAULT_RETRY_RATE_LIMIT_N
+
+    def _median_individual_ns(target_len: int) -> float:
+        samples = []
+        while len(samples) < SAMPLES:
+            with tempfile.TemporaryDirectory() as td:
+                ledger = SqliteLedger(td + "/ledger.sqlite")
+                try:
+                    verifier, paypal, permits, escrow, artifact = _setup(ledger)
+                    verifier.verify_and_capture(
+                        "esc_1", Evidence(delivered_bytes=b"tampered")
+                    )
+                    _pad_to_receipt_count(verifier.ledger, target_len)
+                    evidence = Evidence(delivered_bytes=artifact)
+                    budget = min(n, SAMPLES - len(samples))
+                    for _ in range(budget):
+                        t0 = time.perf_counter_ns()
+                        r = verifier.verify_and_capture("esc_1", evidence)
+                        t1 = time.perf_counter_ns()
+                        assert r.reason == "already_refused"
+                        samples.append(t1 - t0)
+                finally:
+                    ledger.close()
+        assert len(samples) == SAMPLES
+        return statistics.median(samples)
+
+    median_100 = _median_individual_ns(100)
+    median_100k = _median_individual_ns(100_000)
+    assert median_100 > 0
+    assert median_100k <= THRESHOLD_X * median_100, (
+        f"SqliteLedger individual median@100k={median_100k} ns exceeds "
+        f"{THRESHOLD_X}x @100={median_100} ns"
+    )
