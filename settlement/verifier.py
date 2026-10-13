@@ -63,15 +63,16 @@ from .paypal_client import PayPalClient, PayPalTimeout, Capture
 # Decisions do NOT trust the side row for allow/limit: inside the same
 # BEGIN IMMEDIATE, ``individual`` is an indexed COUNT of chain already_*
 # denial receipts for (escrow, window_id). The side table holds window_id,
-# window_start, and a chain-keyed HMAC (rate_mac) over rate_limited so
-# mid-window tampering is detectable before the tally. At most one OPEN
-# window per escrow (UNIQUE partial index). Process memory is never the
-# authority. window_start comes from the row and is NOT reset on restart;
-# a window closes when any writer sees now >= start + W. Tallies are
-# idempotent on (escrow_id, window_id). Disagreement → RetryRateIntegrityError
-# (chain wins; no anomaly receipt). Log growth ≤ N+1 per window.
-# Bound on rate_limited protection: undetected tamper requires forging
-# HMAC-SHA256 keyed by the original refusal receipt hash.
+# window_start, and a ledger-chained rate_mac over rate_limited
+# (SHA-256(first_denial_hash || escrow || window || count)) so
+# mid-window tampering is detectable before the tally — loss bound 0,
+# no checkpoint/K. At most
+# one OPEN window per escrow (UNIQUE partial index). Process memory is
+# never the authority. window_start comes from the row and is NOT reset
+# on restart; a window closes when any writer sees now >= start + W.
+# Tallies are idempotent on (escrow_id, window_id). Disagreement →
+# RetryRateIntegrityError (chain wins; no anomaly receipt). Log growth
+# ≤ N+1 per window.
 DEFAULT_RETRY_RATE_LIMIT_N = 100
 DEFAULT_RETRY_RATE_LIMIT_W = 60.0  # seconds
 
@@ -218,6 +219,8 @@ class ReleaseVerifier:
         # Soft mirror of open windows for tests / flush targets only —
         # never the authority for counts (chain COUNT + MAC-protected side).
         self._retry_rate_windows: dict[str, _RetryRateWindow] = {}
+        # (escrow_id, window_id) -> first already_* denial hash (rate_mac anchor).
+        self._first_denial_by_window: dict[tuple[str, str], str] = {}
         self._rate_locks: dict[str, threading.Lock] = {}
         self._rate_locks_guard = threading.Lock()
         # Terminal escrow_id -> already_refused/already_voided. Written when
@@ -263,9 +266,53 @@ class ReleaseVerifier:
                 self._rate_locks[escrow_id] = lock
             return lock
 
-    def _persist_rate_window(self, escrow_id: str, state: _RetryRateWindow) -> None:
+    def _first_denial_hash(self, escrow_id: str, window_id: str) -> str | None:
+        """Hash of the window's first already_* denial (rate_mac anchor)."""
+        key = (escrow_id, window_id)
+        cached = self._first_denial_by_window.get(key)
+        if cached is not None:
+            return cached
+        finder = getattr(self.ledger, "first_denial_hash", None)
+        if finder is not None:
+            found = finder(escrow_id, window_id)
+            if isinstance(found, str) and found:
+                self._first_denial_by_window[key] = found
+                return found
+            return None
+        for r in self.ledger.receipts():
+            if r.event_type != "REFUSED":
+                continue
+            reason = r.payload.get("reason", "")
+            if not isinstance(reason, str) or not reason.startswith("already_"):
+                continue
+            if (
+                r.payload.get("escrow_id") == escrow_id
+                and r.payload.get("window_id") == window_id
+            ):
+                self._first_denial_by_window[key] = r.hash
+                return r.hash
+        return None
+
+    def _remember_first_denial(
+        self, escrow_id: str, window_id: str, receipt_hash: str
+    ) -> None:
+        key = (escrow_id, window_id)
+        if key not in self._first_denial_by_window:
+            self._first_denial_by_window[key] = receipt_hash
+
+    def _persist_rate_window(
+        self,
+        escrow_id: str,
+        state: _RetryRateWindow,
+        *,
+        rate_mac: str | None = None,
+    ) -> None:
         """Write window counters to the side store (durable on Sqlite)."""
-        orig = self._original_refusal_id(escrow_id)
+        if rate_mac is None:
+            anchor = self._first_denial_hash(escrow_id, state.window_id)
+            rate_mac = rate_limited_mac(
+                anchor, escrow_id, state.window_id, state.rate_limited
+            )
         self._rate_store.upsert(
             RetryRateRow(
                 escrow_id=escrow_id,
@@ -275,9 +322,7 @@ class ReleaseVerifier:
                 rate_limited=state.rate_limited,
                 covered_reason=state.last_already_reason,
                 tally_flushed=state.tally_flushed,
-                rate_mac=rate_limited_mac(
-                    orig, escrow_id, state.window_id, state.rate_limited
-                ),
+                rate_mac=rate_mac,
             )
         )
 
@@ -358,7 +403,7 @@ class ReleaseVerifier:
         """
         Tamper checks for an open (or about-to-close) side row.
         Chain individual denials are the expected `individual`.
-        rate_limited is checked via chain-keyed HMAC (rate_mac).
+        rate_limited is checked via ledger-chained rate_mac (first-denial anchor).
         rate_limited>0 while individual < N is also refused.
         """
         key = (row.escrow_id, row.window_id)
@@ -368,7 +413,7 @@ class ReleaseVerifier:
             row.escrow_id, row.window_id, row.individual, chain_denials
         )
         verify_rate_limited_mac(
-            self._original_refusal_id(row.escrow_id),
+            self._first_denial_hash(row.escrow_id, row.window_id),
             row.escrow_id,
             row.window_id,
             row.rate_limited,
@@ -474,7 +519,7 @@ class ReleaseVerifier:
                 row, chain_tallies, chain_denials
             )
             verify_rate_limited_mac(
-                self._original_refusal_id(row.escrow_id),
+                self._first_denial_hash(row.escrow_id, row.window_id),
                 row.escrow_id,
                 row.window_id,
                 row.rate_limited,
@@ -583,7 +628,7 @@ class ReleaseVerifier:
             side.rate_mac
             if side is not None and side.window_id == state.window_id
             else rate_limited_mac(
-                self._original_refusal_id(escrow_id),
+                self._first_denial_hash(escrow_id, state.window_id),
                 escrow_id,
                 state.window_id,
                 state.rate_limited,
@@ -770,7 +815,9 @@ class ReleaseVerifier:
                     )
             else:
                 verify_rate_limited_mac(
-                    self._original_refusal_id(escrow_id),
+                    self._first_denial_hash(
+                        open_row.escrow_id, open_row.window_id
+                    ),
                     open_row.escrow_id,
                     open_row.window_id,
                     open_row.rate_limited,
@@ -795,18 +842,45 @@ class ReleaseVerifier:
             )
 
             if chain_indiv < self.retry_rate_limit_n:
-                self._append_retry_denial(
+                denial = self._append_retry_denial(
                     escrow_id,
                     already_reason,
                     window_id=state.window_id,
                     window_start=state.window_start,
                 )
+                if chain_indiv == 0:
+                    self._remember_first_denial(
+                        escrow_id, state.window_id, denial.hash
+                    )
                 state.individual = chain_indiv + 1
                 self._persist_rate_window(escrow_id, state)
                 return VerifyResult(False, already_reason)
 
+            # Verify on every over-limit step (loss bound 0).
+            anchor = self._first_denial_hash(escrow_id, state.window_id)
+            side_mac = (
+                open_row.rate_mac
+                if open_row is not None
+                and open_row.window_id == state.window_id
+                else rate_limited_mac(
+                    anchor, escrow_id, state.window_id, state.rate_limited
+                )
+            )
+            verify_rate_limited_mac(
+                anchor,
+                escrow_id,
+                state.window_id,
+                state.rate_limited,
+                side_mac,
+            )
             state.rate_limited += 1
-            self._persist_rate_window(escrow_id, state)
+            self._persist_rate_window(
+                escrow_id,
+                state,
+                rate_mac=rate_limited_mac(
+                    anchor, escrow_id, state.window_id, state.rate_limited
+                ),
+            )
             return VerifyResult(False, "rate_limited")
 
     def _predicate_passes(self, escrow: Escrow, evidence: Evidence) -> tuple[bool, str]:

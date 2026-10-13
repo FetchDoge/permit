@@ -4,8 +4,9 @@ REA F7: durable per-escrow retry rate-limit side table, outside the hash chain.
 Decisions do NOT trust this table's counters as authority: `individual` is
 derived from an indexed COUNT of chain denial receipts inside the same
 BEGIN IMMEDIATE as the allow/limit choice. This table holds window_id,
-window_start, and a MAC-protected rate_limited counter so mid-window
-tampering is detectable before the tally.
+window_start, and a ledger-chained ``rate_mac`` over rate_limited so
+mid-window tampering is detectable before the tally (loss bound = 0 —
+no checkpoint/K sampling).
 
 At most one OPEN window (tally_flushed=0) per escrow — UNIQUE partial index.
 """
@@ -36,36 +37,51 @@ class RetryRateRow:
 
 
 def rate_limited_mac(
-    original_refusal_id: str | None,
+    anchor_hash: str | None,
     escrow_id: str,
     window_id: str,
     rate_limited: int,
 ) -> str:
     """
-    Running integrity tag for rate_limited, keyed from a chain value
-    (original refusal receipt hash). Bound: any undetected tamper of
-    rate_limited requires forging this HMAC (SHA-256) without the key.
+    Ledger-anchored integrity tag for ``rate_limited`` (O(1)).
+
+    ``anchor_hash`` is the hash of the window's first ``already_*`` denial
+    receipt (the ledger ``prev_hash`` this counter is chained to). Tag:
+
+        SHA-256(anchor || escrow || window || count)
+
+    Stored in the side row and updated atomically with every increment;
+    verified on every increment and at tally. No checkpoint/K sampling —
+    loss bound is zero. Changing ``rate_limited`` to 0 or 3 without a
+    matching tag → RetryRateIntegrityError on the next retry.
     """
-    key = (original_refusal_id or ("0" * 64)).encode("utf-8")
-    msg = f"{escrow_id}|{window_id}|{int(rate_limited)}".encode("utf-8")
-    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+    if not anchor_hash:
+        # No first denial yet — empty tag; verify treats blank+count=0 as ok.
+        return ""
+    msg = (
+        f"{anchor_hash}|{escrow_id}|{window_id}|{int(rate_limited)}"
+    ).encode("utf-8")
+    return hashlib.sha256(msg).hexdigest()
 
 
 def verify_rate_limited_mac(
-    original_refusal_id: str | None,
+    anchor_hash: str | None,
     escrow_id: str,
     window_id: str,
     rate_limited: int,
     rate_mac: str,
 ) -> None:
+    if int(rate_limited) == 0 and not (rate_mac or "") and not anchor_hash:
+        # Fresh open window: no denials yet, no tag yet.
+        return
     expected = rate_limited_mac(
-        original_refusal_id, escrow_id, window_id, rate_limited
+        anchor_hash, escrow_id, window_id, rate_limited
     )
     if not hmac.compare_digest(expected, rate_mac or ""):
         raise RetryRateIntegrityError(
             "retry rate side table rate_mac mismatch for "
             f"escrow_id={escrow_id!r} window_id={window_id!r} "
-            f"rate_limited={rate_limited}; refuse (chain-keyed MAC)"
+            f"rate_limited={rate_limited}; refuse (ledger-chained MAC)"
         )
 
 

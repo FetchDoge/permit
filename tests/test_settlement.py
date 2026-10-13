@@ -1158,7 +1158,8 @@ def test_retry_rate_limit_side_table_tamper_rate_limited_before_n():
         side = ledger.retry_rate_store.get_open("esc_1")
         assert side is not None
         assert side.individual == 5
-        orig = verifier._original_refusal_id("esc_1")
+        anchor = verifier._first_denial_hash("esc_1", side.window_id)
+        assert anchor is not None
         # Forge a valid MAC so the before-N check (not MAC) is what fires.
         ledger.retry_rate_store.upsert(
             RetryRateRow(
@@ -1169,7 +1170,9 @@ def test_retry_rate_limit_side_table_tamper_rate_limited_before_n():
                 rate_limited=3,  # tamper before N
                 covered_reason=side.covered_reason,
                 tally_flushed=False,
-                rate_mac=rate_limited_mac(orig, side.escrow_id, side.window_id, 3),
+                rate_mac=rate_limited_mac(
+                    anchor, side.escrow_id, side.window_id, 3
+                ),
             )
         )
         ledger.close()
@@ -1722,85 +1725,121 @@ def test_retry_rate_limit_live_tamper_rate_limited_three():
 
 
 def test_retry_rate_limit_eight_processes_no_false_integrity_error():
-    """8 processes × 2000 retries: zero false RetryRateIntegrityError."""
+    """8×2000 retries × 20 rounds: print false-refusal count; fail if > 0."""
     import multiprocessing as mp
     import tempfile
 
     import settlement.verifier as vmod
+    from permit.retry_rate_store import RetryRateIntegrityError
     from permit.sqlite_ledger import SqliteLedger
 
     n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
     per = 2000
     n_proc = 8
-    with tempfile.TemporaryDirectory() as td:
-        path = td + "/ledger.sqlite"
-        clock_value = 2_000_000.0
-        ledger = SqliteLedger(path)
-        permits = PermitStore(ledger=ledger)
-        paypal = MockPayPalClient()
+    rounds = 20
+    false_refusals = 0
 
-        def now():
-            return clock_value
+    def _one_round(round_idx: int) -> int:
+        """Return 1 if this round saw a false RetryRateIntegrityError, else 0."""
+        with tempfile.TemporaryDirectory() as td:
+            path = td + f"/ledger_{round_idx}.sqlite"
+            clock_value = 2_000_000.0 + round_idx
+            ledger = SqliteLedger(path)
+            permits = PermitStore(ledger=ledger)
+            paypal = MockPayPalClient()
 
-        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, clock=now)
-        permit, _ = permits.grant(
-            agent_id="agent_1",
-            cap_cents=5000,
-            allowlist=["merchant_1"],
-            expiry=datetime.now(timezone.utc) + timedelta(hours=1),
-        )
-        check = permits.check(permit.permit_id, 3000, "merchant_1")
-        auth_id = check.receipt.payload["auth_id"]
-        pp_auth = paypal.authorize(3000, "merchant_1")
-        artifact = b"delivered work product"
-        escrow = Escrow(
-            escrow_id="esc_1",
-            permit_id=permit.permit_id,
-            auth_id=auth_id,
-            paypal_auth_id=pp_auth.auth_id,
-            amount_cents=3000,
-            merchant_id="merchant_1",
-            predicate_type=PredicateType.D,
-            artifact_hash=hashlib.sha256(artifact).hexdigest(),
-        )
-        verifier.register(escrow)
-        _refuse_escrow(verifier)
-        before = len(ledger)
-        ledger.close()
+            def now():
+                return clock_value
 
-        ctx = mp.get_context("spawn")
-        q = ctx.Queue()
-        procs = [
-            ctx.Process(
-                target=_mp_flood_worker, args=(path, clock_value, per, q)
+            verifier = ReleaseVerifier(paypal, permits, ledger=ledger, clock=now)
+            permit, _ = permits.grant(
+                agent_id="agent_1",
+                cap_cents=5000,
+                allowlist=["merchant_1"],
+                expiry=datetime.now(timezone.utc) + timedelta(hours=1),
             )
-            for _ in range(n_proc)
-        ]
-        for p in procs:
-            p.start()
-        for p in procs:
-            p.join(timeout=120)
-            assert p.exitcode == 0
-        results = [q.get(timeout=5) for _ in range(n_proc)]
-        assert all(status == "ok" for status, _ in results), results
+            check = permits.check(permit.permit_id, 3000, "merchant_1")
+            auth_id = check.receipt.payload["auth_id"]
+            pp_auth = paypal.authorize(3000, "merchant_1")
+            artifact = b"delivered work product"
+            escrow = Escrow(
+                escrow_id="esc_1",
+                permit_id=permit.permit_id,
+                auth_id=auth_id,
+                paypal_auth_id=pp_auth.auth_id,
+                amount_cents=3000,
+                merchant_id="merchant_1",
+                predicate_type=PredicateType.D,
+                artifact_hash=hashlib.sha256(artifact).hexdigest(),
+            )
+            verifier.register(escrow)
+            _refuse_escrow(verifier)
+            before = len(ledger)
+            ledger.close()
 
-        final = SqliteLedger(path)
-        # Startup integrity in one read snapshot — must not false-refuse.
-        final.check_retry_rate_integrity(limit_n=n)
-        permits_f = PermitStore(ledger=final)
-        paypal_f = MockPayPalClient()
-        verifier_f = ReleaseVerifier(paypal_f, permits_f, ledger=final, clock=now)
-        open_row = final.retry_rate_store.get_open("esc_1")
-        assert open_row is not None
-        assert open_row.individual == n
-        total = n_proc * per
-        assert open_row.rate_limited == total - n
-        verifier_f.flush_retry_rate_limits("esc_1")
-        final.sync_receipts_from_db()
-        assert len(_rate_limited_receipts(final, "esc_1")) == 1
-        assert _tally_count_sum(final, "esc_1") == total - n
-        assert len(final) - before == n + 1
-        final.close()
+            ctx = mp.get_context("spawn")
+            q = ctx.Queue()
+            procs = [
+                ctx.Process(
+                    target=_mp_flood_worker, args=(path, clock_value, per, q)
+                )
+                for _ in range(n_proc)
+            ]
+            for p in procs:
+                p.start()
+            for p in procs:
+                p.join(timeout=120)
+                assert p.exitcode == 0
+            results = [q.get(timeout=5) for _ in range(n_proc)]
+            # Worker-side integrity errors are false refusals under honest load.
+            worker_false = sum(
+                1
+                for status, detail in results
+                if status == "err"
+                and "RetryRateIntegrityError" in str(detail)
+            )
+            assert all(
+                status == "ok"
+                or (
+                    status == "err"
+                    and "RetryRateIntegrityError" in str(detail)
+                )
+                for status, detail in results
+            ), results
+
+            try:
+                final = SqliteLedger(path)
+                final.check_retry_rate_integrity(limit_n=n)
+                permits_f = PermitStore(ledger=final)
+                paypal_f = MockPayPalClient()
+                verifier_f = ReleaseVerifier(
+                    paypal_f, permits_f, ledger=final, clock=now
+                )
+                open_row = final.retry_rate_store.get_open("esc_1")
+                assert open_row is not None
+                assert open_row.individual == n
+                total = n_proc * per
+                assert open_row.rate_limited == total - n
+                verifier_f.flush_retry_rate_limits("esc_1")
+                final.sync_receipts_from_db()
+                assert len(_rate_limited_receipts(final, "esc_1")) == 1
+                assert _tally_count_sum(final, "esc_1") == total - n
+                assert len(final) - before == n + 1
+                final.close()
+                return worker_false
+            except RetryRateIntegrityError:
+                return worker_false + 1
+
+    for i in range(rounds):
+        false_refusals += _one_round(i)
+
+    print(
+        f"eight_processes_false_refusal_count={false_refusals} "
+        f"(rounds={rounds}, procs={n_proc}, per={per})"
+    )
+    assert false_refusals == 0, (
+        f"false RetryRateIntegrityError count {false_refusals} > 0"
+    )
 
 
 def test_only_verifier_calls_capture():
