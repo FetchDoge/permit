@@ -53,7 +53,9 @@ from permit.retry_rate_store import (
     RetryRateRow,
     create_high_water,
     high_water_lock,
+    publish_rate_mac_to_anchor,
     rate_limited_mac,
+    require_retry_rate_mac_key,
     verify_rate_limited_mac,
 )
 
@@ -205,6 +207,10 @@ class ReleaseVerifier:
         self.permits = permits
         # NOTE: explicit None check — an empty Ledger is falsy via __len__.
         self.ledger = ledger if ledger is not None else Ledger()
+        # Fail before any decision if the MAC key is missing/empty/short.
+        # SqliteLedger also validates in its constructor; this covers the
+        # in-memory ledger path and double-checks the sqlite path.
+        require_retry_rate_mac_key()
         self._escrows: dict[str, Escrow] = {}
         self._lock = threading.Lock()
         if retry_rate_limit_n < 0:
@@ -983,8 +989,12 @@ class ReleaseVerifier:
             )
             prev_for_new = side_mac
             with high_water_lock(escrow_id, state.window_id) as hwlock:
-                hwlock.check(int(state.rate_limited))
-                state.rate_limited += 1
+                cur = int(state.rate_limited)
+                hwlock.reconcile(cur)
+                hwlock.check(cur)
+                new_count = cur + 1
+                hwlock.write_intent(new_count)
+                state.rate_limited = new_count
                 new_mac = rate_limited_mac(
                     anchor,
                     escrow_id,
@@ -1007,7 +1017,8 @@ class ReleaseVerifier:
                     and side_now.window_id == state.window_id
                     else int(state.rate_limited)
                 )
-                hwlock.set(hw_val)
+                hwlock.confirm(hw_val)
+                publish_rate_mac_to_anchor(new_mac)
             return VerifyResult(False, "rate_limited")
 
     def _predicate_passes(self, escrow: Escrow, evidence: Evidence) -> tuple[bool, str]:

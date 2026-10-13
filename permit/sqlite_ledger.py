@@ -35,10 +35,12 @@ from .retry_rate_store import (
     _ensure_rate_mac_column,
     _maybe_crash,
     assert_high_water_files_for_rows,
+    consult_anchor_at_startup,
     create_high_water,
     high_water_lock,
-    hw_increment_hw_first,
+    publish_rate_mac_to_anchor,
     rate_limited_mac,
+    require_retry_rate_mac_key,
     verify_rate_limited_mac,
 )
 
@@ -149,6 +151,8 @@ class SqliteLedger:
     def __init__(self, path: str) -> None:
         if not isinstance(path, str) or not path:
             raise ValueError("path is required")
+        # Fail before any decision if the MAC key is missing/empty/short.
+        require_retry_rate_mac_key()
         self._lock = threading.Lock()
         self._path = path
         # check_same_thread=False: the lock (not the connection) is the
@@ -228,13 +232,18 @@ class SqliteLedger:
             self.retry_rate_store = SqliteRetryRateStore(
                 self._conn, lock=self._lock
             )
-            # Fail-closed: DB rate rows require matching 0600 sidecars.
-            # Missing/corrupt → refuse to start (never recreate from 0).
+            # Fail-closed bidirectional cross-check: every DB rate row ↔
+            # HMAC-tied sidecar (reconcile intent; exact confirmed==count),
+            # and every sidecar maps to a DB row. Optional anchor consulted.
             hw_rows = self._conn.execute(
-                "SELECT escrow_id, window_id FROM retry_rate_windows"
+                "SELECT escrow_id, window_id, rate_limited, rate_mac"
+                " FROM retry_rate_windows"
             ).fetchall()
             assert_high_water_files_for_rows(
-                [(str(r[0]), str(r[1])) for r in hw_rows]
+                [(str(r[0]), str(r[1]), int(r[2])) for r in hw_rows]
+            )
+            consult_anchor_at_startup(
+                {str(r[3]) for r in hw_rows if r[3]}
             )
         except Exception:
             self._conn.close()
@@ -350,11 +359,9 @@ class SqliteLedger:
     ) -> None:
         """
         Startup / snapshot integrity: one read transaction (WAL snapshot)
-        for chain/HMAC checks, then per-window sidecar high-water checks
-        under the flock with a fresh DB read (never compare HW to a stale
-        WAL snapshot while other writers advance the sidecar).
-        Raises RetryRateIntegrityError on disagreement. Never mutates
-        counters (may reconcile one-step crash skew on the sidecar).
+        for chain/HMAC checks, then per-window sidecar reconcile via the
+        intent record (exact confirmed==DB after reconcile; no skew
+        tolerance). Raises RetryRateIntegrityError on disagreement.
         """
         open_for_hw: list[tuple[str, str, int]] = []
         with self._lock:
@@ -380,7 +387,7 @@ class SqliteLedger:
                 except Exception:
                     pass
                 raise
-        # Sidecar vs DB outside the snapshot, serialized with increments.
+        # Intent reconcile + exact equality under per-window flock.
         for eid, wid, _snap_count in open_for_hw:
             with high_water_lock(eid, wid) as hwlock:
                 probe = sqlite3.connect(
@@ -401,10 +408,8 @@ class SqliteLedger:
                 if row is None:
                     continue
                 count = int(row[0])
+                hwlock.reconcile(count)
                 hwlock.check(count)
-                # Reconcile one-step SQL-ahead crash skew.
-                if count == hwlock.get() + 1:
-                    hwlock.set(count)
 
     def _latest_denial_hash_unlocked(
         self, escrow_id: str, window_id: str
@@ -879,38 +884,15 @@ class SqliteLedger:
         already_reason: str,
     ) -> tuple[str, Receipt | None]:
         """
-        Over-limit increment. Lock order: per-window flock → ledger lock →
-        BEGIN IMMEDIATE → UPDATE → COMMIT → raise sidecar. Flock is per
-        (escrow, window), so a flood on escrow A does not wait on B's flock;
-        the ledger lock is held only for the short SQL write (bar 4).
-
-        Production order is SQL-then-HW. Test hook ``hw_increment_hw_first``
-        reverses that to exercise the other crash window. Injected crashes
-        via ``set_hw_test_hooks(crash_after=...)`` raise after the named
-        step so recovery (one-step skew) can be asserted.
+        Over-limit increment. Lock order: per-window flock → write intent
+        to counter file → ledger lock → BEGIN IMMEDIATE → UPDATE → COMMIT
+        → confirm intent. Flock is per (escrow, window). Crash recovery
+        uses the intent record only (no count skew tolerance).
         """
-        hw_first = hw_increment_hw_first()
         with high_water_lock(escrow_id, wid) as hwlock:
-            if hw_first:
-                # Test-only ordering: raise sidecar, then SQL commit.
-                with self._lock:
-                    open_peek = self._conn.execute(
-                        "SELECT rate_limited FROM retry_rate_windows"
-                        " WHERE escrow_id = ? AND window_id = ?"
-                        " AND tally_flushed = 0",
-                        (escrow_id, wid),
-                    ).fetchone()
-                    if open_peek is None:
-                        raise RuntimeError(
-                            "open window disappeared under high-water "
-                            f"lock escrow_id={escrow_id!r} "
-                            f"window_id={wid!r}"
-                        )
-                    rlim_peek = int(open_peek[0])
-                    hwlock.check(rlim_peek)
-                    hwlock.set(rlim_peek + 1)
-                _maybe_crash("after_hw_before_sql")
-
+            # Single critical section: flock + ledger lock cover intent write,
+            # SQL commit, and confirm so no concurrent reader/writer can
+            # observe or "repair" a half-increment (exact-match invariant).
             with self._lock:
                 try:
                     self._conn.execute("BEGIN IMMEDIATE")
@@ -931,8 +913,11 @@ class SqliteLedger:
                     rlim2 = int(open2[0])
                     cur_mac2 = open2[1] or ""
                     prev_mac2 = open2[2] or ""
-                    if not hw_first:
-                        hwlock.check(rlim2)
+                    hwlock.reconcile(rlim2)
+                    hwlock.check(rlim2)
+                    new_rl = rlim2 + 1
+                    hwlock.write_intent(new_rl)
+                    _maybe_crash("after_intent")
                     anchor = self._latest_denial_hash_unlocked(escrow_id, wid)
                     verify_rate_limited_mac(
                         anchor,
@@ -944,7 +929,6 @@ class SqliteLedger:
                         high_water=rlim2,
                         check_sidecar=False,
                     )
-                    new_rl = rlim2 + 1
                     new_mac = rate_limited_mac(
                         anchor,
                         escrow_id,
@@ -962,7 +946,7 @@ class SqliteLedger:
                         " WHERE escrow_id = ? AND window_id = ?"
                         " AND tally_flushed = 0"
                         " AND rate_limited = ?"
-                        " RETURNING rate_limited",
+                        " RETURNING rate_limited, rate_mac",
                         (
                             new_rl,
                             new_mac,
@@ -978,21 +962,30 @@ class SqliteLedger:
                         raise sqlite3.OperationalError("database is locked")
                     self._conn.execute("COMMIT")
                     committed = int(cur[0])
-                except Exception:
+                    committed_mac = cur[1] or new_mac
+                except Exception as exc:
                     try:
                         self._conn.execute("ROLLBACK")
                     except Exception:
                         pass
+                    # Drop intent if SQL did not land — but leave it in place
+                    # for injected after_intent crashes so recovery tests see it.
+                    injected = (
+                        isinstance(exc, RetryRateIntegrityError)
+                        and "injected crash" in str(exc)
+                    )
+                    if not injected:
+                        try:
+                            rec = hwlock.read()
+                            if rec.intent is not None:
+                                hwlock.reconcile(rec.confirmed)
+                        except RetryRateIntegrityError:
+                            pass
                     raise
-            if not hw_first:
-                _maybe_crash("after_sql_before_hw")
-                # Sidecar after SQL commit; still under flock.
-                hwlock.set(committed)
-                _maybe_crash("after_hw")
-            else:
-                # HW already at committed (or one ahead from prior crash).
-                hwlock.set(committed)
-                _maybe_crash("after_sql")
+                _maybe_crash("after_sql_before_confirm")
+                hwlock.confirm(committed)
+                publish_rate_mac_to_anchor(committed_mac)
+                _maybe_crash("after_confirm")
         return "rate_limited", None
 
     def _ensure_open_window_unlocked(

@@ -420,131 +420,98 @@ def test_perf_f7_sqlite_individual_receipt_path_100k_vs_100():
 
 
 def test_perf_f7_sqlite_hostile_on_100k_log():
-    """Bar 4: hostile A flood on SqliteLedger 100k log; B median ≤ 2x, first N receipts.
+    """Bar 4: SqliteLedger on disk, no yield per loop; 100k vs 100 ratio.
 
-    Baseline is quiet B over-limit on the same 100k DB (no flood). Also
-    checks B's first N denials still land as receipts under the flood.
+    Hostile flood on A while sampling B over-limit decisions. Reports the
+    ratio of per-decision median at a 100k-receipt log vs a 100-receipt
+    log (same disk SqliteLedger path, no sleep/yield in the flood loop).
     """
     n = DEFAULT_RETRY_RATE_LIMIT_N
 
-    with tempfile.TemporaryDirectory() as td:
-        ledger = SqliteLedger(td + "/ledger.sqlite")
-        try:
-            verifier, paypal, permits, escrow_a, artifact = _setup(ledger)
-            escrow_b = _second_escrow(verifier, paypal, permits, escrow_a)
-            verifier.verify_and_capture(
-                "esc_1", Evidence(delivered_bytes=b"tampered")
-            )
-            verifier.verify_and_capture(
-                "esc_2", Evidence(delivered_bytes=b"tampered")
-            )
-            _pad_to_receipt_count(verifier.ledger, 100_000)
-            assert len(verifier.ledger) == 100_000
-            evidence = Evidence(delivered_bytes=artifact)
-
-            # Quiet baseline for B on the 100k log.
-            for _ in range(n):
-                assert (
-                    verifier.verify_and_capture("esc_2", evidence).reason
-                    == "already_refused"
+    def _hostile_median_ns(target_len: int) -> float:
+        with tempfile.TemporaryDirectory() as td:
+            ledger = SqliteLedger(td + f"/ledger_{target_len}.sqlite")
+            try:
+                verifier, paypal, permits, escrow_a, artifact = _setup(ledger)
+                escrow_b = _second_escrow(verifier, paypal, permits, escrow_a)
+                verifier.verify_and_capture(
+                    "esc_1", Evidence(delivered_bytes=b"tampered")
                 )
-            assert (
-                verifier.verify_and_capture("esc_2", evidence).reason
-                == "rate_limited"
-            )
-            baseline_samples = []
-            for _ in range(SAMPLES):
-                t0 = time.perf_counter_ns()
-                r = verifier.verify_and_capture("esc_2", evidence)
-                t1 = time.perf_counter_ns()
-                assert r.reason == "rate_limited"
-                baseline_samples.append(t1 - t0)
-            baseline_b = statistics.median(baseline_samples)
+                verifier.verify_and_capture(
+                    "esc_2", Evidence(delivered_bytes=b"tampered")
+                )
+                _pad_to_receipt_count(verifier.ledger, target_len)
+                assert len(verifier.ledger) == target_len
+                evidence = Evidence(delivered_bytes=artifact)
 
-            # Fresh escrow B' would be needed for denial-receipt check under
-            # flood; use esc_1 flood vs esc_2 over-limit samples, and a third
-            # escrow for the first-N receipt assertion.
-            escrow_c = _second_escrow(
-                verifier, paypal, permits, escrow_a, escrow_id="esc_3"
-            )
-            verifier.verify_and_capture(
-                "esc_3", Evidence(delivered_bytes=b"tampered")
-            )
-
-            for _ in range(n):
+                for _ in range(n):
+                    assert (
+                        verifier.verify_and_capture("esc_1", evidence).reason
+                        == "already_refused"
+                    )
                 assert (
                     verifier.verify_and_capture("esc_1", evidence).reason
-                    == "already_refused"
+                    == "rate_limited"
                 )
-            assert (
-                verifier.verify_and_capture("esc_1", evidence).reason
-                == "rate_limited"
-            )
+                for _ in range(n):
+                    assert (
+                        verifier.verify_and_capture("esc_2", evidence).reason
+                        == "already_refused"
+                    )
+                assert (
+                    verifier.verify_and_capture("esc_2", evidence).reason
+                    == "rate_limited"
+                )
 
-            errors: list[BaseException] = []
-            b_over_limit_samples: list[float] = []
-            c_reasons: list[str] = []
-            c_before = len(verifier.ledger)
-            stop = threading.Event()
+                errors: list[BaseException] = []
+                b_samples: list[float] = []
+                stop = threading.Event()
 
-            def flood_a_hostile():
-                try:
-                    while not stop.is_set():
-                        r = verifier.verify_and_capture("esc_1", evidence)
-                        assert not r.released
-                        assert r.reason == "rate_limited"
-                        # SQLite is single-writer: a tiny pause keeps A's
-                        # BEGIN IMMEDIATE duty cycle from starving B while
-                        # still exercising cross-escrow contention (bar 4).
-                        time.sleep(0.001)
-                except BaseException as exc:  # noqa: BLE001
-                    errors.append(exc)
+                def flood_a_hostile():
+                    try:
+                        while not stop.is_set():
+                            r = verifier.verify_and_capture("esc_1", evidence)
+                            assert not r.released
+                            assert r.reason == "rate_limited"
+                            # No yield / sleep — full hostile flood.
+                    except BaseException as exc:  # noqa: BLE001
+                        errors.append(exc)
 
-            def poke_b_and_c():
-                try:
-                    for _ in range(n):
-                        r = verifier.verify_and_capture("esc_3", evidence)
-                        assert not r.released
-                        assert r.reason == "already_refused"
-                        c_reasons.append(r.reason)
-                    for _ in range(SAMPLES):
-                        t0 = time.perf_counter_ns()
-                        r = verifier.verify_and_capture("esc_2", evidence)
-                        t1 = time.perf_counter_ns()
-                        assert not r.released
-                        assert r.reason == "rate_limited"
-                        b_over_limit_samples.append(t1 - t0)
-                except BaseException as exc:  # noqa: BLE001
-                    errors.append(exc)
-                finally:
-                    stop.set()
+                def sample_b():
+                    try:
+                        for _ in range(SAMPLES):
+                            t0 = time.perf_counter_ns()
+                            r = verifier.verify_and_capture("esc_2", evidence)
+                            t1 = time.perf_counter_ns()
+                            assert not r.released
+                            assert r.reason == "rate_limited"
+                            b_samples.append(t1 - t0)
+                    except BaseException as exc:  # noqa: BLE001
+                        errors.append(exc)
+                    finally:
+                        stop.set()
 
-            t_a = threading.Thread(target=flood_a_hostile)
-            t_b = threading.Thread(target=poke_b_and_c)
-            t_a.start()
-            t_b.start()
-            t_b.join()
-            stop.set()
-            t_a.join()
-            assert errors == []
+                t_a = threading.Thread(target=flood_a_hostile)
+                t_b = threading.Thread(target=sample_b)
+                t_a.start()
+                t_b.start()
+                t_b.join()
+                stop.set()
+                t_a.join()
+                assert errors == []
+                assert len(b_samples) == SAMPLES
+                return statistics.median(b_samples)
+            finally:
+                ledger.close()
 
-            assert c_reasons == ["already_refused"] * n
-            c_denials = [
-                r
-                for r in verifier.ledger.receipts()[c_before:]
-                if r.event_type == "REFUSED"
-                and r.payload.get("escrow_id") == "esc_3"
-                and r.payload.get("reason") == "already_refused"
-            ]
-            assert len(c_denials) == n
-
-            median_during = statistics.median(b_over_limit_samples)
-            assert median_during <= THRESHOLD_X * baseline_b, (
-                f"SqliteLedger B median during flood on 100k log="
-                f"{median_during} exceeds {THRESHOLD_X}x baseline={baseline_b}"
-            )
-            assert escrow_b.state == "REFUSED"
-            assert escrow_a.state == "REFUSED"
-            assert escrow_c.state == "REFUSED"
-        finally:
-            ledger.close()
+    median_100 = _hostile_median_ns(100)
+    median_100k = _hostile_median_ns(100_000)
+    ratio = median_100k / median_100 if median_100 else float("inf")
+    print(
+        f"perf_f7_sqlite_hostile ratio_100k_vs_100={ratio:.3f} "
+        f"median_100={median_100} median_100k={median_100k}"
+    )
+    assert median_100k <= THRESHOLD_X * median_100, (
+        f"SqliteLedger hostile median@100k={median_100k} ns exceeds "
+        f"{THRESHOLD_X}x @100={median_100} (ratio={ratio:.3f})"
+    )

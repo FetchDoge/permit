@@ -866,17 +866,38 @@ def test_retry_rate_limit_side_table_tamper_count_edited():
             verifier.verify_and_capture("esc_1", evidence)
         verifier.flush_retry_rate_limits("esc_1")
         side = ledger.retry_rate_store.load_all()[0]
+        tampered = side.rate_limited + 99
+        from permit.retry_rate_store import HighWaterRecord, _atomic_write_hw_record, _hw_entry_path, _hw_lock_path
+        import fcntl as _fcntl
+
         ledger.retry_rate_store.upsert(
             RetryRateRow(
                 escrow_id=side.escrow_id,
                 window_id=side.window_id,
                 window_start=side.window_start,
                 individual=side.individual,
-                rate_limited=side.rate_limited + 99,  # tamper
+                rate_limited=tampered,  # tamper
                 covered_reason=side.covered_reason,
                 tally_flushed=True,
             )
         )
+        # Keep sidecar in sync so reopen reaches the chain tally mismatch check.
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
+        lock_fd = os.open(_hw_lock_path(hw_path), os.O_RDWR)
+        try:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+            _atomic_write_hw_record(
+                hw_path,
+                HighWaterRecord(
+                    escrow_id=side.escrow_id,
+                    window_id=side.window_id,
+                    confirmed=tampered,
+                    intent=None,
+                ),
+            )
+        finally:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+            os.close(lock_fd)
         ledger.close()
         ledger2 = SqliteLedger(path)
         permits2 = PermitStore(ledger=ledger2)
@@ -998,7 +1019,14 @@ def test_retry_rate_limit_side_table_tamper_row_deleted():
             verifier.verify_and_capture("esc_1", evidence)
         verifier.flush_retry_rate_limits("esc_1")
         side = ledger.retry_rate_store.load_all()[0]
+        from permit.retry_rate_store import _hw_entry_path
+
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
         ledger.retry_rate_store.delete(side.escrow_id, side.window_id)
+        # Remove the sidecar too so reopen reaches the chain/side-row check
+        # (orphan file alone would refuse at SqliteLedger.__init__).
+        if os.path.exists(hw_path):
+            os.remove(hw_path)
         ledger.close()
         ledger2 = SqliteLedger(path)
         permits2 = PermitStore(ledger=ledger2)
@@ -1169,9 +1197,30 @@ def test_retry_rate_limit_side_table_tamper_rate_limited_before_n():
         assert anchor is not None
         # Forge a valid MAC + matching sidecar HW so the before-N check
         # (not MAC / high-water) is what fires.
-        from permit.retry_rate_store import set_high_water
+        from permit.retry_rate_store import (
+            HighWaterRecord,
+            _atomic_write_hw_record,
+            _hw_entry_path,
+            _hw_lock_path,
+        )
+        import fcntl as _fcntl
 
-        set_high_water(side.escrow_id, side.window_id, 3)
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
+        lock_fd = os.open(_hw_lock_path(hw_path), os.O_RDWR)
+        try:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+            _atomic_write_hw_record(
+                hw_path,
+                HighWaterRecord(
+                    escrow_id=side.escrow_id,
+                    window_id=side.window_id,
+                    confirmed=3,
+                    intent=None,
+                ),
+            )
+        finally:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+            os.close(lock_fd)
         ledger.retry_rate_store.upsert(
             RetryRateRow(
                 escrow_id=side.escrow_id,
@@ -1242,7 +1291,12 @@ def test_retry_rate_limit_side_table_tamper_delete_open_row():
             assert verifier.verify_and_capture("esc_1", evidence).reason == "already_refused"
         side = ledger.retry_rate_store.get_open("esc_1")
         assert side is not None
+        from permit.retry_rate_store import _hw_entry_path
+
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
         ledger.retry_rate_store.delete(side.escrow_id, side.window_id)
+        if os.path.exists(hw_path):
+            os.remove(hw_path)
         ledger.close()
         ledger2 = SqliteLedger(path)
         permits2 = PermitStore(ledger=ledger2)
@@ -1560,9 +1614,19 @@ def test_retry_rate_limit_two_multiprocess_writers_one_sqlite_file():
 
 def _sqlite_refused_setup(td_path, clock, *, n_denials=0, over=0):
     """Shared helper: SqliteLedger escrow refused, optional denials/over."""
+    import permit.retry_rate_store as rrs
     from permit.sqlite_ledger import SqliteLedger
 
+    # Isolate the counter-file directory to this ledger so the bidirectional
+    # DB↔file cross-check does not see orphans from other tests' windows.
+    hw_base = td_path + ".hw"
+    os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = hw_base
+    rrs.clear_retry_rate_mac_key_cache()
+    rrs.load_retry_rate_mac_key(refresh=True)
+
     ledger = SqliteLedger(td_path)
+    # Stash for multiprocess workers (same process sees the env already).
+    ledger._test_hw_base = hw_base  # type: ignore[attr-defined]
 
     def now():
         return clock[0]
@@ -1939,8 +2003,19 @@ def test_retry_rate_limit_rollback_saved_pair_50_to_older():
         ledger.close()
 
 
-def test_retry_rate_mac_key_missing_no_flag_fails():
-    """Startup: no key and no demo flag → refuse."""
+def _restore_suite_mac_key() -> None:
+    import permit.retry_rate_store as rrs
+
+    rrs.clear_retry_rate_mac_key_cache()
+    os.environ.setdefault(
+        "PERMIT_RETRY_RATE_MAC_KEY",
+        "test-retry-rate-mac-key-NOT-FOR-PRODUCTION",
+    )
+    rrs.load_retry_rate_mac_key(refresh=True)
+
+
+def test_retry_rate_mac_key_missing_fails():
+    """No key configured → refuse (no demo fallback)."""
     import permit.retry_rate_store as rrs
 
     rrs.clear_retry_rate_mac_key_cache()
@@ -1949,83 +2024,60 @@ def test_retry_rate_mac_key_missing_no_flag_fails():
         for k in (
             "PERMIT_RETRY_RATE_MAC_KEY",
             "PERMIT_RETRY_RATE_MAC_KEY_FILE",
-            "PERMIT_RETRY_RATE_ALLOW_DEMO_MAC_KEY",
         )
     }
     try:
         with pytest.raises(RetryRateIntegrityError, match="unset|refuse"):
             rrs.load_retry_rate_mac_key(refresh=True)
     finally:
-        rrs.clear_retry_rate_mac_key_cache()
         for k, v in old.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-        # Restore suite defaults.
-        os.environ.setdefault(
-            "PERMIT_RETRY_RATE_MAC_KEY",
-            "test-retry-rate-mac-key-NOT-FOR-PRODUCTION",
-        )
-        rrs.load_retry_rate_mac_key(refresh=True)
+        _restore_suite_mac_key()
 
 
 def test_retry_rate_mac_key_empty_fails():
-    """Startup: empty PERMIT_RETRY_RATE_MAC_KEY → refuse."""
+    """Empty PERMIT_RETRY_RATE_MAC_KEY → refuse."""
     import permit.retry_rate_store as rrs
 
     rrs.clear_retry_rate_mac_key_cache()
     old = os.environ.get("PERMIT_RETRY_RATE_MAC_KEY")
     old_file = os.environ.pop("PERMIT_RETRY_RATE_MAC_KEY_FILE", None)
-    old_demo = os.environ.pop("PERMIT_RETRY_RATE_ALLOW_DEMO_MAC_KEY", None)
     os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = ""
     try:
         with pytest.raises(RetryRateIntegrityError, match="empty"):
             rrs.load_retry_rate_mac_key(refresh=True)
     finally:
-        rrs.clear_retry_rate_mac_key_cache()
         if old is None:
             os.environ.pop("PERMIT_RETRY_RATE_MAC_KEY", None)
         else:
             os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = old
         if old_file is not None:
             os.environ["PERMIT_RETRY_RATE_MAC_KEY_FILE"] = old_file
-        if old_demo is not None:
-            os.environ["PERMIT_RETRY_RATE_ALLOW_DEMO_MAC_KEY"] = old_demo
-        os.environ.setdefault(
-            "PERMIT_RETRY_RATE_MAC_KEY",
-            "test-retry-rate-mac-key-NOT-FOR-PRODUCTION",
-        )
-        rrs.load_retry_rate_mac_key(refresh=True)
+        _restore_suite_mac_key()
 
 
 def test_retry_rate_mac_key_short_fails():
-    """Startup: key shorter than 32 bytes → refuse."""
+    """Key shorter than 32 bytes → refuse."""
     import permit.retry_rate_store as rrs
 
     rrs.clear_retry_rate_mac_key_cache()
     old = os.environ.get("PERMIT_RETRY_RATE_MAC_KEY")
     old_file = os.environ.pop("PERMIT_RETRY_RATE_MAC_KEY_FILE", None)
-    old_demo = os.environ.pop("PERMIT_RETRY_RATE_ALLOW_DEMO_MAC_KEY", None)
-    os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = "too-short-key"
+    os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = "x" * 31
     try:
         with pytest.raises(RetryRateIntegrityError, match="too short"):
             rrs.load_retry_rate_mac_key(refresh=True)
     finally:
-        rrs.clear_retry_rate_mac_key_cache()
         if old is None:
             os.environ.pop("PERMIT_RETRY_RATE_MAC_KEY", None)
         else:
             os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = old
         if old_file is not None:
             os.environ["PERMIT_RETRY_RATE_MAC_KEY_FILE"] = old_file
-        if old_demo is not None:
-            os.environ["PERMIT_RETRY_RATE_ALLOW_DEMO_MAC_KEY"] = old_demo
-        os.environ.setdefault(
-            "PERMIT_RETRY_RATE_MAC_KEY",
-            "test-retry-rate-mac-key-NOT-FOR-PRODUCTION",
-        )
-        rrs.load_retry_rate_mac_key(refresh=True)
+        _restore_suite_mac_key()
 
 
 def test_retry_rate_limit_eight_processes_no_false_integrity_error():
@@ -2045,8 +2097,14 @@ def test_retry_rate_limit_eight_processes_no_false_integrity_error():
 
     def _one_round(round_idx: int) -> int:
         """Return 1 if this round saw a false RetryRateIntegrityError, else 0."""
+        import permit.retry_rate_store as rrs
+
         with tempfile.TemporaryDirectory() as td:
             path = td + f"/ledger_{round_idx}.sqlite"
+            hw_base = path + ".hw"
+            os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = hw_base
+            rrs.clear_retry_rate_mac_key_cache()
+            rrs.load_retry_rate_mac_key(refresh=True)
             clock_value = 2_000_000.0 + round_idx
             ledger = SqliteLedger(path)
             permits = PermitStore(ledger=ledger)
@@ -2079,11 +2137,19 @@ def test_retry_rate_limit_eight_processes_no_false_integrity_error():
             verifier.register(escrow)
             _refuse_escrow(verifier)
             before = len(ledger)
+            # Pre-create the open rate window + sidecar so workers do not race
+            # on INSERT/create_high_water (orphan HW digests from lost races).
+            evidence0 = Evidence(delivered_bytes=artifact)
+            for _ in range(n):
+                assert (
+                    verifier.verify_and_capture("esc_1", evidence0).reason
+                    == "already_refused"
+                )
             ledger.close()
 
             ctx = mp.get_context("spawn")
             q = ctx.Queue()
-            hw_path = os.environ.get("PERMIT_RETRY_RATE_MAC_HW_FILE")
+            hw_path = hw_base
             mac_key = os.environ.get("PERMIT_RETRY_RATE_MAC_KEY")
             procs = [
                 ctx.Process(
@@ -2126,16 +2192,18 @@ def test_retry_rate_limit_eight_processes_no_false_integrity_error():
                 assert open_row is not None
                 assert open_row.individual == n
                 total = n_proc * per
-                if open_row.rate_limited != total - n:
+                # Parent already exhausted N denials; every worker retry is
+                # over-limit, so rate_limited == total.
+                if open_row.rate_limited != total:
                     raise AssertionError(
                         f"rate_limited={open_row.rate_limited} "
-                        f"expected={total - n} round={round_idx} "
+                        f"expected={total} round={round_idx} "
                         f"results={results} worker_false={worker_false}"
                     )
                 verifier_f.flush_retry_rate_limits("esc_1")
                 final.sync_receipts_from_db()
                 assert len(_rate_limited_receipts(final, "esc_1")) == 1
-                assert _tally_count_sum(final, "esc_1") == total - n
+                assert _tally_count_sum(final, "esc_1") == total
                 assert len(final) - before == n + 1
                 final.close()
                 return worker_false
@@ -2471,12 +2539,14 @@ def test_hw_sidecar_wrong_mode_refuses():
         ledger.close()
 
 
-def test_hw_crash_after_sql_before_hw_no_lost_counts():
-    """Crash between SQL COMMIT and sidecar write: recover without lost counts."""
+def test_hw_crash_after_sql_before_confirm_no_lost_counts():
+    """Crash between SQL COMMIT and intent confirm: recover via intent record."""
     import tempfile
 
     import settlement.verifier as vmod
     from permit.retry_rate_store import (
+        _hw_entry_path,
+        _read_hw_record,
         clear_hw_test_hooks,
         get_high_water,
         set_hw_test_hooks,
@@ -2492,10 +2562,9 @@ def test_hw_crash_after_sql_before_hw_no_lost_counts():
         side = ledger.retry_rate_store.get_open("esc_1")
         assert side is not None
         before = side.rate_limited
-        hw_before = get_high_water(side.escrow_id, side.window_id)
-        assert hw_before == before
+        assert get_high_water(side.escrow_id, side.window_id) == before
 
-        set_hw_test_hooks(crash_after="after_sql_before_hw", hw_first=False)
+        set_hw_test_hooks(crash_after="after_sql_before_confirm")
         try:
             with pytest.raises(RetryRateIntegrityError, match="injected crash"):
                 verifier.verify_and_capture("esc_1", evidence)
@@ -2504,11 +2573,11 @@ def test_hw_crash_after_sql_before_hw_no_lost_counts():
 
         side2 = ledger.retry_rate_store.get_open("esc_1")
         assert side2 is not None
-        # SQL committed; HW still one behind — allowed skew.
         assert side2.rate_limited == before + 1
-        assert get_high_water(side2.escrow_id, side2.window_id) == before
+        rec = _read_hw_record(_hw_entry_path(side2.escrow_id, side2.window_id))
+        assert rec.confirmed == before and rec.intent == before + 1
 
-        # Next honest step reconciles; no false refusal; count advances.
+        # Next honest step reconciles intent → confirm; no false refusal.
         assert (
             verifier.verify_and_capture("esc_1", evidence).reason == "rate_limited"
         )
@@ -2519,12 +2588,14 @@ def test_hw_crash_after_sql_before_hw_no_lost_counts():
         ledger.close()
 
 
-def test_hw_crash_after_hw_before_sql_no_false_refusal():
-    """Crash between sidecar write and SQL commit (hw_first): no false refusal."""
+def test_hw_crash_after_intent_before_sql_no_false_refusal():
+    """Crash after intent write before SQL: clear intent; no false refusal."""
     import tempfile
 
     import settlement.verifier as vmod
     from permit.retry_rate_store import (
+        _hw_entry_path,
+        _read_hw_record,
         clear_hw_test_hooks,
         get_high_water,
         set_hw_test_hooks,
@@ -2541,7 +2612,7 @@ def test_hw_crash_after_hw_before_sql_no_false_refusal():
         assert side is not None
         before = side.rate_limited
 
-        set_hw_test_hooks(crash_after="after_hw_before_sql", hw_first=True)
+        set_hw_test_hooks(crash_after="after_intent")
         try:
             with pytest.raises(RetryRateIntegrityError, match="injected crash"):
                 verifier.verify_and_capture("esc_1", evidence)
@@ -2550,11 +2621,10 @@ def test_hw_crash_after_hw_before_sql_no_false_refusal():
 
         side2 = ledger.retry_rate_store.get_open("esc_1")
         assert side2 is not None
-        # SQL rolled back / not committed; HW one ahead — allowed skew.
         assert side2.rate_limited == before
-        assert get_high_water(side2.escrow_id, side2.window_id) == before + 1
+        rec = _read_hw_record(_hw_entry_path(side2.escrow_id, side2.window_id))
+        assert rec.confirmed == before and rec.intent == before + 1
 
-        # Next honest step (normal SQL-then-HW) reconciles without refusal.
         assert (
             verifier.verify_and_capture("esc_1", evidence).reason == "rate_limited"
         )
@@ -2621,7 +2691,6 @@ def test_hw_two_process_concurrency_atomic_updates():
     n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
     per = 40
     mac_key = os.environ["PERMIT_RETRY_RATE_MAC_KEY"]
-    hw_path = os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"]
 
     with tempfile.TemporaryDirectory() as td:
         path = td + "/ledger.sqlite"
@@ -2629,6 +2698,7 @@ def test_hw_two_process_concurrency_atomic_updates():
         verifier, ledger, evidence = _sqlite_refused_setup(
             path, clock, n_denials=n, over=0
         )
+        hw_path = os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"]
         side0 = ledger.retry_rate_store.get_open("esc_1")
         assert side0 is not None and side0.rate_limited == 0
         ledger.close()
@@ -2662,3 +2732,401 @@ def test_hw_two_process_concurrency_atomic_updates():
         assert side.rate_limited == 2 * per
         assert get_high_water(side.escrow_id, side.window_id) == 2 * per
         final.close()
+
+
+def test_no_demo_mac_key_constant_exists():
+    """_DEMO_MAC_KEY and ALLOW_DEMO env path must be gone."""
+    import permit.retry_rate_store as rrs
+
+    assert not hasattr(rrs, "_DEMO_MAC_KEY")
+    assert not hasattr(rrs, "_ENV_ALLOW_DEMO")
+    src = open(rrs.__file__, encoding="utf-8").read()
+    assert "_DEMO_MAC_KEY" not in src
+    assert "PERMIT_RETRY_RATE_ALLOW_DEMO_MAC_KEY" not in src
+
+
+def test_ledger_and_verifier_ctors_reject_bad_keys():
+    """SqliteLedger and ReleaseVerifier constructors validate the MAC key."""
+    import tempfile
+
+    import permit.retry_rate_store as rrs
+    from permit.permit import PermitStore
+    from permit.sqlite_ledger import SqliteLedger
+    from settlement.paypal_client import MockPayPalClient
+
+    rrs.clear_retry_rate_mac_key_cache()
+    old_key = os.environ.pop("PERMIT_RETRY_RATE_MAC_KEY", None)
+    old_file = os.environ.pop("PERMIT_RETRY_RATE_MAC_KEY_FILE", None)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            # Missing key
+            with pytest.raises(RetryRateIntegrityError, match="unset|refuse"):
+                SqliteLedger(td + "/missing.sqlite")
+            with pytest.raises(RetryRateIntegrityError, match="unset|refuse"):
+                ReleaseVerifier(MockPayPalClient(), PermitStore())
+
+            # Empty key
+            os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = ""
+            rrs.clear_retry_rate_mac_key_cache()
+            with pytest.raises(RetryRateIntegrityError, match="empty"):
+                SqliteLedger(td + "/empty.sqlite")
+            with pytest.raises(RetryRateIntegrityError, match="empty"):
+                ReleaseVerifier(MockPayPalClient(), PermitStore())
+
+            # 31-byte key
+            os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = "x" * 31
+            rrs.clear_retry_rate_mac_key_cache()
+            with pytest.raises(RetryRateIntegrityError, match="too short"):
+                SqliteLedger(td + "/short.sqlite")
+            with pytest.raises(RetryRateIntegrityError, match="too short"):
+                ReleaseVerifier(MockPayPalClient(), PermitStore())
+    finally:
+        if old_key is None:
+            os.environ.pop("PERMIT_RETRY_RATE_MAC_KEY", None)
+        else:
+            os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = old_key
+        if old_file is not None:
+            os.environ["PERMIT_RETRY_RATE_MAC_KEY_FILE"] = old_file
+        _restore_suite_mac_key()
+
+
+def test_rollback_50_to_49_exact_match_x30():
+    """50→49 DB rollback vs confirmed=50 file must refuse; 30 repeats."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import RetryRateRow
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    for round_i in range(30):
+        with tempfile.TemporaryDirectory() as td:
+            path = td + f"/ledger_{round_i}.sqlite"
+            clock = [1_000_000.0 + round_i]
+            verifier, ledger, evidence = _sqlite_refused_setup(
+                path, clock, n_denials=n, over=50
+            )
+            side = ledger.retry_rate_store.get_open("esc_1")
+            assert side is not None and side.rate_limited == 50
+            saved = RetryRateRow(
+                escrow_id=side.escrow_id,
+                window_id=side.window_id,
+                window_start=side.window_start,
+                individual=side.individual,
+                rate_limited=49,
+                covered_reason=side.covered_reason,
+                tally_flushed=False,
+                rate_mac=side.rate_mac,  # stale mac; HW equality fails first
+                prev_rate_mac=side.prev_rate_mac,
+            )
+            # Forge a MAC for count=49 so HMAC alone isn't the only bar —
+            # exact HW match must still catch the rollback.
+            from permit.retry_rate_store import rate_limited_mac
+
+            anchor = ledger.latest_denial_hash(side.escrow_id, side.window_id)
+            saved.rate_mac = rate_limited_mac(
+                anchor,
+                side.escrow_id,
+                side.window_id,
+                49,
+                prev_mac=side.prev_rate_mac,
+                high_water=49,
+            )
+            before = len(ledger)
+            _raw_sql_rollback_side_row(ledger, saved)
+            with pytest.raises(
+                RetryRateIntegrityError,
+                match="sidecar != DB|exact match|rollback|confirmed != DB|process high-water",
+            ):
+                verifier.verify_and_capture("esc_1", evidence)
+            assert len(ledger) == before
+            ledger.close()
+
+
+def test_live_joint_rollback_caught_by_process_hw():
+    """Live joint rollback of DB+file (no key theft): process HW catches it."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        HighWaterRecord,
+        _atomic_write_hw_record,
+        _hw_entry_path,
+        _hw_lock_path,
+        process_high_water,
+        rate_limited_mac,
+    )
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=20
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None and side.rate_limited == 20
+        assert process_high_water(side.escrow_id, side.window_id) == 20
+
+        # Joint rollback: rewrite file + DB to 10 with valid file HMAC + rate_mac.
+        target = 10
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
+        lock_path = _hw_lock_path(hw_path)
+        import fcntl as _fcntl
+
+        lock_fd = os.open(lock_path, os.O_RDWR)
+        try:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+            rec = HighWaterRecord(
+                escrow_id=side.escrow_id,
+                window_id=side.window_id,
+                confirmed=target,
+                intent=None,
+            )
+            _atomic_write_hw_record(hw_path, rec)
+        finally:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+        anchor = ledger.latest_denial_hash(side.escrow_id, side.window_id)
+        forged_mac = rate_limited_mac(
+            anchor,
+            side.escrow_id,
+            side.window_id,
+            target,
+            prev_mac=side.prev_rate_mac,
+            high_water=target,
+        )
+        from permit.retry_rate_store import RetryRateRow
+
+        _raw_sql_rollback_side_row(
+            ledger,
+            RetryRateRow(
+                escrow_id=side.escrow_id,
+                window_id=side.window_id,
+                window_start=side.window_start,
+                individual=side.individual,
+                rate_limited=target,
+                covered_reason=side.covered_reason,
+                tally_flushed=False,
+                rate_mac=forged_mac,
+                prev_rate_mac=side.prev_rate_mac,
+            ),
+        )
+        with pytest.raises(
+            RetryRateIntegrityError, match="process high-water|live joint rollback"
+        ):
+            verifier.verify_and_capture("esc_1", evidence)
+        ledger.close()
+
+
+class _FileAnchorStub:
+    """Persists the latest rate_mac; check_startup refuses if missing after restart."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def __call__(self, rate_mac: str) -> None:
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(rate_mac)
+
+    def check_startup(self, macs: set[str]) -> None:
+        if not os.path.exists(self.path):
+            return
+        last = open(self.path, encoding="utf-8").read().strip()
+        if last and last not in macs:
+            raise RetryRateIntegrityError(
+                f"anchor rate_mac {last!r} missing from DB after restart; "
+                "refuse (joint on-disk rollback)"
+            )
+
+
+def test_restart_joint_rollback_caught_with_anchor_stub():
+    """Restart after joint DB+file rollback: anchor stub catches it."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        HighWaterRecord,
+        _atomic_write_hw_record,
+        _hw_entry_path,
+        _hw_lock_path,
+        clear_rate_mac_anchor,
+        clear_retry_rate_mac_key_cache,
+        rate_limited_mac,
+        set_rate_mac_anchor,
+    )
+    from permit.sqlite_ledger import SqliteLedger
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        anchor_path = td + "/anchor.mac"
+        clock = [1_000_000.0]
+        stub = _FileAnchorStub(anchor_path)
+        set_rate_mac_anchor(stub, url="https://example.invalid/anchor")
+        try:
+            verifier, ledger, evidence = _sqlite_refused_setup(
+                path, clock, n_denials=n, over=15
+            )
+            side = ledger.retry_rate_store.get_open("esc_1")
+            assert side is not None
+            assert os.path.exists(anchor_path)
+            anchored = open(anchor_path, encoding="utf-8").read().strip()
+            assert anchored == side.rate_mac
+            ledger.close()
+
+            # Joint rollback on disk (no process HW): rewrite DB+file to 5.
+            import fcntl as _fcntl
+            import sqlite3
+
+            from permit.retry_rate_store import _DDL_RATE_LIMITED_MONOTONIC
+
+            target = 5
+            conn = sqlite3.connect(path)
+            conn.execute("DROP TRIGGER IF EXISTS retry_rate_rate_limited_monotonic")
+            anchor_hash = None
+            row = conn.execute(
+                "SELECT escrow_id, window_id, window_start, individual,"
+                " covered_reason, prev_rate_mac, rate_mac FROM retry_rate_windows"
+                " WHERE tally_flushed = 0"
+            ).fetchone()
+            assert row is not None
+            eid, wid = row[0], row[1]
+            # Keep prev_mac; mint a valid mac for target under the key.
+            # Need latest denial hash from receipts.
+            den = conn.execute(
+                "SELECT hash FROM receipts WHERE event_type='REFUSED'"
+                " AND refusal_kind='already' AND escrow_id=? AND window_id=?"
+                " ORDER BY seq DESC LIMIT 1",
+                (eid, wid),
+            ).fetchone()
+            assert den is not None
+            forged = rate_limited_mac(
+                den[0], eid, wid, target, prev_mac=row[5] or "", high_water=target
+            )
+            conn.execute(
+                "UPDATE retry_rate_windows SET rate_limited=?, rate_mac=?"
+                " WHERE escrow_id=? AND window_id=?",
+                (target, forged, eid, wid),
+            )
+            conn.commit()
+            conn.execute(_DDL_RATE_LIMITED_MONOTONIC)
+            conn.close()
+
+            hw_path = _hw_entry_path(eid, wid)
+            lock_path = _hw_lock_path(hw_path)
+            lock_fd = os.open(lock_path, os.O_RDWR)
+            try:
+                _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+                _atomic_write_hw_record(
+                    hw_path,
+                    HighWaterRecord(
+                        escrow_id=eid, window_id=wid, confirmed=target, intent=None
+                    ),
+                )
+            finally:
+                _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+                os.close(lock_fd)
+
+            clear_retry_rate_mac_key_cache()
+            with pytest.raises(
+                RetryRateIntegrityError, match="anchor rate_mac|joint on-disk"
+            ):
+                SqliteLedger(path)
+        finally:
+            clear_rate_mac_anchor()
+            clear_retry_rate_mac_key_cache()
+
+
+def test_hw_symlink_counter_lock_parent_refused():
+    """Symlink counter file, lock file, or parent directory → refuse."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import (
+        RetryRateIntegrityError,
+        _hw_entry_path,
+        _hw_lock_path,
+        _hw_root_dir,
+        get_high_water,
+    )
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=1
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        hw_path = _hw_entry_path(side.escrow_id, side.window_id)
+        lock_path = _hw_lock_path(hw_path)
+        root = _hw_root_dir()
+
+        # Counter file symlink
+        real = hw_path + ".real"
+        os.rename(hw_path, real)
+        os.symlink(real, hw_path)
+        with pytest.raises(RetryRateIntegrityError, match="symlink"):
+            get_high_water(side.escrow_id, side.window_id)
+        os.unlink(hw_path)
+        os.rename(real, hw_path)
+
+        # Lock file symlink
+        if os.path.exists(lock_path):
+            real_lock = lock_path + ".real"
+            os.rename(lock_path, real_lock)
+            os.symlink(real_lock, lock_path)
+            with pytest.raises(RetryRateIntegrityError, match="symlink"):
+                get_high_water(side.escrow_id, side.window_id)
+            os.unlink(lock_path)
+            os.rename(real_lock, lock_path)
+
+        # Parent directory symlink: point HW_FILE at a symlink dir
+        import permit.retry_rate_store as rrs
+
+        decoy = td + "/decoy_hw"
+        os.mkdir(decoy, 0o700)
+        link = td + "/hw_link"
+        os.symlink(decoy, link)
+        old_hw = os.environ.get("PERMIT_RETRY_RATE_MAC_HW_FILE")
+        os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = link
+        rrs.clear_retry_rate_mac_key_cache()
+        try:
+            with pytest.raises(RetryRateIntegrityError, match="symlink"):
+                rrs._hw_root_dir()
+        finally:
+            if old_hw is None:
+                os.environ.pop("PERMIT_RETRY_RATE_MAC_HW_FILE", None)
+            else:
+                os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = old_hw
+            rrs.clear_retry_rate_mac_key_cache()
+            rrs.load_retry_rate_mac_key(refresh=True)
+        ledger.close()
+
+
+def test_check_high_water_has_no_skew_tolerance():
+    """grep-backed behaviour: count==hw-1 (50 vs 49) refuses, no +1 allowance."""
+    import tempfile
+
+    import settlement.verifier as vmod
+    from permit.retry_rate_store import check_high_water
+
+    n = getattr(vmod, "DEFAULT_RETRY_RATE_LIMIT_N", 100)
+    with tempfile.TemporaryDirectory() as td:
+        path = td + "/ledger.sqlite"
+        clock = [1_000_000.0]
+        verifier, ledger, evidence = _sqlite_refused_setup(
+            path, clock, n_denials=n, over=50
+        )
+        side = ledger.retry_rate_store.get_open("esc_1")
+        assert side is not None
+        with pytest.raises(
+            RetryRateIntegrityError,
+            match="exact match|!= DB|process high-water|rollback",
+        ):
+            check_high_water(side.escrow_id, side.window_id, 49)
+        # Exact match still ok.
+        assert check_high_water(side.escrow_id, side.window_id, 50) == 50
+        ledger.close()

@@ -22,7 +22,7 @@ def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def test_mock_demo_exits_clean():
-    proc = _run(["demo.py", "--allow-demo-mac-key"])
+    proc = _run(["demo.py"])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "VERIFIED" in proc.stdout
     assert "delegate a $15 sub-permit" in proc.stdout
