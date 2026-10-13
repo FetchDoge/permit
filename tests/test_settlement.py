@@ -155,6 +155,136 @@ def test_void_releases_permit_reservation():
     assert not result.released
 
 
+def _retry_denials(ledger):
+    return [
+        r
+        for r in ledger.receipts()
+        if r.event_type == "REFUSED"
+        and isinstance(r.payload.get("reason"), str)
+        and r.payload["reason"].startswith("already_")
+    ]
+
+
+def _original_refusal_hash(ledger, escrow_id: str) -> str | None:
+    """First original REFUSED hash for escrow, else escrow-level VOIDED hash."""
+    refused = voided = None
+    for r in ledger.receipts():
+        if r.payload.get("escrow_id") != escrow_id:
+            continue
+        if r.event_type == "REFUSED":
+            reason = r.payload.get("reason", "")
+            if isinstance(reason, str) and reason.startswith("already_"):
+                continue
+            if refused is None:
+                refused = r.hash
+        elif r.event_type == "VOIDED" and voided is None:
+            voided = r.hash
+    return refused or voided
+
+
+def test_retry_on_refused_or_voided_writes_denial_receipt():
+    """REA F6: every refused retry on an already REFUSED/VOIDED escrow must
+    append a denial receipt with a unique receipt_id referencing the original
+    refusal; capture must never run; hash chain stays valid."""
+    for terminal, expected_reason, first_release in (
+        (
+            "REFUSED",
+            "already_refused",
+            lambda v, art: v.verify_and_capture(
+                "esc_1", Evidence(delivered_bytes=b"tampered")
+            ),
+        ),
+        (
+            "VOIDED",
+            "already_voided",
+            lambda v, art: (v.void("esc_1"), None)[1],
+        ),
+    ):
+        verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
+        first_release(verifier, artifact)
+        assert escrow.state == terminal
+        original_id = _original_refusal_hash(verifier.ledger, "esc_1")
+        assert original_id is not None
+        captures_before = len(paypal.capture_calls)
+
+        result = verifier.verify_and_capture(
+            "esc_1", Evidence(delivered_bytes=artifact)
+        )
+
+        assert not result.released
+        assert result.reason == expected_reason
+        assert result.capture is None
+        assert len(paypal.capture_calls) == captures_before
+        denials = _retry_denials(verifier.ledger)
+        assert len(denials) == 1
+        denial = denials[0]
+        assert denial.payload["escrow_id"] == "esc_1"
+        assert denial.payload["reason"] == expected_reason
+        assert denial.payload["receipt_id"].startswith("den_")
+        assert denial.payload["original_refusal_id"] == original_id
+        assert denial.payload["original_refusal_id"] != denial.payload["receipt_id"]
+        ok, reason = verifier.ledger.verify_chain()
+        assert ok, reason
+        assert escrow.state == terminal
+
+
+def test_retry_denial_receipts_serial_and_parallel():
+    """REA F6 concurrency: 25 serial + 25 parallel refused retries each write a
+    unique denial receipt referencing the original refusal; none capture."""
+    import threading
+
+    verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
+    first = verifier.verify_and_capture(
+        "esc_1", Evidence(delivered_bytes=b"tampered")
+    )
+    assert not first.released
+    assert escrow.state == "REFUSED"
+    original_id = _original_refusal_hash(verifier.ledger, "esc_1")
+    assert original_id is not None
+    captures_before = len(paypal.capture_calls)
+
+    for _ in range(25):
+        result = verifier.verify_and_capture(
+            "esc_1", Evidence(delivered_bytes=artifact)
+        )
+        assert not result.released
+        assert result.reason == "already_refused"
+        assert result.capture is None
+
+    barrier = threading.Barrier(25)
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=5)
+            result = verifier.verify_and_capture(
+                "esc_1", Evidence(delivered_bytes=artifact)
+            )
+            assert not result.released
+            assert result.reason == "already_refused"
+            assert result.capture is None
+        except BaseException as exc:  # noqa: BLE001 — collect for join
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(25)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+
+    denials = _retry_denials(verifier.ledger)
+    assert len(denials) == 50
+    receipt_ids = [d.payload["receipt_id"] for d in denials]
+    assert len(set(receipt_ids)) == 50
+    assert all(rid.startswith("den_") for rid in receipt_ids)
+    assert all(d.payload["original_refusal_id"] == original_id for d in denials)
+    assert len(paypal.capture_calls) == captures_before == 0
+    ok, reason = verifier.ledger.verify_chain()
+    assert ok, reason
+    assert escrow.state == "REFUSED"
+
+
 def test_only_verifier_calls_capture():
     import ast
 
