@@ -15,7 +15,9 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  test:
+  # Matrix job id must not be `test` — the branch ruleset requires a check
+  # named exactly "test", provided by the aggregate gate below.
+  pytest:
     name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
@@ -124,3 +126,19 @@ jobs:
           ./gitleaks version
       - name: gitleaks
         run: ./gitleaks detect --source . --verbose --redact --config .gitleaks.toml
+
+  # Required branch-ruleset check name. Aggregates pytest matrix, -O, and security.
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: [pytest, test-optimized, security]
+    if: always()
+    steps:
+      - name: aggregate gate
+        run: |
+          echo "pytest=${{ needs.pytest.result }}"
+          echo "test-optimized=${{ needs.test-optimized.result }}"
+          echo "security=${{ needs.security.result }}"
+          test "${{ needs.pytest.result }}" = "success"
+          test "${{ needs.test-optimized.result }}" = "success"
+          test "${{ needs.security.result }}" = "success"
