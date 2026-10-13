@@ -38,8 +38,10 @@ from .retry_rate_store import (
     consult_anchor_at_startup,
     create_high_water,
     high_water_lock,
+    high_water_root_lock,
     publish_rate_mac_to_anchor,
     rate_limited_mac,
+    remove_high_water,
     require_retry_rate_mac_key,
     verify_rate_limited_mac,
 )
@@ -237,20 +239,20 @@ class SqliteLedger:
             # and every sidecar maps to a DB row. Optional anchor consulted.
             # Re-read rate_limited under each per-window flock so concurrent
             # writers cannot leave us reconciling a stale pre-flock snapshot.
-            hw_rows = self._conn.execute(
-                "SELECT escrow_id, window_id, rate_limited, rate_mac"
-                " FROM retry_rate_windows"
-            ).fetchall()
             db_path = self._path
 
-            def _fresh_hw_count(escrow_id: str, window_id: str) -> int | None:
+            def _probe_conn() -> sqlite3.Connection:
                 probe = sqlite3.connect(
                     db_path,
                     isolation_level=None,
                     check_same_thread=False,
                 )
+                probe.execute("PRAGMA busy_timeout=30000")
+                return probe
+
+            def _fresh_hw_count(escrow_id: str, window_id: str) -> int | None:
+                probe = _probe_conn()
                 try:
-                    probe.execute("PRAGMA busy_timeout=30000")
                     row = probe.execute(
                         "SELECT rate_limited FROM retry_rate_windows"
                         " WHERE escrow_id = ? AND window_id = ?",
@@ -260,12 +262,47 @@ class SqliteLedger:
                     probe.close()
                 return None if row is None else int(row[0])
 
+            def _refresh_rows() -> list[tuple[str, str, int]]:
+                probe = _probe_conn()
+                try:
+                    return [
+                        (str(r[0]), str(r[1]), int(r[2]))
+                        for r in probe.execute(
+                            "SELECT escrow_id, window_id, rate_limited"
+                            " FROM retry_rate_windows"
+                        ).fetchall()
+                    ]
+                finally:
+                    probe.close()
+
+            def _row_exists(escrow_id: str, window_id: str) -> bool:
+                probe = _probe_conn()
+                try:
+                    row = probe.execute(
+                        "SELECT 1 FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?",
+                        (escrow_id, window_id),
+                    ).fetchone()
+                finally:
+                    probe.close()
+                return row is not None
+
+            # Snapshot under root lock inside assert (refresh_rows).
+            hw_rows = _refresh_rows()
             assert_high_water_files_for_rows(
-                [(str(r[0]), str(r[1]), int(r[2])) for r in hw_rows],
+                hw_rows,
                 fresh_count=_fresh_hw_count,
+                refresh_rows=_refresh_rows,
+                row_exists=_row_exists,
             )
             consult_anchor_at_startup(
-                {str(r[3]) for r in hw_rows if r[3]}
+                {
+                    str(r[0])
+                    for r in self._conn.execute(
+                        "SELECT rate_mac FROM retry_rate_windows"
+                        " WHERE rate_mac IS NOT NULL AND rate_mac != ''"
+                    ).fetchall()
+                }
             )
         except Exception:
             self._conn.close()
@@ -497,10 +534,15 @@ class SqliteLedger:
                     f"(chain_individual={int(n)}); refuse"
                 )
             if int(side[6]):  # tally_flushed
-                raise RetryRateIntegrityError(
-                    "retry rate side table marked flushed but chain has no tally "
-                    f"for escrow_id={eid!r} window_id={wid!r}; refuse"
-                )
+                # Windows closed with only individual denials (rate_limited=0)
+                # write no chain tally — that is expected. Missing tally is
+                # only a refuse when rate_limited > 0.
+                if int(side[4]) > 0:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table marked flushed but chain has no "
+                        f"tally for escrow_id={eid!r} window_id={wid!r}; refuse"
+                    )
+                continue
             if int(side[3]) != int(n):
                 raise RetryRateIntegrityError(
                     "retry rate side table individual mismatch for "
@@ -550,10 +592,12 @@ class SqliteLedger:
                 )
         for (eid, wid), side in side_by_key.items():
             if int(side[6]) and (eid, wid) not in tally_counts:
-                raise RetryRateIntegrityError(
-                    "retry rate side table tally_flushed=1 but no chain tally for "
-                    f"escrow_id={eid!r} window_id={wid!r}; refuse to start"
-                )
+                if int(side[4]) > 0:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table tally_flushed=1 but no chain "
+                        f"tally for escrow_id={eid!r} window_id={wid!r}; "
+                        "refuse to start"
+                    )
 
     def sync_receipts_from_db(self) -> None:
         """Reload in-memory receipt cache from SQLite (after foreign writers)."""
@@ -1085,19 +1129,31 @@ class SqliteLedger:
         # No open window: insert one (or adopt a concurrent writer's).
         # rate_mac stays empty until the first denial anchors it.
         # Sidecar created only for brand-new windows (never from 0 when
-        # a DB row already exists without a file).
+        # a DB row already exists without a file). New files carry
+        # intent=-1 until INSERT succeeds so concurrent startup treats
+        # them as pending, not orphaned.
         for _ in range(3):
             wid = f"rw_{uuid.uuid4().hex}"
             try:
                 create_high_water(escrow_id, wid, initial=0)
-                self._conn.execute(
-                    "INSERT INTO retry_rate_windows"
-                    " (escrow_id, window_id, window_start, individual,"
-                    "  rate_limited, covered_reason, tally_flushed,"
-                    "  rate_mac, prev_rate_mac)"
-                    " VALUES (?, ?, ?, 0, 0, ?, 0, '', '')",
-                    (escrow_id, wid, now, already_reason),
-                )
+                try:
+                    self._conn.execute(
+                        "INSERT INTO retry_rate_windows"
+                        " (escrow_id, window_id, window_start, individual,"
+                        "  rate_limited, covered_reason, tally_flushed,"
+                        "  rate_mac, prev_rate_mac)"
+                        " VALUES (?, ?, ?, 0, 0, ?, 0, '', '')",
+                        (escrow_id, wid, now, already_reason),
+                    )
+                except sqlite3.IntegrityError:
+                    # Lost INSERT race — drop the unused sidecar so it
+                    # cannot be listed as an orphan on the next startup.
+                    remove_high_water(escrow_id, wid)
+                    raise
+                # Leave intent=-1 until after COMMIT (and reconcile /
+                # write_intent). Clearing earlier makes the sidecar look
+                # orphaned to concurrent startups that cannot yet see the
+                # uncommitted INSERT.
                 return wid, now, 0, 0, "", ""
             except sqlite3.IntegrityError:
                 open_row = self._load_open_window_unlocked(escrow_id)

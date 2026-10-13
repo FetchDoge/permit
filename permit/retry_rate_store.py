@@ -54,7 +54,9 @@ import os
 import sqlite3
 import stat
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Iterator
 
 try:
     import fcntl
@@ -318,6 +320,56 @@ def _hw_lock_path(data_path: str) -> str:
     return data_path + ".lock"
 
 
+def _hw_root_lock_path() -> str:
+    return os.path.join(_hw_root_dir(), ".root.lock")
+
+
+@contextmanager
+def high_water_root_lock() -> Iterator[None]:
+    """
+    Exclusive flock over the HW root.
+
+    Held across create_high_water + the matching DB INSERT, and across the
+    startup orphan cross-check, so a live writer cannot plant a counter file
+    that a concurrent opener lists as an orphan (or the reverse).
+    """
+    root = _hw_root_dir()
+    _refuse_if_symlink(root, what="high-water parent directory")
+    lock_path = _hw_root_lock_path()
+    _refuse_if_symlink(lock_path, what="high-water root lock file")
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
+def remove_high_water(escrow_id: str, window_id: str) -> None:
+    """
+    Delete a counter file + lock after a lost INSERT race (file created,
+    UNIQUE open-window INSERT failed). Not for operator recovery of
+    missing-sidecar cases.
+    """
+    path = _hw_entry_path(escrow_id, window_id)
+    lock_path = _hw_lock_path(path)
+    for p in (path, lock_path):
+        try:
+            if os.path.exists(p) and not os.path.islink(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+
 def _assert_hw_file_meta(path: str) -> None:
     """Require regular file, mode 0600, owner == euid; refuse symlinks."""
     _refuse_if_symlink(path, what="high-water sidecar")
@@ -375,6 +427,11 @@ def _record_to_payload(rec: HighWaterRecord) -> bytes:
     )
 
 
+# intent=-1 marks a counter file created before the matching DB INSERT commits.
+# Startup treats any pending intent (including -1) as not-yet-orphaned.
+_HW_CREATING_INTENT = -1
+
+
 def _parse_hw_record(raw: bytes, *, path: str) -> HighWaterRecord:
     if not raw or not raw.strip():
         raise RetryRateIntegrityError(
@@ -399,9 +456,14 @@ def _parse_hw_record(raw: bytes, *, path: str) -> HighWaterRecord:
         raise RetryRateIntegrityError(
             f"high-water sidecar corrupt at {path!r}; refuse"
         ) from exc
-    if confirmed < 0 or (intent is not None and intent < 0):
+    if confirmed < 0:
         raise RetryRateIntegrityError(
             f"high-water sidecar corrupt at {path!r} (negative); refuse"
+        )
+    # intent=-1 is the creating sentinel (file exists before DB INSERT).
+    if intent is not None and intent < 0 and intent != _HW_CREATING_INTENT:
+        raise RetryRateIntegrityError(
+            f"high-water sidecar corrupt at {path!r} (negative intent); refuse"
         )
     expected = _hw_record_mac(escrow_id, window_id, confirmed, intent)
     if not mac or not hmac.compare_digest(expected, mac):
@@ -512,6 +574,10 @@ def create_high_water(
     Only for a brand-new rate window (caller inserting the DB row) or a
     fresh DB with no rate rows. If the file already exists, verify and
     return its confirmed value (never reset to 0).
+
+    New files are written with intent=-1 (creating) until the caller
+    clears intent after the DB INSERT, so concurrent startup cannot list
+    them as orphans mid-create.
     """
     path = _hw_entry_path(escrow_id, window_id)
     lock_path = _hw_lock_path(path)
@@ -542,7 +608,7 @@ def create_high_water(
                 escrow_id=escrow_id,
                 window_id=window_id,
                 confirmed=int(initial),
-                intent=None,
+                intent=_HW_CREATING_INTENT,
             )
             _atomic_write_hw_record(path, rec)
             val = int(initial)
@@ -556,6 +622,15 @@ def create_high_water(
     with _hw_mem_guard:
         _hw_mem[_hw_map_key(escrow_id, window_id)] = val
     return val
+
+
+def clear_high_water_creating_intent(escrow_id: str, window_id: str) -> None:
+    """After a successful DB INSERT, clear the creating intent (-1)."""
+    with high_water_lock(escrow_id, window_id) as hwlock:
+        rec = hwlock.read()
+        if rec.intent == _HW_CREATING_INTENT:
+            rec.intent = None
+            _atomic_write_hw_record(hwlock._path, rec)
 
 
 def get_high_water(escrow_id: str, window_id: str) -> int:
@@ -630,26 +705,30 @@ def check_high_water(
                 f"db_count={count} process_hw={proc}; refuse "
                 "(live joint rollback)"
             )
-    path = _hw_entry_path(escrow_id, window_id)
-    rec = _read_hw_record(path)
-    if rec.intent is not None:
-        raise RetryRateIntegrityError(
-            "high-water sidecar has pending intent for "
-            f"escrow_id={escrow_id!r} window_id={window_id!r}: "
-            f"confirmed={rec.confirmed} intent={rec.intent} "
-            f"db_count={count}; refuse (reconcile intent first)"
-        )
-    if count != rec.confirmed:
-        raise RetryRateIntegrityError(
-            "retry rate high-water sidecar != DB count for "
-            f"escrow_id={escrow_id!r} window_id={window_id!r}: "
-            f"db_count={count} sidecar_confirmed={rec.confirmed}; refuse "
-            "(exact match required; possible rollback)"
-        )
-    with _hw_mem_guard:
-        if rec.confirmed > _hw_mem.get(mk, 0):
-            _hw_mem[mk] = rec.confirmed
-    return rec.confirmed
+    with high_water_lock(escrow_id, window_id) as hwlock:
+        rec = hwlock.read()
+        if rec.intent == _HW_CREATING_INTENT and rec.confirmed == count:
+            # Creating sentinel left after INSERT; clear before exact check.
+            hwlock.reconcile(count)
+            rec = hwlock.read()
+        if rec.intent is not None:
+            raise RetryRateIntegrityError(
+                "high-water sidecar has pending intent for "
+                f"escrow_id={escrow_id!r} window_id={window_id!r}: "
+                f"confirmed={rec.confirmed} intent={rec.intent} "
+                f"db_count={count}; refuse (reconcile intent first)"
+            )
+        if count != rec.confirmed:
+            raise RetryRateIntegrityError(
+                "retry rate high-water sidecar != DB count for "
+                f"escrow_id={escrow_id!r} window_id={window_id!r}: "
+                f"db_count={count} sidecar_confirmed={rec.confirmed}; refuse "
+                "(exact match required; possible rollback)"
+            )
+        with _hw_mem_guard:
+            if rec.confirmed > _hw_mem.get(mk, 0):
+                _hw_mem[mk] = rec.confirmed
+        return rec.confirmed
 
 
 def reconcile_intent_with_db(
@@ -686,6 +765,8 @@ def assert_high_water_files_for_rows(
     rows: list[tuple[str, str, int]],
     *,
     fresh_count: object | None = None,
+    refresh_rows: object | None = None,
+    row_exists: object | None = None,
 ) -> None:
     """
     Startup bidirectional cross-check:
@@ -693,43 +774,74 @@ def assert_high_water_files_for_rows(
       confirmed must equal DB ``rate_limited``.
     - every counter file under the HW root maps to a DB row (no orphans).
 
-    ``fresh_count``, when provided, is ``fresh_count(escrow_id, window_id)
-    -> int | None`` and is called **under the per-window flock** so the
-    count is not a stale pre-flock snapshot (multiprocess writers may
-    advance DB+file between the caller's SELECT and flock acquisition).
+    Runs under ``high_water_root_lock`` so the DB snapshot and the counter-file
+    listing are consistent with live window creators. ``refresh_rows``, when
+    provided, is called under that lock to re-read ``[(escrow, window, count)]``.
+    ``fresh_count`` / ``row_exists`` re-probe under per-window flock.
+    A counter file with a pending intent, or whose row appears on re-probe,
+    is treated as pending — not orphaned.
     """
-    for escrow_id, window_id, db_count in rows:
-        path = _hw_entry_path(escrow_id, window_id)
-        if not os.path.exists(path):
-            raise RetryRateIntegrityError(
-                "high-water sidecar missing at startup for "
-                f"escrow_id={escrow_id!r} window_id={window_id!r} "
-                f"path={path!r}; refuse to start (DB has rate rows; "
-                "never recreate from 0 — restore sidecar from backup or "
-                "rewrite with the row's rate_limited under mode 0600 "
-                "owned by the service uid, then restart)"
-            )
-        with high_water_lock(escrow_id, window_id) as hwlock:
-            count = int(db_count)
-            if fresh_count is not None:
-                refreshed = fresh_count(escrow_id, window_id)
-                if refreshed is None:
-                    # Row disappeared under flock (flushed/deleted); skip.
-                    continue
-                count = int(refreshed)
-            hwlock.reconcile(count)
-            hwlock.check(count)
+    with high_water_root_lock():
+        if refresh_rows is not None:
+            rows = list(refresh_rows())
 
-    for digest, fpath in list_hw_entry_digests().items():
-        matched = False
-        for escrow_id, window_id, _db_count in rows:
-            want = hashlib.sha256(
+        known: set[str] = set()
+        for escrow_id, window_id, db_count in rows:
+            digest = hashlib.sha256(
                 _hw_map_key(escrow_id, window_id).encode()
             ).hexdigest()[:32]
-            if want == digest:
-                matched = True
-                break
-        if not matched:
+            known.add(digest)
+            path = _hw_entry_path(escrow_id, window_id)
+            if not os.path.exists(path):
+                raise RetryRateIntegrityError(
+                    "high-water sidecar missing at startup for "
+                    f"escrow_id={escrow_id!r} window_id={window_id!r} "
+                    f"path={path!r}; refuse to start (DB has rate rows; "
+                    "never recreate from 0 — restore sidecar from backup or "
+                    "rewrite with the row's rate_limited under mode 0600 "
+                    "owned by the service uid, then restart)"
+                )
+            with high_water_lock(escrow_id, window_id) as hwlock:
+                count = int(db_count)
+                if fresh_count is not None:
+                    refreshed = fresh_count(escrow_id, window_id)
+                    if refreshed is None:
+                        # Row disappeared under flock (flushed/deleted); skip.
+                        continue
+                    count = int(refreshed)
+                hwlock.reconcile(count)
+                hwlock.check(count)
+
+        for digest, fpath in list_hw_entry_digests().items():
+            if digest in known:
+                continue
+            # Unmatched digest: under the file flock, decide pending vs orphan.
+            try:
+                rec = _read_hw_record(fpath)
+            except RetryRateIntegrityError:
+                # Unreadable/corrupt unmatched file — still refuse.
+                raise RetryRateIntegrityError(
+                    f"orphan high-water sidecar at {fpath!r} "
+                    f"(digest={digest}); refuse to start "
+                    "(DB↔file cross-check)"
+                ) from None
+            if rec.intent is not None:
+                # Intent written before SQL commit — pending, not orphaned.
+                continue
+            if row_exists is not None and row_exists(rec.escrow_id, rec.window_id):
+                continue
+            # Recompute known digests after a refresh in case insert landed.
+            if refresh_rows is not None:
+                rows2 = list(refresh_rows())
+                for escrow_id, window_id, _c in rows2:
+                    want = hashlib.sha256(
+                        _hw_map_key(escrow_id, window_id).encode()
+                    ).hexdigest()[:32]
+                    if want == digest:
+                        known.add(digest)
+                        break
+                if digest in known:
+                    continue
             raise RetryRateIntegrityError(
                 f"orphan high-water sidecar at {fpath!r} "
                 f"(digest={digest}); refuse to start "
@@ -931,6 +1043,12 @@ class high_water_lock:
     def write_intent(self, target: int) -> HighWaterRecord:
         """Write intent=target before SQL commit (confirmed unchanged)."""
         rec = self.read()
+        if rec.intent == _HW_CREATING_INTENT:
+            # Creating sentinel left until after DB INSERT was visible;
+            # clear it so a real increment intent can be recorded.
+            rec.intent = None
+            _atomic_write_hw_record(self._path, rec)
+            rec = self.read()
         if rec.intent is not None:
             raise RetryRateIntegrityError(
                 "high-water intent already pending for "
@@ -997,6 +1115,10 @@ class high_water_lock:
                     f"escrow_id={self.escrow_id!r} window_id={self.window_id!r}: "
                     f"db_count={count} confirmed={rec.confirmed}; refuse"
                 )
+        elif rec.intent == _HW_CREATING_INTENT and rec.confirmed == count:
+            # INSERT landed; clear creating sentinel left by create_high_water.
+            rec.intent = None
+            _atomic_write_hw_record(self._path, rec)
         elif rec.intent == count and rec.confirmed == count - 1:
             rec.confirmed = count
             rec.intent = None

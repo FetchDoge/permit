@@ -51,10 +51,12 @@ from permit.retry_rate_store import (
     InMemoryRetryRateStore,
     RetryRateIntegrityError,
     RetryRateRow,
+    clear_high_water_creating_intent,
     create_high_water,
     high_water_lock,
     publish_rate_mac_to_anchor,
     rate_limited_mac,
+    remove_high_water,
     require_retry_rate_mac_key,
     verify_rate_limited_mac,
 )
@@ -520,11 +522,15 @@ class ReleaseVerifier:
                         f"denials escrow_id={key[0]!r} window_id={key[1]!r} "
                         f"(chain_individual={count}); refuse to start"
                     )
-                if row.tally_flushed:
+                if row.tally_flushed and row.rate_limited > 0:
                     raise RetryRateIntegrityError(
                         "retry rate side table marked flushed but chain has no tally "
                         f"for escrow_id={key[0]!r} window_id={key[1]!r}; refuse"
                     )
+                if row.tally_flushed:
+                    # rate_limited==0: closed with only individual denials —
+                    # no chain tally is expected.
+                    continue
                 self._reconcile_open_window_integrity(
                     row, chain_tallies, chain_denials
                 )
@@ -565,7 +571,7 @@ class ReleaseVerifier:
                     self._persist_rate_window(row.escrow_id, state)
                 continue
 
-            if row.tally_flushed and checker is None:
+            if row.tally_flushed and checker is None and row.rate_limited > 0:
                 raise RetryRateIntegrityError(
                     "retry rate side table tally_flushed=1 but no chain tally for "
                     f"escrow_id={row.escrow_id!r} window_id={row.window_id!r}; "
@@ -762,9 +768,17 @@ class ReleaseVerifier:
             )
             try:
                 # Brand-new window only — never recreate a missing sidecar
-                # for an existing DB/side row.
+                # for an existing DB/side row. Creating intent (-1) covers
+                # the create→persist gap against startup orphan checks.
                 create_high_water(escrow_id, state.window_id, initial=0)
-                self._persist_rate_window(escrow_id, state)
+                try:
+                    self._persist_rate_window(escrow_id, state)
+                except Exception:
+                    remove_high_water(escrow_id, state.window_id)
+                    raise
+                # Leave creating intent (-1) until reconcile/write_intent;
+                # clearing before the persist is visible races startup.
+                clear_high_water_creating_intent(escrow_id, state.window_id)
             except RuntimeError:
                 adopted = self._refresh_open_window_from_store(escrow_id)
                 if adopted is None:
