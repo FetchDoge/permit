@@ -87,7 +87,7 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 **Sandbox approval flow.** Each PayPal order needs interactive payer approval:
 
-1. `POST /api/permits/<id>/spend`: the authority check reserves the cap, then the pipeline creates the order and tries to authorize. Before payer approval the service answers **202** with `{status: approval_required, operation_id, order_id, approval_url}`. The reservation, operation, and order stay held server-side.
+1. `POST /api/permits/<id>/spend`: the authority check reserves the cap, then the pipeline creates the order and tries to authorize. Before payer approval the service answers **202** with `{status: approval_required, operation_id, order_id, approval_url}`.
 2. The payer approves at `approval_url`. Permit confirms approval by polling the order's API state, never the checkout page.
 3. `POST /api/operations/<operation_id>/resume` authorizes the **same** order (never a second one) and registers the escrow.
 4. `POST /api/escrows/<id>/release` with delivery evidence: predicate check, then capture.
@@ -95,7 +95,7 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 **Service verbs (JSON):** issue (`POST /api/permits`), delegate (`POST /api/permits/<id>/delegate`), tighten (`POST /api/permits/<id>/tighten`: narrows cap, merchants, expiry, or approval threshold, never widens), check (read-only: no reservation, no receipt), spend, resume, release, reconcile, retry cleanup, e-stop, revoke a subtree (`POST /api/permits/<id>/revoke-cascade`), and read the ledger (`GET /api/ledger`). Mock mode is the default. `--sandbox` arms the real PayPal sandbox rail (needs `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET`).
 
-**Calibration score (advisory).** `permit/calibration.py` computes an advisory score S in [0, 1] (Sol 6.1). `check()` records S, the permit's tau and a MEETS/BELOW verdict on its ALLOWED and BLOCKED receipts, and the dashboard shows them. S never blocks a spend: the four-clause gate is unchanged, and a spend with S = 0 gets the same decision as before. Tau starts at 0.70 at grant and can only be raised; a lowering is refused with a `TAU_REFUSED` receipt. The weights and scales are uncalibrated fixtures.
+**Calibration score (advisory, uncalibrated).** `permit/calibration.py` computes a score S in [0, 1] as a research sketch — not a production metric and not a security guarantee. The weights and scales are fixed demo fixtures with no empirical backing, so treat S as a conversation starter about how you might eventually measure permit quality, not as evidence that any given permit is safe. `check()` records S, the permit's tau, and a MEETS/BELOW verdict on its ALLOWED and BLOCKED receipts, and the dashboard surfaces them. S never blocks a spend: the four-clause gate is unchanged, and a spend with S = 0 gets the same decision as before. Tau starts at 0.70 at grant and can only be raised; a lowering is refused with a `TAU_REFUSED` receipt.
 
 **Actors:** the **payer** approves, the **merchant** delivers, the **Permit operator** issues permits and holds the e-stop, and the **credential owner** holds the PayPal secret. The agent never holds credentials.
 
@@ -117,5 +117,4 @@ The project builds in the open toward the Nov 12, 2026 hackathon deadline.
 - **Remaining:** the integrated sandbox run, the video (by Nov 8), and the Devpost package (by Nov 10).
 
 ## License
-
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/marsojuji-cmyk/permit/blob/main/LICENSE).
