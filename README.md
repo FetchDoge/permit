@@ -52,7 +52,7 @@ python demos/demo_approval.py --fast   # LLM agent: auto-allow, approve, deny, f
 python demos/demo_admission.py         # offline: runaway loop refused at budget exhaustion, concurrent overspend cannot exceed cap
 ```
 
-The three LLM demos call the runner set by `PERMIT_GROK_CLI`. There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demos/demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl`. The file is gitignored, so a fresh clone has no transcript until you record one.
+The three LLM demos call the runner set by `PERMIT_GROK_CLI`. There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demos/demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl` (gitignored — your own recordings stay local). A fresh clone ships one recorded transcript as a fixture, so the judge path runs with no recording of your own: `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` (provenance: `demos/fixtures/README.md`).
 
 ## How it fails
 
@@ -106,7 +106,7 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 - **337 tests pass:** `python -m pytest -q`, run 2026-10-13 on the REA F1/F2/F4 branch (332 on main at 9af721d + 5 new). CI runs the same suite plus `python demo.py` on every push.
 - **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (15 receipts)` (run 2026-10-07 at `dc0f3a5`).
 - **Mock rail vs sandbox, kept separate:**
-  - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_GROK_CLI` or a recorded transcript.
+  - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_GROK_CLI` or a recorded transcript — one ships as `demos/fixtures/demo_transcript.jsonl` for the offline replay path.
   - The Oct 2 sandbox spike made real REST calls (OAuth, order, authorize, capture, void) against PayPal sandbox and verified merchant identity. Its report left the tree in `3f88feb`. Read it with `git show 3f88feb^:spike-report.md`.
   - `docs/sandbox-runbook.md` is the scripted procedure for an integrated six-beat sandbox run. That run is not yet recorded.
 
