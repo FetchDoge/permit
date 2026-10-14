@@ -9,7 +9,9 @@ Spend pipeline: the only path from a spend attempt to money movement.
                with the release-verifier.
     release(): release-verifier's verify_and_capture - the sole capture path.
     estop():   revoke the permit, void every in-flight escrow AND every
-               outstanding authorized-but-unregistered hold.
+               outstanding authorized-but-unregistered hold whose provider
+               void is confirmed. Unconfirmed cleanup stays reserved and is
+               reported on EstopResult.unresolved. Cascades to descendants.
     delegate(): carve a sub-permit out of a permit's remaining cap.
     revoke_cascade():
                revoke a permit and all descendants, void every in-flight
@@ -30,6 +32,15 @@ The permit package's isolation still holds: this module may import from
 settlement; permit/permit.py itself MUST NOT import any PayPal client
 (enforced by import test). NeedsPayerApproval is caught duck-typed (by
 class name), never imported.
+
+Unregistered cleanup is in-memory only. A reservation is released only
+after paypal.void returns the same provider auth id with status VOIDED.
+Timeout, exception, a missing result, a mismatched id, PENDING, and any
+other status keep the permit auth id, the provider auth id, and the
+reservation. retry_cleanup() retries that same identity and does not
+authorize or capture. A process restart drops the identity with the rest
+of this process's state. This is not durable recovery and not a
+production safety claim.
 """
 
 from __future__ import annotations
@@ -37,7 +48,7 @@ from __future__ import annotations
 import inspect
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .ledger import Ledger, Receipt
@@ -89,6 +100,40 @@ class ApprovalRequired(Exception):
         self.artifact_hash = artifact_hash
 
 
+@dataclass(frozen=True)
+class EstopResult:
+    """
+    What estop() did to the money.
+
+    receipt: the E-STOP event. The permit is revoked either way.
+    voided: holds whose void PayPal confirmed. Those reservations are released.
+    unknown_open: escrows in UNKNOWN state (a capture may still be settling).
+        E-stop deliberately does NOT void these: racing a pending capture
+        could double-move money. They stay reserved and reconcile() is the
+        only way forward. Listed so the stop report never reads clean while
+        money is still possibly in flight.
+
+    unresolved: cleanup that is still open. Includes an outstanding hold
+        with no provider id, an unconfirmed unregistered void, a registered
+        escrow left in CLEANUP_PENDING, and a registered void that returned
+        false while that reservation remains. These ids are not listed in
+        voided. UNKNOWN capture uncertainty stays in unknown_open.
+        The unresolved list lives only in this process.
+
+    Iterates as (receipt, voided) so `receipt, voided = flow.estop(...)`
+    keeps working at every existing call site.
+    """
+
+    receipt: Receipt
+    voided: list[str]
+    unknown_open: list[str]
+    unresolved: list[str] = field(default_factory=list)
+
+    def __iter__(self):
+        yield self.receipt
+        yield self.voided
+
+
 def _is_needs_payer_approval(exc: BaseException) -> bool:
     """
     Duck-typed NeedsPayerApproval check. The sandbox client raises an
@@ -111,10 +156,16 @@ class SpendPipeline:
         self._auth_to_escrow: dict[str, str] = {}
         # permit-level auth_id -> {"permit_id": ..., "paypal_auth_id": ...},
         # tracked BEFORE the external authorize call (P1-1 e-stop race fix).
-        # Entries are removed once the escrow is registered (6f) or the hold
-        # is voided after a failed post-authorize recheck (6e).
+        # Entries are removed once the escrow is registered (6f) or an
+        # unregistered void is confirmed VOIDED (6e). An unconfirmed void
+        # stays here with cleanup_pending set. In-memory only.
         self._outstanding: dict[str, dict] = {}
         self._outstanding_lock = threading.Lock()
+        # Permit auth ids whose unregistered void was confirmed VOIDED.
+        # Resume must not recreate these identities or authorize again.
+        # In-memory only; a restart drops the set.
+        self._cleanup_confirmed: set[str] = set()
+        self._cleanup_committing: set[str] = set()
         # Whether this paypal client accepts the idempotency_key kwarg on
         # authorize(). Detected once from the bound method's signature.
         self._authorize_kw: bool | None = None
@@ -151,6 +202,110 @@ class SpendPipeline:
     def _drop_outstanding(self, auth_id: str) -> None:
         with self._outstanding_lock:
             self._outstanding.pop(auth_id, None)
+
+    def _reservation_held(self, permit_id: str, auth_id: str) -> bool:
+        permit = self.permits.get(permit_id)
+        if permit is None:
+            return False
+        return auth_id in permit.in_flight
+
+    def _hold_for_cleanup(
+        self,
+        auth_id: str,
+        permit_id: str,
+        paypal_auth_id: str | None,
+    ) -> None:
+        """Record the unregistered operation before the provider void is attempted."""
+        with self._outstanding_lock:
+            entry = self._outstanding.get(auth_id)
+            if entry is None:
+                entry = {"permit_id": permit_id}
+                self._outstanding[auth_id] = entry
+            entry["permit_id"] = permit_id
+            if paypal_auth_id:
+                entry["paypal_auth_id"] = paypal_auth_id
+            entry["cleanup_pending"] = True
+
+    def _provider_void_confirmed(self, paypal_auth_id: str):
+        """
+        Confirmation is Void(auth_id=<this id>, status='VOIDED') only.
+        A missing result, mismatched id, PENDING, any other status, and any
+        exception (including timeout) are unconfirmed. Does not authorize
+        or capture.
+        """
+        try:
+            result = self.paypal.void(paypal_auth_id)
+        except Exception:
+            return None
+        if result is None:
+            return None
+        if getattr(result, "auth_id", None) != paypal_auth_id:
+            return None
+        if getattr(result, "status", None) != "VOIDED":
+            return None
+        return result
+
+    def _commit_confirmed_void(self, permit_id: str, auth_id: str) -> bool:
+        """Release the reservation once, then forget the outstanding identity."""
+        with self._outstanding_lock:
+            if auth_id in self._cleanup_confirmed:
+                return True
+            if auth_id in self._cleanup_committing:
+                return False
+            self._cleanup_committing.add(auth_id)
+        released = False
+        try:
+            if self._reservation_held(permit_id, auth_id):
+                self.permits.settle_void(permit_id, auth_id)
+            released = True
+        finally:
+            with self._outstanding_lock:
+                self._cleanup_committing.discard(auth_id)
+                if released:
+                    self._outstanding.pop(auth_id, None)
+                    self._cleanup_confirmed.add(auth_id)
+        return released
+
+    def _release_if_void_confirmed(
+        self,
+        permit_id: str,
+        auth_id: str,
+        paypal_auth_id: str | None,
+    ) -> bool:
+        """
+        Track the operation first. Release cap only when void is confirmed
+        for that provider auth id. Otherwise keep the reservation and the
+        identity for retry_cleanup().
+        """
+        self._hold_for_cleanup(auth_id, permit_id, paypal_auth_id)
+        if not paypal_auth_id:
+            return False
+        if self._provider_void_confirmed(paypal_auth_id) is None:
+            return False
+        return self._commit_confirmed_void(permit_id, auth_id)
+
+    def retry_cleanup(self, auth_id: str) -> bool:
+        """
+        Retry one unregistered void with the same provider auth id.
+
+        True when that hold was already confirmed, or this call observes
+        VOIDED and releases cap once. False while the void is unconfirmed;
+        the reservation stays held. Does not call authorize, authorize_order,
+        or capture. In-memory only: restart drops this identity.
+        """
+        with self._outstanding_lock:
+            if auth_id in self._cleanup_confirmed:
+                return True
+            entry = self._outstanding.get(auth_id)
+            if entry is None or not entry.get("cleanup_pending"):
+                return False
+            paypal_auth_id = entry.get("paypal_auth_id")
+            permit_id = entry.get("permit_id")
+        if not paypal_auth_id or not permit_id:
+            return False
+        if self._provider_void_confirmed(paypal_auth_id) is None:
+            return False
+        return self._commit_confirmed_void(permit_id, auth_id)
 
     def _find_check_receipt(self, auth_id: str) -> Receipt | None:
         """Locate the ALLOWED receipt for an outstanding auth_id, if any."""
@@ -359,28 +514,27 @@ class SpendPipeline:
             reason = None
 
         if reason is not None:
-            # Void the PayPal hold best-effort; cleanup of the provider
-            # hold itself is the settlement layer's job, so ignore errors.
-            try:
-                self.paypal.void(paypal_auth_id)
-            except Exception:
-                pass
-            self.permits.settle_void(permit_id, auth_id)
-            self._drop_outstanding(auth_id)
+            # Release only on an explicit matching VOIDED. Anything else
+            # keeps the reservation and the operation identity.
+            self._release_if_void_confirmed(permit_id, auth_id, paypal_auth_id)
             return SpendAttempt(
                 False, reason, None, (first_receipt,) if first_receipt else ()
             )
 
         # (6f) register_escrow as before, then drop the outstanding entry.
-        escrow_id, authorized_receipt = self.register_escrow(
-            permit_id=permit_id,
-            auth_id=auth_id,
-            paypal_auth_id=paypal_auth_id,
-            amount_cents=amount_cents,
-            merchant_id=merchant_id,
-            predicate_type=predicate_type,
-            artifact_hash=artifact_hash,
-        )
+        # A rejection owns its cleanup entry; do not drop it here.
+        try:
+            escrow_id, authorized_receipt = self.register_escrow(
+                permit_id=permit_id,
+                auth_id=auth_id,
+                paypal_auth_id=paypal_auth_id,
+                amount_cents=amount_cents,
+                merchant_id=merchant_id,
+                predicate_type=predicate_type,
+                artifact_hash=artifact_hash,
+            )
+        except RuntimeError:
+            raise
         self._drop_outstanding(auth_id)
         receipts = tuple(r for r in (first_receipt, authorized_receipt) if r is not None)
         return SpendAttempt(True, "allowed", escrow_id, receipts)
@@ -394,7 +548,28 @@ class SpendPipeline:
         authorize_order(order_id, amount_cents, merchant_id); otherwise
         raises RuntimeError. If the order still needs approval, raises
         ApprovalRequired again (rebuilt from the same fields).
+
+        A cleanup-pending identity retries that void and does not authorize.
+        After the void is confirmed, a later call does not recreate the
+        identity or authorize a new hold.
         """
+        auth_id = appr.auth_id
+        with self._outstanding_lock:
+            if auth_id in self._cleanup_confirmed:
+                phase = "confirmed"
+            elif (self._outstanding.get(auth_id) or {}).get("cleanup_pending"):
+                phase = "pending"
+            else:
+                phase = "approval"
+        receipt = self._find_check_receipt(auth_id)
+        receipts = (receipt,) if receipt is not None else ()
+        if phase == "confirmed":
+            return SpendAttempt(False, "cleanup_confirmed", None, receipts)
+        if phase == "pending":
+            if self.retry_cleanup(auth_id):
+                return SpendAttempt(False, "cleanup_confirmed", None, receipts)
+            return SpendAttempt(False, "cleanup_pending", None, receipts)
+
         authorize_order = getattr(self.paypal, "authorize_order", None)
         if authorize_order is None:
             raise RuntimeError(
@@ -402,10 +577,10 @@ class SpendPipeline:
                 "cannot resume an approval-required operation"
             )
 
-        auth_id = appr.auth_id
         permit_id = appr.permit_id
         with self._outstanding_lock:
-            self._outstanding.setdefault(auth_id, {"permit_id": permit_id})
+            if auth_id not in self._cleanup_confirmed:
+                self._outstanding.setdefault(auth_id, {"permit_id": permit_id})
 
         try:
             pp_auth = authorize_order(
@@ -455,20 +630,16 @@ class SpendPipeline:
         instead of re-spending.
 
         Fail closed (P1-1 fix): if the permit is missing, revoked, or
-        expired at registration time, the PayPal hold is voided
-        (best-effort), the permit reservation is released, and
-        RuntimeError is raised INSTEAD of registering. This covers the
+        expired at registration time, the operation identity is recorded
+        before the void is attempted. Cap is released only when that void
+        is confirmed VOIDED for the same provider auth id. RuntimeError is
+        raised INSTEAD of registering. This covers the
         e-stop-between-authorize-and-register race.
         """
         now = datetime.now(timezone.utc)
         permit = self.permits.get(permit_id)
         if permit is None or permit.revoked or now >= permit.expiry:
-            try:
-                self.paypal.void(paypal_auth_id)
-            except Exception:
-                pass
-            if permit is not None:
-                self.permits.settle_void(permit_id, auth_id)
+            self._release_if_void_confirmed(permit_id, auth_id, paypal_auth_id)
             raise RuntimeError("permit revoked/expired during registration")
 
         escrow_id = f"esc_{uuid.uuid4().hex[:12]}"
@@ -553,34 +724,66 @@ class SpendPipeline:
 
     def _void_permit_holds(
         self, permit_id: str, in_flight_auth_ids: list[str]
-    ) -> list[str]:
+    ) -> tuple[list[str], list[str], list[str]]:
         """
         Void one permit's in-flight holds: registered escrows via the
         verifier, plus outstanding authorized-but-unregistered holds
         (the P1-1 race window). Shared by estop() and revoke_cascade().
+
+        Returns (voided, unknown_open, unresolved). Unconfirmed voids keep
+        the reservation and are listed in unresolved; UNKNOWN escrows are
+        listed in unknown_open and are not raced with a void. Failures are
+        collected rather than raising mid-loop.
         """
         voided: list[str] = []
+        unknown_open: list[str] = []
+        unresolved: list[str] = []
+        # Registered escrows first (existing behavior, plus unresolved reporting).
         for auth_id in in_flight_auth_ids:
             escrow_id = self._auth_to_escrow.get(auth_id)
-            if escrow_id is not None and self.verifier.void(escrow_id):
+            if escrow_id is None:
+                continue
+            escrow = self.verifier.get_escrow(escrow_id)
+            state = getattr(escrow, "state", None) if escrow is not None else None
+            if state == "UNKNOWN":
+                # A capture may still be settling on the provider. Do not
+                # race it with a void; leave the reservation held and point
+                # the operator at reconcile(). Listed, never silent.
+                unknown_open.append(escrow_id)
+                continue
+            if state == "CLEANUP_PENDING":
+                # Pending void is not capture uncertainty. Report it and
+                # leave registered settlement to retry_cleanup().
+                unresolved.append(escrow_id)
+                continue
+            try:
+                confirmed = self.verifier.void(escrow_id)
+            except Exception:
+                unresolved.append(escrow_id)
+                continue
+            if confirmed:
                 voided.append(escrow_id)
+            elif self._reservation_held(permit_id, auth_id):
+                unresolved.append(escrow_id)
+        # Outstanding authorized-but-unregistered holds, including those
+        # whose provider id is not known yet.
         with self._outstanding_lock:
             pending = [
-                (auth_id, entry)
+                (auth_id, entry.get("paypal_auth_id"))
                 for auth_id, entry in self._outstanding.items()
                 if entry.get("permit_id") == permit_id
-                and entry.get("paypal_auth_id")
                 and auth_id not in self._auth_to_escrow
             ]
-        for auth_id, entry in pending:
-            try:
-                self.paypal.void(entry["paypal_auth_id"])
-            except Exception:
-                pass  # best-effort; provider-hold cleanup is settlement's job
-            self.permits.settle_void(permit_id, auth_id)
-            self._drop_outstanding(auth_id)
-            voided.append(auth_id)
-        return voided
+        for auth_id, paypal_auth_id in pending:
+            if not paypal_auth_id:
+                self._hold_for_cleanup(auth_id, permit_id, None)
+                unresolved.append(auth_id)
+                continue
+            if self._release_if_void_confirmed(permit_id, auth_id, paypal_auth_id):
+                voided.append(auth_id)
+            else:
+                unresolved.append(auth_id)
+        return voided, unknown_open, unresolved
 
     def revoke_cascade(self, permit_id: str) -> tuple[Receipt, list[str]]:
         """
@@ -593,7 +796,8 @@ class SpendPipeline:
         receipt, in_flight = self.permits.revoke_subtree(permit_id)
         voided: list[str] = []
         for pid, auth_ids in in_flight.items():
-            voided.extend(self._void_permit_holds(pid, auth_ids))
+            v, _unknown, _unresolved = self._void_permit_holds(pid, auth_ids)
+            voided.extend(v)
         # Release carves post-order: children before parents. The subtree
         # map is keyed by permit; a child's parent always appears earlier
         # in a BFS order, so reversed() yields children first. Permits
@@ -612,23 +816,35 @@ class SpendPipeline:
             self._release_subtree_carves(cid)
         self.permits.release_carve(permit_id)
 
-    def estop(self, permit_id: str) -> tuple[Receipt, list[str]]:
+    def estop(self, permit_id: str) -> EstopResult:
         """
         E-stop: revoke the permit, void every in-flight escrow, AND void
         every outstanding authorized-but-unregistered hold (the threaded
         case of the P1-1 race — the in-authorize case is caught by the
         post-authorize recheck in spend()).
 
-        Returns the e-stop receipt and the voided ids: escrow ids for
-        registered escrows, permit auth_ids for outstanding unregistered
-        holds.
+        Returns an EstopResult: the e-stop receipt, the voided ids (escrow
+        ids for registered escrows, permit auth_ids for outstanding
+        unregistered holds), unknown_open — escrows in UNKNOWN state,
+        which e-stop deliberately does not void (racing a pending capture
+        could double-move money), and unresolved — cleanup that was not
+        confirmed. Those stay reserved; reconcile() remains the path for
+        UNKNOWN, and retry_cleanup() remains the path for an unregistered
+        pending void. Failed or ambiguous voids are not listed as voided.
 
         The e-stop cascades: every descendant permit is revoked and its
         in-flight holds are voided too (parent first, then descendants).
+        Failures are collected across the whole subtree rather than
+        raising mid-loop.
         """
         receipt, in_flight = self.permits.estop_cascade(permit_id)
-        voided = self._void_permit_holds(permit_id, in_flight.get(permit_id, []))
+        voided: list[str] = []
+        unknown_open: list[str] = []
+        unresolved: list[str] = []
         for pid, auth_ids in in_flight.items():
-            if pid != permit_id:
-                voided.extend(self._void_permit_holds(pid, auth_ids))
-        return receipt, voided
+            v, uo, ur = self._void_permit_holds(pid, auth_ids)
+            voided.extend(v)
+            unknown_open.extend(uo)
+            unresolved.extend(ur)
+        return EstopResult(receipt, voided, unknown_open, unresolved)
+

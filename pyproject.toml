@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -15,9 +15,13 @@ dependencies = []
 test = ["pytest>=8", "pytest-cov>=5"]
 lint = ["ruff>=0.8"]
 security = ["bandit>=1.7", "pip-audit>=2.7"]
+build = ["build>=1"]
+
+[project.scripts]
+permit = "permit.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["permit*", "settlement*", "agent*", "scenarios*"]
+include = ["permit*", "settlement*", "agent*", "scenarios*", "harness*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
