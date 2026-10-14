@@ -42,7 +42,7 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 
-from agent.react import run_agent
+from agent.react import llm_preflight, run_agent
 from agent.tools import SpendTools
 from dashboard.server import Dashboard
 from permit.flow import SpendPipeline
@@ -100,12 +100,35 @@ def require(cond: bool, message: str) -> None:
         raise AssertionError(f"demo requirement failed: {message}")
 
 
+def find_authorized_escrow(dash, permit_id: str, beat_label: str) -> str:
+    """Guarded replacement for the bare next(...) escrow lookup."""
+    escrows = dash.state()["escrows"]
+    for e in escrows:
+        if e["permit_id"] == permit_id and e["state"] == "AUTHORIZED":
+            return e["escrow_id"]
+    raise AssertionError(
+        f"demo requirement failed: {beat_label}: no AUTHORIZED escrow for "
+        f"permit {permit_id}; escrows present: "
+        f"{[(e['escrow_id'], e['permit_id'], e['state']) for e in escrows]}. "
+        "The agent's spend did not create a hold - check the replay "
+        "transcript contains an attempt_spend action for this beat."
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replay", default=None)
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--port", type=int, default=8471)
     args = ap.parse_args()
+    if args.replay:
+        import os as _os
+        if not _os.path.isfile(args.replay) or _os.path.getsize(args.replay) == 0:
+            raise SystemExit(
+                f"replay transcript {args.replay!r} is missing or empty: "
+                "record a live run first (sets PERMIT_GROK_CLI) or pass a "
+                "complete recorded transcript."
+            )
 
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
@@ -122,6 +145,9 @@ def main():
         transcript = (stem[0] + ".replay.jsonl"
                       if len(stem) > 1 else args.replay + ".replay.jsonl")
     else:
+        # Preflight BEFORE truncating: a failed live run must never
+        # destroy the previous recording (it is the only replay source).
+        llm_preflight()
         transcript = "demo_transcript.jsonl"
     open(transcript, "w").close()  # fresh transcript per run
 
@@ -195,9 +221,7 @@ def main():
                 "separately.",
         transcript, replay=args.replay, beat=4)
     print(f"  agent: {answer}")
-    escrow_id = next(e["escrow_id"] for e in dash.state()["escrows"]
-                     if e["permit_id"] == child.permit_id
-                     and e["state"] == "AUTHORIZED")
+    escrow_id = find_authorized_escrow(dash, child.permit_id, "beat 4")
     print(f"  child escrow {escrow_id[:14]}... in flight; "
           f"human revokes the PARENT")
     receipt, voided = flow.revoke_cascade(parent.permit_id)
@@ -231,9 +255,7 @@ def main():
                 "Attempt the spend only - do NOT call deliver; the merchant "
                 "delivers separately.",
         transcript, replay=args.replay, beat=5)
-    escrow_id = next(e["escrow_id"] for e in dash.state()["escrows"]
-                     if e["permit_id"] == permit.permit_id
-                     and e["state"] == "AUTHORIZED")
+    escrow_id = find_authorized_escrow(dash, permit.permit_id, "beat 5")
     print(f"  worker submits bytes that do NOT match the precommitment...")
     obs = json.loads(tools.deliver_tampered(escrow_id))
     show_receipts(ledger, mark)
