@@ -17,19 +17,58 @@ import hashlib
 import json
 import sqlite3
 import threading
+import uuid
 
-from .ledger import GENESIS_HASH, Receipt, _canonical, _utcnow_iso
+from .ledger import (
+    GENESIS_HASH,
+    Receipt,
+    _canonical,
+    _rate_tally_key,
+    _utcnow_iso,
+)
+from .retry_rate_store import (
+    RetryRateIntegrityError,
+    _DDL_ONE_OPEN,
+    _DDL_RATE_LIMITED_MONOTONIC,
+    _DDL_RETRY_RATE,
+    SqliteRetryRateStore,
+    _ensure_rate_mac_column,
+    _maybe_crash,
+    assert_high_water_files_for_rows,
+    consult_anchor_at_startup,
+    create_high_water,
+    high_water_lock,
+    clear_high_water_creating_intent,
+    get_high_water,
+    high_water_create,
+    high_water_root_lock,
+    publish_rate_mac_to_anchor,
+    rate_limited_mac,
+    remove_high_water,
+    require_retry_rate_mac_key,
+    verify_rate_limited_mac,
+)
 
 
 _DDL_TABLE = """
 CREATE TABLE IF NOT EXISTS receipts (
-  seq        INTEGER PRIMARY KEY,
-  prev_hash  TEXT    NOT NULL,
-  event_type TEXT    NOT NULL,
-  payload    TEXT    NOT NULL,
-  timestamp  TEXT    NOT NULL,
-  hash       TEXT    NOT NULL UNIQUE
+  seq          INTEGER PRIMARY KEY,
+  prev_hash    TEXT    NOT NULL,
+  event_type   TEXT    NOT NULL,
+  payload      TEXT    NOT NULL,
+  timestamp    TEXT    NOT NULL,
+  hash         TEXT    NOT NULL UNIQUE,
+  escrow_id    TEXT,
+  window_id    TEXT,
+  refusal_kind TEXT
 )
+"""
+
+# Indexed denial lookup: O(log n) COUNT for (escrow_id, window_id).
+_DDL_ALREADY_DENIAL_IDX = """
+CREATE INDEX IF NOT EXISTS receipts_already_denial_idx
+ON receipts (escrow_id, window_id)
+WHERE event_type = 'REFUSED' AND refusal_kind = 'already'
 """
 
 _DDL_NO_UPDATE = """
@@ -64,13 +103,51 @@ ON receipts (json_extract(payload, '$.idempotency_key'))
 WHERE json_extract(payload, '$.idempotency_key') IS NOT NULL
 """
 
+# F7: at most one rate_limited tally receipt per (escrow_id, window_id).
+_DDL_RATE_TALLY_UNIQUE = """
+CREATE UNIQUE INDEX IF NOT EXISTS receipts_rate_limited_window
+ON receipts (
+  json_extract(payload, '$.escrow_id'),
+  json_extract(payload, '$.window_id')
+)
+WHERE event_type = 'REFUSED'
+  AND json_extract(payload, '$.reason') = 'rate_limited'
+"""
+
 _DDL = (
     _DDL_TABLE,
     _DDL_NO_UPDATE,
     _DDL_NO_DELETE,
     _DDL_LINK,
     _DDL_IDEMPOTENCY,
+    _DDL_RATE_TALLY_UNIQUE,
+    _DDL_ALREADY_DENIAL_IDX,
+    _DDL_RETRY_RATE,
+    _DDL_ONE_OPEN,
+    _DDL_RATE_LIMITED_MONOTONIC,
 )
+
+
+def _refusal_kind(event_type: str, payload: dict) -> str | None:
+    if event_type != "REFUSED":
+        return None
+    reason = payload.get("reason")
+    if not isinstance(reason, str):
+        return None
+    if reason.startswith("already_"):
+        return "already"
+    if reason == "rate_limited":
+        return "rate_tally"
+    return None
+
+
+def _payload_escrow_window(payload: dict) -> tuple[str | None, str | None]:
+    eid = payload.get("escrow_id")
+    wid = payload.get("window_id")
+    return (
+        eid if isinstance(eid, str) else None,
+        wid if isinstance(wid, str) else None,
+    )
 
 
 class SqliteLedger:
@@ -79,6 +156,8 @@ class SqliteLedger:
     def __init__(self, path: str) -> None:
         if not isinstance(path, str) or not path:
             raise ValueError("path is required")
+        # Fail before any decision if the MAC key is missing/empty/short.
+        require_retry_rate_mac_key()
         self._lock = threading.Lock()
         self._path = path
         # check_same_thread=False: the lock (not the connection) is the
@@ -95,10 +174,15 @@ class SqliteLedger:
                     raise RuntimeError(
                         "journal_mode WAL not engaged: %r" % (mode,)
                     )
+            # Concurrent writers (multiprocess flood) wait instead of
+            # raising OperationalError('database is locked') immediately.
+            self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             for stmt in _DDL:
                 self._conn.execute(stmt)
+            self._migrate_receipt_index_columns()
+            _ensure_rate_mac_column(self._conn)
             integrity = self._conn.execute("PRAGMA integrity_check").fetchall()
             if integrity != [("ok",)]:
                 raise RuntimeError("integrity_check failed: %r" % (integrity,))
@@ -132,14 +216,178 @@ class SqliteLedger:
                     allowed[auth_id] = receipt
             self._receipts = receipts
             self._allowed_by_auth = allowed
+            rate_tallies: dict[tuple[str, str], Receipt] = {}
+            for receipt in receipts:
+                if receipt.event_type != "REFUSED":
+                    continue
+                key = _rate_tally_key(receipt.payload)
+                if key is not None:
+                    rate_tallies[key] = receipt
+            self._rate_tally_by_window = rate_tallies
             ok, detail = self._verify_receipts(receipts)
             if not ok:
                 raise RuntimeError(
                     "restored chain failed verification: %s" % (detail,)
                 )
+            # F7 side store: outside the hash chain, SAME connection as
+            # receipts so denial+increment can share one BEGIN IMMEDIATE.
+            # Cross-process writers each open their own SqliteLedger on the
+            # file; SQLite serializes the transactions. One OPEN window per
+            # escrow is enforced by retry_rate_one_open_window.
+            self.retry_rate_store = SqliteRetryRateStore(
+                self._conn, lock=self._lock
+            )
+            # Fail-closed bidirectional cross-check: every DB rate row ↔
+            # HMAC-tied sidecar (reconcile intent; exact confirmed==count),
+            # and every sidecar maps to a DB row. Optional anchor consulted.
+            # Re-read rate_limited under each per-window flock so concurrent
+            # writers cannot leave us reconciling a stale pre-flock snapshot.
+            db_path = self._path
+            # `:memory:` is per-connection — a second connect() is an empty
+            # DB. Probe via self._conn there; use a separate connection on
+            # file paths so we can observe foreign commits under flock.
+
+            def _fresh_hw_count(escrow_id: str, window_id: str) -> int | None:
+                if db_path == ":memory:":
+                    row = self._conn.execute(
+                        "SELECT rate_limited FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?",
+                        (escrow_id, window_id),
+                    ).fetchone()
+                    return None if row is None else int(row[0])
+                probe = sqlite3.connect(
+                    db_path,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                try:
+                    probe.execute("PRAGMA busy_timeout=30000")
+                    row = probe.execute(
+                        "SELECT rate_limited FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?",
+                        (escrow_id, window_id),
+                    ).fetchone()
+                finally:
+                    probe.close()
+                return None if row is None else int(row[0])
+
+            def _refresh_rows() -> list[tuple[str, str, int]]:
+                if db_path == ":memory:":
+                    return [
+                        (str(r[0]), str(r[1]), int(r[2]))
+                        for r in self._conn.execute(
+                            "SELECT escrow_id, window_id, rate_limited"
+                            " FROM retry_rate_windows"
+                        ).fetchall()
+                    ]
+                probe = sqlite3.connect(
+                    db_path,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                try:
+                    probe.execute("PRAGMA busy_timeout=30000")
+                    return [
+                        (str(r[0]), str(r[1]), int(r[2]))
+                        for r in probe.execute(
+                            "SELECT escrow_id, window_id, rate_limited"
+                            " FROM retry_rate_windows"
+                        ).fetchall()
+                    ]
+                finally:
+                    probe.close()
+
+            def _row_exists(escrow_id: str, window_id: str) -> bool:
+                if db_path == ":memory:":
+                    row = self._conn.execute(
+                        "SELECT 1 FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?",
+                        (escrow_id, window_id),
+                    ).fetchone()
+                    return row is not None
+                probe = sqlite3.connect(
+                    db_path,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                try:
+                    probe.execute("PRAGMA busy_timeout=30000")
+                    row = probe.execute(
+                        "SELECT 1 FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?",
+                        (escrow_id, window_id),
+                    ).fetchone()
+                finally:
+                    probe.close()
+                return row is not None
+
+            hw_rows = _refresh_rows()
+            assert_high_water_files_for_rows(
+                hw_rows,
+                fresh_count=_fresh_hw_count,
+                refresh_rows=_refresh_rows,
+                row_exists=_row_exists,
+            )
+            consult_anchor_at_startup(
+                {
+                    str(r[0])
+                    for r in self._conn.execute(
+                        "SELECT rate_mac FROM retry_rate_windows"
+                        " WHERE rate_mac IS NOT NULL AND rate_mac != ''"
+                    ).fetchall()
+                }
+            )
         except Exception:
             self._conn.close()
             raise
+
+    def _migrate_receipt_index_columns(self) -> None:
+        """Add escrow_id/window_id/refusal_kind and backfill from payload."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(receipts)")}
+        added = False
+        for col, decl in (
+            ("escrow_id", "TEXT"),
+            ("window_id", "TEXT"),
+            ("refusal_kind", "TEXT"),
+        ):
+            if col not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE receipts ADD COLUMN {col} {decl}"
+                )
+                added = True
+        # One-time backfill only when columns were just added, OR when a
+        # REFUSED row still lacks its indexed escrow_id (payload has one).
+        # Do NOT treat "any NULL escrow_id" as dirty — GRANTED/ALLOWED/etc.
+        # legitimately leave the column NULL, and re-running UPDATE on every
+        # open races the append-only trigger across processes.
+        need = self._conn.execute(
+            "SELECT 1 FROM receipts"
+            " WHERE event_type = 'REFUSED'"
+            " AND escrow_id IS NULL"
+            " AND json_extract(payload, '$.escrow_id') IS NOT NULL"
+            " LIMIT 1"
+        ).fetchone()
+        if added or need is not None:
+            self._conn.execute("DROP TRIGGER IF EXISTS receipts_no_update")
+            try:
+                self._conn.execute(
+                    "UPDATE receipts SET"
+                    " escrow_id = json_extract(payload, '$.escrow_id'),"
+                    " window_id = json_extract(payload, '$.window_id'),"
+                    " refusal_kind = CASE"
+                    "  WHEN event_type = 'REFUSED'"
+                    "   AND json_extract(payload, '$.reason') LIKE 'already_%'"
+                    "  THEN 'already'"
+                    "  WHEN event_type = 'REFUSED'"
+                    "   AND json_extract(payload, '$.reason') = 'rate_limited'"
+                    "  THEN 'rate_tally'"
+                    "  ELSE NULL END"
+                    " WHERE escrow_id IS NULL"
+                    " AND json_extract(payload, '$.escrow_id') IS NOT NULL"
+                )
+            finally:
+                self._conn.execute(_DDL_NO_UPDATE)
+        self._conn.execute(_DDL_ALREADY_DENIAL_IDX)
 
     @staticmethod
     def _verify_receipts(receipts: list[Receipt]) -> tuple[bool, str]:
@@ -162,8 +410,1022 @@ class SqliteLedger:
             expected_prev = r.hash
         return True, "ok"
 
+    def find_rate_limited_tally(
+        self, escrow_id: str, window_id: str
+    ) -> Receipt | None:
+        """Existing rate_limited tally for (escrow_id, window_id), if any."""
+        with self._lock:
+            return self._rate_tally_by_window.get((escrow_id, window_id))
+
+    def count_individual_denials(self) -> dict[tuple[str, str], int]:
+        """
+        Count already_* denial receipts per (escrow_id, window_id) from SQL.
+        Uses indexed columns (O(log n) per group).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT escrow_id, window_id, COUNT(*)"
+                " FROM receipts"
+                " WHERE event_type = 'REFUSED' AND refusal_kind = 'already'"
+                " AND escrow_id IS NOT NULL AND window_id IS NOT NULL"
+                " GROUP BY escrow_id, window_id"
+            ).fetchall()
+        return {
+            (str(eid), str(wid)): int(n) for eid, wid, n in rows if eid and wid
+        }
+
+    def _count_already_denials_unlocked(
+        self, escrow_id: str, window_id: str
+    ) -> int:
+        """Indexed COUNT inside an open transaction."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM receipts"
+            " WHERE event_type = 'REFUSED' AND refusal_kind = 'already'"
+            " AND escrow_id = ? AND window_id = ?",
+            (escrow_id, window_id),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def check_retry_rate_integrity(
+        self, *, original_refusal_id_for=None, limit_n: int = 100
+    ) -> None:
+        """
+        Startup / snapshot integrity: one read transaction (WAL snapshot)
+        for chain/HMAC checks, then per-window sidecar reconcile via the
+        intent record (exact confirmed==DB after reconcile; no skew
+        tolerance). Raises RetryRateIntegrityError on disagreement.
+        """
+        open_for_hw: list[tuple[str, str, int]] = []
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                self._check_retry_rate_integrity_unlocked(
+                    original_refusal_id_for=original_refusal_id_for,
+                    limit_n=limit_n,
+                )
+                open_for_hw = [
+                    (str(r[0]), str(r[1]), int(r[4]))
+                    for r in self._conn.execute(
+                        "SELECT escrow_id, window_id, window_start,"
+                        " individual, rate_limited, covered_reason,"
+                        " tally_flushed, rate_mac, prev_rate_mac"
+                        " FROM retry_rate_windows WHERE tally_flushed = 0"
+                    ).fetchall()
+                ]
+                self._conn.execute("COMMIT")
+            except Exception:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        # Intent reconcile + exact equality under per-window flock.
+        for eid, wid, _snap_count in open_for_hw:
+            with high_water_lock(eid, wid) as hwlock:
+                probe = sqlite3.connect(
+                    self._path,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                try:
+                    probe.execute("PRAGMA busy_timeout=30000")
+                    row = probe.execute(
+                        "SELECT rate_limited FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?"
+                        " AND tally_flushed = 0",
+                        (eid, wid),
+                    ).fetchone()
+                finally:
+                    probe.close()
+                if row is None:
+                    continue
+                count = int(row[0])
+                hwlock.reconcile(count)
+                hwlock.check(count)
+
+    def _latest_denial_hash_unlocked(
+        self, escrow_id: str, window_id: str
+    ) -> str | None:
+        """Hash of the window's latest already_* denial (rate_mac message input)."""
+        row = self._conn.execute(
+            "SELECT hash FROM receipts"
+            " WHERE event_type = 'REFUSED' AND refusal_kind = 'already'"
+            " AND escrow_id = ? AND window_id = ?"
+            " ORDER BY seq DESC LIMIT 1",
+            (escrow_id, window_id),
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def latest_denial_hash(self, escrow_id: str, window_id: str) -> str | None:
+        """Public indexed lookup for the window's latest already_* denial hash."""
+        with self._lock:
+            return self._latest_denial_hash_unlocked(escrow_id, window_id)
+
+    # Compat alias used by older call sites / tests.
+    def first_denial_hash(self, escrow_id: str, window_id: str) -> str | None:
+        return self.latest_denial_hash(escrow_id, window_id)
+
+    def _check_retry_rate_integrity_unlocked(
+        self, *, original_refusal_id_for=None, limit_n: int = 100
+    ) -> None:
+        """Caller holds lock; runs inside an open transaction."""
+        # original_refusal_id_for kept for API compat; rate_mac uses latest denial.
+        del original_refusal_id_for
+        side_rows = self._conn.execute(
+            "SELECT escrow_id, window_id, window_start, individual,"
+            " rate_limited, covered_reason, tally_flushed, rate_mac,"
+            " prev_rate_mac"
+            " FROM retry_rate_windows"
+        ).fetchall()
+        side_by_key = {
+            (r[0], r[1]): r for r in side_rows
+        }
+        chain_denials = self._conn.execute(
+            "SELECT escrow_id, window_id, COUNT(*)"
+            " FROM receipts"
+            " WHERE event_type = 'REFUSED' AND refusal_kind = 'already'"
+            " AND escrow_id IS NOT NULL AND window_id IS NOT NULL"
+            " GROUP BY escrow_id, window_id"
+        ).fetchall()
+        tallies = {
+            (r[0], r[1])
+            for r in self._conn.execute(
+                "SELECT escrow_id, window_id FROM receipts"
+                " WHERE event_type = 'REFUSED' AND refusal_kind = 'rate_tally'"
+                " AND escrow_id IS NOT NULL AND window_id IS NOT NULL"
+            ).fetchall()
+        }
+        for eid, wid, n in chain_denials:
+            key = (eid, wid)
+            if key in tallies:
+                continue
+            side = side_by_key.get(key)
+            if side is None:
+                raise RetryRateIntegrityError(
+                    "retry rate side table missing open row derived from chain "
+                    f"denials escrow_id={eid!r} window_id={wid!r} "
+                    f"(chain_individual={int(n)}); refuse"
+                )
+            if int(side[6]):  # tally_flushed, no chain tally yet
+                # No-tally-allowed only when HMAC-verified counter file says
+                # 0 and the chain has individual denials — never from the
+                # editable side.rate_limited column alone.
+                try:
+                    hw_confirmed = get_high_water(eid, wid)
+                except RetryRateIntegrityError:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table marked flushed but chain has no "
+                        f"tally for escrow_id={eid!r} window_id={wid!r} "
+                        "(counter unverifiable); refuse"
+                    ) from None
+                anchor = self._latest_denial_hash_unlocked(eid, wid)
+                verify_rate_limited_mac(
+                    anchor,
+                    eid,
+                    wid,
+                    hw_confirmed,
+                    side[7] or "",
+                    prev_mac=side[8] or "",
+                    high_water=hw_confirmed,
+                    check_sidecar=False,
+                )
+                if hw_confirmed == 0 and int(n) > 0:
+                    # Counter+chain agree: closed with only individual denials.
+                    continue
+                raise RetryRateIntegrityError(
+                    "retry rate side table marked flushed but chain has no "
+                    f"tally for escrow_id={eid!r} window_id={wid!r} "
+                    f"(hw_confirmed={hw_confirmed}, chain_individual={int(n)}); "
+                    "refuse"
+                )
+            if int(side[3]) != int(n):
+                raise RetryRateIntegrityError(
+                    "retry rate side table individual mismatch for "
+                    f"escrow_id={eid!r} window_id={wid!r}: "
+                    f"side={int(side[3])} chain={int(n)}; refuse"
+                )
+            anchor = self._latest_denial_hash_unlocked(eid, wid)
+            # HMAC only inside the SQL snapshot — sidecar is checked after
+            # COMMIT under the per-window flock (avoids WAL-vs-HW races
+            # when other processes are mid-increment).
+            verify_rate_limited_mac(
+                anchor,
+                eid,
+                wid,
+                int(side[4]),
+                side[7] or "",
+                prev_mac=side[8] or "",
+                check_sidecar=False,
+            )
+            if int(side[4]) > 0 and int(side[3]) < limit_n:
+                raise RetryRateIntegrityError(
+                    "retry rate side table rate_limited set before exhausting N "
+                    f"for escrow_id={eid!r} window_id={wid!r}; refuse"
+                )
+        tally_counts = {
+            (r[0], r[1]): int(r[2])
+            for r in self._conn.execute(
+                "SELECT escrow_id, window_id,"
+                " CAST(json_extract(payload, '$.count') AS INTEGER)"
+                " FROM receipts"
+                " WHERE event_type = 'REFUSED' AND refusal_kind = 'rate_tally'"
+                " AND escrow_id IS NOT NULL AND window_id IS NOT NULL"
+            ).fetchall()
+        }
+        for key, chain_count in tally_counts.items():
+            side = side_by_key.get(key)
+            if side is None:
+                raise RetryRateIntegrityError(
+                    "retry rate side table missing row for chain tally "
+                    f"escrow_id={key[0]!r} window_id={key[1]!r}; refuse"
+                )
+            if int(side[4]) != chain_count:
+                raise RetryRateIntegrityError(
+                    "retry rate side table count mismatch for "
+                    f"escrow_id={key[0]!r} window_id={key[1]!r}: "
+                    f"side={int(side[4])} chain={chain_count}; refuse"
+                )
+        for (eid, wid), side in side_by_key.items():
+            if int(side[6]) and (eid, wid) not in tally_counts:
+                try:
+                    hw_confirmed = get_high_water(eid, wid)
+                except RetryRateIntegrityError:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table tally_flushed=1 but no chain "
+                        f"tally for escrow_id={eid!r} window_id={wid!r} "
+                        "(counter unverifiable); refuse to start"
+                    ) from None
+                chain_n = next(
+                    (int(n) for e, w, n in chain_denials if e == eid and w == wid),
+                    0,
+                )
+                if hw_confirmed == 0 and chain_n > 0:
+                    continue
+                raise RetryRateIntegrityError(
+                    "retry rate side table tally_flushed=1 but no chain "
+                    f"tally for escrow_id={eid!r} window_id={wid!r} "
+                    f"(hw_confirmed={hw_confirmed}, chain_individual={chain_n}); "
+                    "refuse to start"
+                )
+
+    def sync_receipts_from_db(self) -> None:
+        """Reload in-memory receipt cache from SQLite (after foreign writers)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, prev_hash, event_type, payload, timestamp, hash"
+                " FROM receipts ORDER BY seq"
+            ).fetchall()
+            receipts: list[Receipt] = []
+            allowed: dict[str, Receipt] = {}
+            rate_tallies: dict[tuple[str, str], Receipt] = {}
+            for seq, prev_hash, event_type, payload_text, timestamp, stored_hash in rows:
+                payload = json.loads(payload_text)
+                receipt = Receipt(
+                    seq=seq,
+                    prev_hash=prev_hash,
+                    event_type=event_type,
+                    payload=payload,
+                    timestamp=timestamp,
+                )
+                if receipt.hash != stored_hash:
+                    raise RuntimeError(
+                        "stored hash mismatch at seq %s" % (seq,)
+                    )
+                receipts.append(receipt)
+                if event_type == "ALLOWED":
+                    auth_id = payload.get("auth_id")
+                    if isinstance(auth_id, str):
+                        allowed[auth_id] = receipt
+                if event_type == "REFUSED":
+                    key = _rate_tally_key(payload)
+                    if key is not None:
+                        rate_tallies[key] = receipt
+            self._receipts = receipts
+            self._allowed_by_auth = allowed
+            self._rate_tally_by_window = rate_tallies
+
+    def _insert_receipt_unlocked(
+        self, event_type: str, payload: dict
+    ) -> Receipt:
+        """Insert a receipt. Caller holds _lock and an open BEGIN IMMEDIATE."""
+        tip = self._conn.execute(
+            "SELECT seq, hash FROM receipts ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        if tip is None:
+            seq, prev_hash = 0, GENESIS_HASH
+        else:
+            seq, prev_hash = tip[0] + 1, tip[1]
+        receipt = Receipt(
+            seq=seq,
+            prev_hash=prev_hash,
+            event_type=event_type,
+            payload=payload,
+            timestamp=_utcnow_iso(),
+        )
+        eid, wid = _payload_escrow_window(payload)
+        kind = _refusal_kind(event_type, payload)
+        self._conn.execute(
+            "INSERT INTO receipts"
+            " (seq, prev_hash, event_type, payload, timestamp, hash,"
+            "  escrow_id, window_id, refusal_kind)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                receipt.seq,
+                receipt.prev_hash,
+                receipt.event_type,
+                json.dumps(
+                    receipt.payload, sort_keys=True, separators=(",", ":")
+                ),
+                receipt.timestamp,
+                receipt.hash,
+                eid,
+                wid,
+                kind,
+            ),
+        )
+        return receipt
+
+    def _cache_receipt_unlocked(self, receipt: Receipt) -> None:
+        self._receipts.append(receipt)
+        if receipt.event_type == "ALLOWED":
+            auth_id = receipt.payload.get("auth_id")
+            if isinstance(auth_id, str):
+                self._allowed_by_auth[auth_id] = receipt
+        if receipt.event_type == "REFUSED":
+            key = _rate_tally_key(receipt.payload)
+            if key is not None:
+                self._rate_tally_by_window[key] = receipt
+
+    def _load_open_window_unlocked(self, escrow_id: str):
+        return self._conn.execute(
+            "SELECT window_id, window_start, individual, rate_limited,"
+            " covered_reason, rate_mac, prev_rate_mac FROM retry_rate_windows"
+            " WHERE escrow_id = ? AND tally_flushed = 0",
+            (escrow_id,),
+        ).fetchone()
+
+    def _orphan_open_windows_from_chain_unlocked(
+        self, escrow_id: str
+    ) -> list[tuple[str, int]]:
+        """(window_id, chain_individual) with denials but no tally and no side row."""
+        rows = self._conn.execute(
+            "SELECT r.window_id, COUNT(*)"
+            " FROM receipts r"
+            " WHERE r.event_type = 'REFUSED' AND r.refusal_kind = 'already'"
+            " AND r.escrow_id = ?"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM receipts t"
+            "   WHERE t.event_type = 'REFUSED' AND t.refusal_kind = 'rate_tally'"
+            "   AND t.escrow_id = r.escrow_id AND t.window_id = r.window_id"
+            " )"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM retry_rate_windows s"
+            "   WHERE s.escrow_id = r.escrow_id AND s.window_id = r.window_id"
+            " )"
+            " GROUP BY r.window_id",
+            (escrow_id,),
+        ).fetchall()
+        return [(str(wid), int(n)) for wid, n in rows]
+
+    def _close_open_window_unlocked(
+        self,
+        escrow_id: str,
+        window_id: str,
+        window_start: float,
+        rate_limited: int,
+        covered_reason: str,
+        original_refusal_id: str | None,
+        rate_mac: str = "",
+        prev_rate_mac: str = "",
+    ) -> Receipt | None:
+        """Append tally if needed and mark flushed. Inside an open transaction."""
+        # Protect rate_limited via ledger-chained MAC before trusting the count.
+        # Sidecar check is separate (caller / flush holds a fresh view); do not
+        # compare HW to this possibly-stale SQL snapshot.
+        anchor = self._latest_denial_hash_unlocked(escrow_id, window_id)
+        verify_rate_limited_mac(
+            anchor,
+            escrow_id,
+            window_id,
+            rate_limited,
+            rate_mac,
+            prev_mac=prev_rate_mac,
+            check_sidecar=False,
+        )
+        chain_indiv = self._count_already_denials_unlocked(escrow_id, window_id)
+        side_indiv = self._conn.execute(
+            "SELECT individual FROM retry_rate_windows"
+            " WHERE escrow_id = ? AND window_id = ?",
+            (escrow_id, window_id),
+        ).fetchone()
+        if side_indiv is not None and int(side_indiv[0]) != chain_indiv:
+            raise RetryRateIntegrityError(
+                "retry rate side table individual mismatch on close for "
+                f"escrow_id={escrow_id!r} window_id={window_id!r}: "
+                f"side={int(side_indiv[0])} chain={chain_indiv}; refuse"
+            )
+        tally: Receipt | None = None
+        existing_key = (escrow_id, window_id)
+        if existing_key in self._rate_tally_by_window:
+            tally = self._rate_tally_by_window[existing_key]
+        elif rate_limited > 0:
+            row = self._conn.execute(
+                "SELECT seq, prev_hash, event_type, payload, timestamp, hash"
+                " FROM receipts WHERE event_type = 'REFUSED'"
+                " AND json_extract(payload, '$.reason') = 'rate_limited'"
+                " AND json_extract(payload, '$.escrow_id') = ?"
+                " AND json_extract(payload, '$.window_id') = ?",
+                (escrow_id, window_id),
+            ).fetchone()
+            if row is not None:
+                seq, prev_hash, et, payload_text, ts, stored_hash = row
+                if seq < len(self._receipts):
+                    tally = self._receipts[seq]
+                else:
+                    tally = Receipt(
+                        seq=seq,
+                        prev_hash=prev_hash,
+                        event_type=et,
+                        payload=json.loads(payload_text),
+                        timestamp=ts,
+                    )
+                    if tally.hash != stored_hash:
+                        raise RuntimeError("tally hash mismatch on close")
+            else:
+                try:
+                    tally = self._insert_receipt_unlocked(
+                        "REFUSED",
+                        {
+                            "escrow_id": escrow_id,
+                            "reason": "rate_limited",
+                            "count": rate_limited,
+                            "window_id": window_id,
+                            "window_start": window_start,
+                            "covered_reason": covered_reason,
+                            "receipt_id": f"rl_{uuid.uuid4().hex}",
+                            "original_refusal_id": original_refusal_id,
+                        },
+                    )
+                except sqlite3.IntegrityError:
+                    # Lost the race to another writer; load the winner.
+                    row = self._conn.execute(
+                        "SELECT seq, prev_hash, event_type, payload,"
+                        " timestamp, hash FROM receipts"
+                        " WHERE event_type = 'REFUSED'"
+                        " AND json_extract(payload, '$.reason') = 'rate_limited'"
+                        " AND json_extract(payload, '$.escrow_id') = ?"
+                        " AND json_extract(payload, '$.window_id') = ?",
+                        (escrow_id, window_id),
+                    ).fetchone()
+                    if row is None:
+                        raise
+                    seq, prev_hash, et, payload_text, ts, stored_hash = row
+                    tally = Receipt(
+                        seq=seq,
+                        prev_hash=prev_hash,
+                        event_type=et,
+                        payload=json.loads(payload_text),
+                        timestamp=ts,
+                    )
+                    if tally.hash != stored_hash:
+                        raise RuntimeError("tally hash mismatch on close race")
+        self._conn.execute(
+            "UPDATE retry_rate_windows SET tally_flushed = 1,"
+            " rate_limited = ?"
+            " WHERE escrow_id = ? AND window_id = ?",
+            (
+                int(tally.payload["count"]) if tally is not None else int(rate_limited),
+                escrow_id,
+                window_id,
+            ),
+        )
+        return tally
+
+    def record_terminal_retry(
+        self,
+        escrow_id: str,
+        already_reason: str,
+        *,
+        limit_n: int,
+        window_w: float,
+        now: float,
+        original_refusal_id: str | None,
+    ) -> tuple[str, Receipt | None]:
+        """
+        Cross-process rate limit. Inside one BEGIN IMMEDIATE:
+
+          - Detect a deleted mid-window side row (chain denials, no tally)
+          - Derive ``individual`` from an indexed COUNT of chain denials —
+            never trust the side row for the allow/limit decision
+          - If the side row disagrees with the chain → RetryRateIntegrityError
+          - ``rate_limited`` is protected by a ledger-chained rate_mac
+            anchored to the window's first denial receipt hash
+          - if chain_individual < N: INSERT denial + sync side.individual
+            (and set rate_mac for count=0 on the first denial)
+          - else: verify rate_mac, then rate_limited+1 with updated MAC
+
+        Returns (result_reason, denial_receipt_or_None).
+        """
+        with self._lock:
+            cached: list[Receipt] = []
+            # Set by _ensure_open_window_unlocked when it creates a new HW file
+            # so ROLLBACK can remove the orphan sidecar.
+            self._hw_created_pending = None
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                wid, wstart_f, chain_indiv, rlim, cur_mac, prev_mac = (
+                    self._ensure_open_window_unlocked(
+                        escrow_id,
+                        already_reason=already_reason,
+                        window_w=window_w,
+                        now=now,
+                        original_refusal_id=original_refusal_id,
+                        cached=cached,
+                    )
+                )
+
+                if chain_indiv < limit_n:
+                    denial = self._insert_receipt_unlocked(
+                        "REFUSED",
+                        {
+                            "escrow_id": escrow_id,
+                            "reason": already_reason,
+                            "window_id": wid,
+                            "window_start": wstart_f,
+                            "receipt_id": f"den_{uuid.uuid4().hex}",
+                            "original_refusal_id": original_refusal_id,
+                        },
+                    )
+                    new_indiv = chain_indiv + 1
+                    # rate_mac message uses the latest denial's chain hash.
+                    # individual phase: count stays 0; chain prev → new mac.
+                    hw0 = int(rlim)
+                    zero_mac = rate_limited_mac(
+                        denial.hash,
+                        escrow_id,
+                        wid,
+                        int(rlim),
+                        prev_mac=cur_mac or "",
+                        high_water=hw0,
+                    )
+                    cur = self._conn.execute(
+                        "UPDATE retry_rate_windows"
+                        " SET individual = ?,"
+                        " covered_reason = ?,"
+                        " rate_mac = ?,"
+                        " prev_rate_mac = ?"
+                        " WHERE escrow_id = ? AND window_id = ?"
+                        " AND tally_flushed = 0"
+                        " RETURNING individual",
+                        (
+                            new_indiv,
+                            already_reason,
+                            zero_mac,
+                            cur_mac or "",
+                            escrow_id,
+                            wid,
+                        ),
+                    ).fetchone()
+                    if cur is None:
+                        raise RuntimeError(
+                            "individual sync missed open window "
+                            f"escrow_id={escrow_id!r} window_id={wid!r}"
+                        )
+                    self._conn.execute("COMMIT")
+                    # Drop pending before clear so a clear failure cannot
+                    # trigger remove_high_water on a committed row.
+                    self._hw_created_pending = None
+                    clear_high_water_creating_intent(escrow_id, wid)
+                    for r in cached:
+                        self._cache_receipt_unlocked(r)
+                    self._cache_receipt_unlocked(denial)
+                    return already_reason, denial
+
+                # Over-limit: drop the ensure snapshot, release self._lock,
+                # then flock → fresh write conn. Holding the ledger lock
+                # across flock/SQL would block other escrows (bar 4).
+                self._conn.execute("COMMIT")
+                self._hw_created_pending = None
+                clear_high_water_creating_intent(escrow_id, wid)
+                for r in cached:
+                    self._cache_receipt_unlocked(r)
+                cached.clear()
+            except Exception:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                pending = getattr(self, "_hw_created_pending", None)
+                if pending is not None:
+                    self._hw_created_pending = None
+                    # Only delete the sidecar when the INSERT did not land.
+                    row = self._conn.execute(
+                        "SELECT 1 FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?",
+                        pending,
+                    ).fetchone()
+                    if row is None:
+                        remove_high_water(pending[0], pending[1])
+                raise
+            # Fall through outside self._lock.
+        return self._increment_rate_limited_unlocked(
+            escrow_id, wid, already_reason
+        )
+
+    def _increment_rate_limited_unlocked(
+        self,
+        escrow_id: str,
+        wid: str,
+        already_reason: str,
+    ) -> tuple[str, Receipt | None]:
+        """
+        Over-limit increment. Lock order: per-window flock → write intent
+        to counter file → ledger lock → BEGIN IMMEDIATE → UPDATE → COMMIT
+        → confirm intent. Flock is per (escrow, window). Crash recovery
+        uses the intent record only (no count skew tolerance).
+        """
+        with high_water_lock(escrow_id, wid) as hwlock:
+            # Single critical section: flock + ledger lock cover intent write,
+            # SQL commit, and confirm so no concurrent reader/writer can
+            # observe or "repair" a half-increment (exact-match invariant).
+            with self._lock:
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    open2 = self._conn.execute(
+                        "SELECT rate_limited, rate_mac, prev_rate_mac"
+                        " FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?"
+                        " AND tally_flushed = 0",
+                        (escrow_id, wid),
+                    ).fetchone()
+                    if open2 is None:
+                        self._conn.execute("ROLLBACK")
+                        raise RuntimeError(
+                            "open window disappeared under high-water "
+                            f"lock escrow_id={escrow_id!r} "
+                            f"window_id={wid!r}"
+                        )
+                    rlim2 = int(open2[0])
+                    cur_mac2 = open2[1] or ""
+                    prev_mac2 = open2[2] or ""
+                    hwlock.reconcile(rlim2)
+                    hwlock.check(rlim2)
+                    new_rl = rlim2 + 1
+                    hwlock.write_intent(new_rl)
+                    _maybe_crash("after_intent")
+                    anchor = self._latest_denial_hash_unlocked(escrow_id, wid)
+                    verify_rate_limited_mac(
+                        anchor,
+                        escrow_id,
+                        wid,
+                        rlim2,
+                        cur_mac2,
+                        prev_mac=prev_mac2,
+                        high_water=rlim2,
+                        check_sidecar=False,
+                    )
+                    new_mac = rate_limited_mac(
+                        anchor,
+                        escrow_id,
+                        wid,
+                        new_rl,
+                        prev_mac=cur_mac2,
+                        high_water=new_rl,
+                    )
+                    cur = self._conn.execute(
+                        "UPDATE retry_rate_windows"
+                        " SET rate_limited = ?,"
+                        " rate_mac = ?,"
+                        " prev_rate_mac = ?,"
+                        " covered_reason = ?"
+                        " WHERE escrow_id = ? AND window_id = ?"
+                        " AND tally_flushed = 0"
+                        " AND rate_limited = ?"
+                        " RETURNING rate_limited, rate_mac",
+                        (
+                            new_rl,
+                            new_mac,
+                            cur_mac2,
+                            already_reason,
+                            escrow_id,
+                            wid,
+                            rlim2,
+                        ),
+                    ).fetchone()
+                    if cur is None:
+                        self._conn.execute("ROLLBACK")
+                        raise sqlite3.OperationalError("database is locked")
+                    self._conn.execute("COMMIT")
+                    committed = int(cur[0])
+                    committed_mac = cur[1] or new_mac
+                except Exception as exc:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    # Drop intent if SQL did not land — but leave it in place
+                    # for injected after_intent crashes so recovery tests see it.
+                    injected = (
+                        isinstance(exc, RetryRateIntegrityError)
+                        and "injected crash" in str(exc)
+                    )
+                    if not injected:
+                        try:
+                            rec = hwlock.read()
+                            if rec.intent is not None:
+                                hwlock.reconcile(rec.confirmed)
+                        except RetryRateIntegrityError:
+                            pass
+                    raise
+                _maybe_crash("after_sql_before_confirm")
+                hwlock.confirm(committed)
+                publish_rate_mac_to_anchor(committed_mac)
+                _maybe_crash("after_confirm")
+        return "rate_limited", None
+
+    def _ensure_open_window_unlocked(
+        self,
+        escrow_id: str,
+        *,
+        already_reason: str,
+        window_w: float,
+        now: float,
+        original_refusal_id: str | None,
+        cached: list[Receipt],
+    ) -> tuple[str, float, int, int, str, str]:
+        """
+        Return (window_id, window_start, chain_individual, rate_limited,
+        rate_mac, prev_rate_mac).
+        ``chain_individual`` comes from an indexed COUNT — not the side row.
+        Closes an expired open window first. Caller holds lock + transaction.
+        """
+        open_row = self._load_open_window_unlocked(escrow_id)
+        if open_row is None:
+            orphans = self._orphan_open_windows_from_chain_unlocked(escrow_id)
+            if orphans:
+                wid, n = orphans[0]
+                raise RetryRateIntegrityError(
+                    "retry rate side table missing open row mid-window for "
+                    f"escrow_id={escrow_id!r} window_id={wid!r} "
+                    f"(chain_individual={n}); refuse"
+                )
+        else:
+            wid, wstart, side_indiv, rlim, covered, rate_mac, prev_mac = open_row
+            wstart_f = float(wstart)
+            anchor = self._latest_denial_hash_unlocked(escrow_id, str(wid))
+            verify_rate_limited_mac(
+                anchor,
+                escrow_id,
+                str(wid),
+                int(rlim),
+                rate_mac or "",
+                prev_mac=prev_mac or "",
+                check_sidecar=False,
+            )
+            if (now - wstart_f) >= window_w:
+                tally = self._close_open_window_unlocked(
+                    escrow_id,
+                    str(wid),
+                    wstart_f,
+                    int(rlim),
+                    covered or "",
+                    original_refusal_id,
+                    rate_mac=rate_mac or "",
+                    prev_rate_mac=prev_mac or "",
+                )
+                if tally is not None:
+                    cached.append(tally)
+                open_row = None
+            else:
+                chain_indiv = self._count_already_denials_unlocked(
+                    escrow_id, str(wid)
+                )
+                if int(side_indiv) != chain_indiv:
+                    raise RetryRateIntegrityError(
+                        "retry rate side table individual mismatch for "
+                        f"escrow_id={escrow_id!r} window_id={str(wid)!r}: "
+                        f"side={int(side_indiv)} chain={chain_indiv}; refuse"
+                    )
+                return (
+                    str(wid),
+                    wstart_f,
+                    chain_indiv,
+                    int(rlim),
+                    rate_mac or "",
+                    prev_mac or "",
+                )
+
+        # No open window: insert one (or adopt a concurrent writer's).
+        # rate_mac stays empty until the first denial anchors it.
+        # Sidecar created only for brand-new windows (never from 0 when
+        # a DB row already exists without a file).
+        #
+        # Lock order must match increments: per-window flock THEN SQL
+        # BEGIN IMMEDIATE. The caller already opened BEGIN, so commit it
+        # before taking the flock (otherwise SQL→flock vs flock→SQL deadlocks).
+        self._conn.execute("COMMIT")
+        for _ in range(3):
+            wid = f"rw_{uuid.uuid4().hex}"
+            created = False
+            adopt_row = None
+            with high_water_create(escrow_id, wid, initial=0) as hwlock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                open_row = self._load_open_window_unlocked(escrow_id)
+                if open_row is not None:
+                    remove_high_water(escrow_id, wid)
+                    adopt_row = open_row
+                else:
+                    try:
+                        self._conn.execute(
+                            "INSERT INTO retry_rate_windows"
+                            " (escrow_id, window_id, window_start, individual,"
+                            "  rate_limited, covered_reason, tally_flushed,"
+                            "  rate_mac, prev_rate_mac)"
+                            " VALUES (?, ?, ?, 0, 0, ?, 0, '', '')",
+                            (escrow_id, wid, now, already_reason),
+                        )
+                    except sqlite3.IntegrityError:
+                        remove_high_water(escrow_id, wid)
+                        open_row = self._load_open_window_unlocked(escrow_id)
+                        if open_row is None:
+                            self._conn.execute("COMMIT")
+                            adopt_row = None
+                            created = False
+                        else:
+                            adopt_row = open_row
+                    else:
+                        # Leave creating intent (-1)+writer identity until
+                        # the outer COMMIT so concurrent startups see a
+                        # live pending file rather than an orphan.
+                        created = True
+                        self._hw_created_pending = (escrow_id, wid)
+            if created:
+                # BEGIN IMMEDIATE still open for the caller.
+                return wid, now, 0, 0, "", ""
+            if adopt_row is None:
+                try:
+                    in_tx = self._conn.in_transaction
+                except AttributeError:
+                    in_tx = True
+                if in_tx:
+                    try:
+                        self._conn.execute("COMMIT")
+                    except sqlite3.OperationalError:
+                        pass
+                continue
+            wid, wstart, side_indiv, rlim, covered, rate_mac, prev_mac = (
+                adopt_row
+            )
+            wstart_f = float(wstart)
+            anchor = self._latest_denial_hash_unlocked(escrow_id, str(wid))
+            verify_rate_limited_mac(
+                anchor,
+                escrow_id,
+                str(wid),
+                int(rlim),
+                rate_mac or "",
+                prev_mac=prev_mac or "",
+                check_sidecar=False,
+            )
+            if (now - wstart_f) >= window_w:
+                tally = self._close_open_window_unlocked(
+                    escrow_id,
+                    str(wid),
+                    wstart_f,
+                    int(rlim),
+                    covered or "",
+                    original_refusal_id,
+                    rate_mac=rate_mac or "",
+                    prev_rate_mac=prev_mac or "",
+                )
+                if tally is not None:
+                    cached.append(tally)
+                self._conn.execute("COMMIT")
+                continue
+            chain_indiv = self._count_already_denials_unlocked(
+                escrow_id, str(wid)
+            )
+            if int(side_indiv) != chain_indiv:
+                raise RetryRateIntegrityError(
+                    "retry rate side table individual mismatch for "
+                    f"escrow_id={escrow_id!r} window_id={str(wid)!r}: "
+                    f"side={int(side_indiv)} chain={chain_indiv}; refuse"
+                )
+            return (
+                str(wid),
+                wstart_f,
+                chain_indiv,
+                int(rlim),
+                rate_mac or "",
+                prev_mac or "",
+            )
+        self._conn.execute("BEGIN IMMEDIATE")
+        raise RuntimeError(
+            f"unable to open retry-rate window for escrow_id={escrow_id!r}"
+        )
+
+    def flush_open_retry_windows(
+        self,
+        *,
+        original_refusal_id_for,
+        escrow_id: str | None = None,
+    ) -> None:
+        """
+        Close open window(s): append tally if rate_limited>0, mark flushed.
+        original_refusal_id_for(escrow_id) -> str|None.
+        """
+        # Tally-time sidecar check first (flock → then SQL). Never hold a
+        # SQL write lock while waiting on the flock.
+        with self._lock:
+            if escrow_id is None:
+                pre = self._conn.execute(
+                    "SELECT escrow_id, window_id, rate_limited"
+                    " FROM retry_rate_windows WHERE tally_flushed = 0"
+                ).fetchall()
+            else:
+                pre = self._conn.execute(
+                    "SELECT escrow_id, window_id, rate_limited"
+                    " FROM retry_rate_windows"
+                    " WHERE tally_flushed = 0 AND escrow_id = ?",
+                    (escrow_id,),
+                ).fetchall()
+        for eid, wid, rlim in pre:
+            # Fresh probe under flock — no skew tolerance; intent reconcile only.
+            with high_water_lock(str(eid), str(wid)) as hwlock:
+                probe = sqlite3.connect(
+                    self._path,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                try:
+                    probe.execute("PRAGMA busy_timeout=30000")
+                    row = probe.execute(
+                        "SELECT rate_limited FROM retry_rate_windows"
+                        " WHERE escrow_id = ? AND window_id = ?"
+                        " AND tally_flushed = 0",
+                        (str(eid), str(wid)),
+                    ).fetchone()
+                finally:
+                    probe.close()
+                if row is None:
+                    continue
+                count = int(row[0])
+                hwlock.reconcile(count)
+                hwlock.check(count)
+
+        with self._lock:
+            cached: list[Receipt] = []
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if escrow_id is None:
+                    rows = self._conn.execute(
+                        "SELECT escrow_id, window_id, window_start,"
+                        " individual, rate_limited, covered_reason,"
+                        " rate_mac, prev_rate_mac"
+                        " FROM retry_rate_windows WHERE tally_flushed = 0"
+                    ).fetchall()
+                else:
+                    rows = self._conn.execute(
+                        "SELECT escrow_id, window_id, window_start,"
+                        " individual, rate_limited, covered_reason,"
+                        " rate_mac, prev_rate_mac"
+                        " FROM retry_rate_windows"
+                        " WHERE tally_flushed = 0 AND escrow_id = ?",
+                        (escrow_id,),
+                    ).fetchall()
+                for (
+                    eid, wid, wstart, _indiv, rlim, covered, rate_mac, prev_mac
+                ) in rows:
+                    # Flush closes even if W has not elapsed (clean shutdown).
+                    tally = self._close_open_window_unlocked(
+                        eid,
+                        wid,
+                        float(wstart),
+                        int(rlim),
+                        covered or "",
+                        original_refusal_id_for(eid),
+                        rate_mac=rate_mac or "",
+                        prev_rate_mac=prev_mac or "",
+                    )
+                    if tally is not None:
+                        cached.append(tally)
+                self._conn.execute("COMMIT")
+            except Exception:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            for r in cached:
+                self._cache_receipt_unlocked(r)
+
     def append(self, event_type: str, payload: dict) -> Receipt:
         with self._lock:
+            tally_key = (
+                _rate_tally_key(payload) if event_type == "REFUSED" else None
+            )
+            if tally_key is not None and tally_key in self._rate_tally_by_window:
+                return self._rate_tally_by_window[tally_key]
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 tip = self._conn.execute(
@@ -181,10 +1443,13 @@ class SqliteLedger:
                     timestamp=_utcnow_iso(),
                 )
                 try:
+                    eid, wid = _payload_escrow_window(payload)
+                    kind = _refusal_kind(event_type, payload)
                     self._conn.execute(
                         "INSERT INTO receipts"
-                        " (seq, prev_hash, event_type, payload, timestamp, hash)"
-                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        " (seq, prev_hash, event_type, payload, timestamp, hash,"
+                        "  escrow_id, window_id, refusal_kind)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             receipt.seq,
                             receipt.prev_hash,
@@ -196,14 +1461,56 @@ class SqliteLedger:
                             ),
                             receipt.timestamp,
                             receipt.hash,
+                            eid,
+                            wid,
+                            kind,
                         ),
                     )
                 except sqlite3.IntegrityError as exc:
+                    err = str(exc)
+                    # Idempotent re-append of a rate_limited tally window
+                    # (crash replay or a second writer on the same DB file).
+                    if tally_key is not None and "UNIQUE constraint failed" in err:
+                        self._conn.execute("ROLLBACK")
+                        existing = self._rate_tally_by_window.get(tally_key)
+                        if existing is not None:
+                            return existing
+                        row = self._conn.execute(
+                            "SELECT seq, prev_hash, event_type, payload,"
+                            " timestamp, hash FROM receipts"
+                            " WHERE event_type = 'REFUSED'"
+                            " AND json_extract(payload, '$.reason') = 'rate_limited'"
+                            " AND json_extract(payload, '$.escrow_id') = ?"
+                            " AND json_extract(payload, '$.window_id') = ?",
+                            tally_key,
+                        ).fetchone()
+                        if row is None:
+                            raise RuntimeError(
+                                "rate_limited window conflict with no existing row"
+                            ) from exc
+                        seq, prev_hash, et, payload_text, ts, stored_hash = row
+                        if seq < len(self._receipts):
+                            existing = self._receipts[seq]
+                            self._rate_tally_by_window[tally_key] = existing
+                            return existing
+                        receipt = Receipt(
+                            seq=seq,
+                            prev_hash=prev_hash,
+                            event_type=et,
+                            payload=json.loads(payload_text),
+                            timestamp=ts,
+                        )
+                        if receipt.hash != stored_hash:
+                            raise RuntimeError(
+                                "rate_limited conflict row hash mismatch"
+                            ) from exc
+                        self._rate_tally_by_window[tally_key] = receipt
+                        return receipt
                     # Either the link trigger fired (fail closed) or the
                     # idempotency index caught a re-append: return the
                     # existing row instead of writing a duplicate.
                     if payload.get("idempotency_key") is not None and (
-                        "UNIQUE constraint failed" in str(exc)
+                        "UNIQUE constraint failed" in err
                     ):
                         self._conn.execute("ROLLBACK")
                         row = self._conn.execute(
@@ -228,6 +1535,14 @@ class SqliteLedger:
                     raise RuntimeError(
                         "receipt insert rejected: %s" % (exc,)
                     ) from exc
+                # Same transaction: mark side-table row flushed for this tally.
+                if tally_key is not None:
+                    self._conn.execute(
+                        "UPDATE retry_rate_windows SET tally_flushed = 1,"
+                        " rate_limited = ?"
+                        " WHERE escrow_id = ? AND window_id = ?",
+                        (int(payload.get("count", 0)), tally_key[0], tally_key[1]),
+                    )
                 self._conn.execute("COMMIT")
             except Exception:
                 try:
@@ -241,6 +1556,8 @@ class SqliteLedger:
                 auth_id = payload.get("auth_id")
                 if isinstance(auth_id, str):
                     self._allowed_by_auth[auth_id] = receipt
+            if tally_key is not None:
+                self._rate_tally_by_window[tally_key] = receipt
             return receipt
 
     def allowed_receipt(self, auth_id: str) -> Receipt | None:
