@@ -239,12 +239,22 @@ def run_agent(tools, task: str, transcript_path: str,
         # (deliver after attempt_spend) follow the new ids.
         section, in_beat = [], False
         for line in open(replay):
+            if not line.strip():
+                continue
             obj = json.loads(line)
             if obj.get("type") == "beat":
                 in_beat = obj.get("n") == beat
                 continue
             if in_beat:
                 section.append(obj)
+        if not section:
+            transcript.close()
+            raise ValueError(
+                f"replay transcript {replay!r} has no turns for beat {beat}: "
+                "the file is empty, truncated, or missing that beat. "
+                "Record a live run first (sets PERMIT_GROK_CLI) or use a "
+                "complete recorded transcript; replay cannot invent actions."
+            )
         final = ""
         id_map: dict[str, str] = {}
         i = 0
