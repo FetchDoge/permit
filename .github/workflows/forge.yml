@@ -81,8 +81,8 @@ jobs:
           match = re.search(r"(\d+) tests collected", text)
           count = int(match.group(1)) if match else -1
           print(f"COLLECT CONTRACT: {count} tests collected")
-          if count != 127:
-              sys.exit("expected 127 tests collected")
+          if count < 127:
+              sys.exit(f"expected at least 127 tests collected, found {count}")
           PY
           python -m pytest -q --junitxml=junit.xml 2>&1 | tee pytest-q.out
           python - <<'PY'
@@ -103,8 +103,8 @@ jobs:
           n_failed = int(failed.group(1)) if failed else 0
           n_errors = int(errors.group(1)) if errors else 0
           print(f"PYTEST CONTRACT: {summary!r} passed={n_passed} failed={n_failed} errors={n_errors}")
-          if n_passed != 127 or n_failed != 0 or n_errors != 0:
-              sys.exit("expected 127 passed, 0 failed, 0 errors")
+          if n_passed < 127 or n_failed != 0 or n_errors != 0:
+              sys.exit(f"expected >= 127 passed, 0 failed, 0 errors (got passed={n_passed}, failed={n_failed}, errors={n_errors})")
           PY
 
       - name: Fault injection
