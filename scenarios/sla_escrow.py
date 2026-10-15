@@ -40,7 +40,6 @@ from settlement.verifier import (
     Evidence,
     PredicateType,
     ReleaseVerifier,
-    sign_acceptance,
 )
 
 MERCHANT = "report_foundry"
@@ -55,7 +54,7 @@ def run_sla_escrow(paypal, ledger: Ledger | None = None) -> dict:
     """Run the SLA escrow scenario. Returns a transcript dict of beats."""
     ledger = ledger if ledger is not None else Ledger()
     permits = PermitStore(ledger=ledger)
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
+    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=True)
     pipeline = SpendPipeline(permits, paypal, verifier, ledger=ledger)
     beats: list[dict] = []
     now = datetime.now(timezone.utc)
@@ -88,7 +87,7 @@ def run_sla_escrow(paypal, ledger: Ledger | None = None) -> dict:
     )
     assert attempt.allowed, f"spend blocked: {attempt.reason}"
     escrow_id = attempt.escrow_id
-    sig = sign_acceptance(escrow_id, artifact_hash, 4000)
+    sig = verifier.sign_acceptance(escrow_id, artifact_hash, 4000)
     result = pipeline.release(escrow_id, Evidence(acceptance_signature=sig))
     assert result.released, f"release failed: {result.reason}"
     parent = permits.get(client_permit.permit_id)

@@ -41,7 +41,7 @@ def build(cap_cents):
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     paypal = MockPayPalClient()
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
+    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=True)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
     permit, _ = permits.grant(
         agent_id="demo-agent",

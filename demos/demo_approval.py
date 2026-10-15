@@ -104,7 +104,7 @@ def main():
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     paypal = MockPayPalClient()
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
+    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=True)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
     dash = Dashboard(permits, ledger, flow, verifier, port=args.port).start()
     print(f"dashboard: http://127.0.0.1:{args.port}")

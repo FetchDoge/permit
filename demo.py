@@ -29,7 +29,7 @@ from permit.ledger import Ledger
 from permit.permit import PermitStore
 from permit.flow import SpendPipeline
 from settlement.paypal_client import MockPayPalClient
-from settlement.verifier import Evidence, PredicateType, ReleaseVerifier, sign_acceptance
+from settlement.verifier import Evidence, PredicateType, ReleaseVerifier
 
 
 def show(receipts, prefix=""):
@@ -51,7 +51,7 @@ def build_pipeline():
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     paypal = MockPayPalClient()
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
+    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=True)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
     return flow, paypal, permits, ledger
 

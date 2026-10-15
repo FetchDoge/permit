@@ -167,7 +167,7 @@ def main():
         lg = Ledger()
         ps = PermitStore(ledger=lg)
         spy = StrictSpy()
-        vf = ReleaseVerifier(spy, ps, ledger=lg)
+        vf = ReleaseVerifier(spy, ps, ledger=lg, allow_demo_key=True)
         fl = SpendPipeline(ps, spy, vf, ledger=lg)
         p2, _ = ps.grant("spy_agent", 1000, [merchant],
                          datetime.now(timezone.utc) + timedelta(hours=1))

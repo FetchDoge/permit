@@ -12,6 +12,12 @@ import os
 
 import pytest
 
+# Test-only acceptance key for the mock-rail suite (issue #35: the library
+# has no fallback key, so tests configure one explicitly via env).
+os.environ.setdefault(
+    "PERMIT_ACCEPTANCE_KEY", "permit-test-only-acceptance-key-0123456789"
+)
+
 _SANDBOX_CREDS = (
     os.environ.get("PERMIT_PAYPAL_CLIENT_ID"),
     os.environ.get("PERMIT_PAYPAL_CLIENT_SECRET"),

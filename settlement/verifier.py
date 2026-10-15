@@ -101,28 +101,60 @@ class ReconcileResult:
     receipt: Receipt | None = None
 
 
-# Acceptance key: the counterparty's key in production. Defaults to the
-# hardcoded demo key ONLY when PERMIT_ACCEPTANCE_KEY is unset, and says
-# so loudly — a payment authority layer must never silently run on a
-# demo key. (Audit item 12: env-provided keys now; KMS/HSM story next.)
+# Acceptance key (issue #35): there is NO fallback key in library code.
+# A known fallback key lets anyone forge Type A acceptances in a default
+# deployment, so construction fails closed: the key must come from the
+# caller or from PERMIT_ACCEPTANCE_KEY, and must be at least 32 bytes.
+# Demo code opts in explicitly with allow_demo_key=True, which generates
+# a fresh random key per verifier instance (per run), never a constant.
 import os as _os
+import secrets as _secrets
 
-DEMO_ACCEPTANCE_KEY = b"demo-acceptance-key-NOT-FOR-PRODUCTION"
-ACCEPTANCE_KEY = _os.environ.get("PERMIT_ACCEPTANCE_KEY", "").encode() or DEMO_ACCEPTANCE_KEY
-if ACCEPTANCE_KEY is DEMO_ACCEPTANCE_KEY:
-    import warnings as _warnings
-    _warnings.warn(
-        "PERMIT_ACCEPTANCE_KEY unset: running on the demo acceptance key. "
-        "Set PERMIT_ACCEPTANCE_KEY in any real deployment.",
-        RuntimeWarning,
-        stacklevel=2,
-    )
+MIN_ACCEPTANCE_KEY_BYTES = 32
 
 
-def sign_acceptance(escrow_id: str, artifact_hash: str, amount_cents: int) -> str:
-    """What the counterparty (acceptance key holder) does off-camera."""
+def _coerce_key(key: bytes | str | None) -> bytes | None:
+    if key is None:
+        return None
+    return key.encode() if isinstance(key, str) else bytes(key)
+
+
+def resolve_acceptance_key(
+    key: bytes | str | None = None, *, allow_demo_key: bool = False
+) -> bytes:
+    """Resolve and validate the acceptance key, failing closed.
+
+    Order: explicit ``key`` argument, then PERMIT_ACCEPTANCE_KEY.
+    Missing, empty, or short (under 32 byte) keys raise ValueError,
+    unless ``allow_demo_key`` is set, in which case a fresh per-call
+    random key is generated (demo use only, off by default).
+    """
+    resolved = _coerce_key(key)
+    if resolved is None:
+        resolved = _coerce_key(_os.environ.get("PERMIT_ACCEPTANCE_KEY"))
+    if resolved is None or len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
+        if allow_demo_key:
+            return _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
+        raise ValueError(
+            "acceptance key missing, empty, or under "
+            f"{MIN_ACCEPTANCE_KEY_BYTES} bytes: pass acceptance_key or set "
+            "PERMIT_ACCEPTANCE_KEY (fail closed, issue #35)"
+        )
+    return resolved
+
+
+def sign_acceptance(
+    escrow_id: str, artifact_hash: str, amount_cents: int, key: bytes | str
+) -> str:
+    """What the counterparty (acceptance key holder) does off-camera.
+
+    The key is required: there is no module-level key to fall back to.
+    """
+    resolved = _coerce_key(key)
+    if resolved is None or len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
+        raise ValueError("sign_acceptance requires a key of at least 32 bytes")
     msg = f"{escrow_id}|{artifact_hash}|{amount_cents}".encode()
-    return hmac.new(ACCEPTANCE_KEY, msg, hashlib.sha256).hexdigest()
+    return hmac.new(resolved, msg, hashlib.sha256).hexdigest()
 
 
 class ReleaseVerifier:
@@ -131,13 +163,34 @@ class ReleaseVerifier:
         paypal: PayPalClient,
         permits: PermitStore,
         ledger: Ledger | None = None,
+        *,
+        acceptance_key: bytes | str | None = None,
+        allow_demo_key: bool = False,
     ):
+        # Fail closed at construction (issue #35): no usable acceptance
+        # key, no verifier. Demo callers pass allow_demo_key=True and get
+        # a fresh random key for this instance only.
+        self._acceptance_key = resolve_acceptance_key(
+            acceptance_key, allow_demo_key=allow_demo_key
+        )
         self.paypal = paypal
         self.permits = permits
         # NOTE: explicit None check — an empty Ledger is falsy via __len__.
         self.ledger = ledger if ledger is not None else Ledger()
         self._escrows: dict[str, Escrow] = {}
         self._lock = threading.Lock()
+
+    def sign_acceptance(
+        self, escrow_id: str, artifact_hash: str, amount_cents: int
+    ) -> str:
+        """Sign with this verifier's acceptance key.
+
+        Demo/test convenience standing in for the off-camera counterparty
+        who holds the key in a real deployment.
+        """
+        return sign_acceptance(
+            escrow_id, artifact_hash, amount_cents, self._acceptance_key
+        )
 
     def register(self, escrow: Escrow) -> Receipt:
         """Register an escrow hold. Returns the AUTHORIZED receipt."""
@@ -229,7 +282,10 @@ class ReleaseVerifier:
             if evidence.acceptance_signature is None:
                 return False, "missing_acceptance_signature"
             expected = sign_acceptance(
-                escrow.escrow_id, escrow.artifact_hash, escrow.amount_cents
+                escrow.escrow_id,
+                escrow.artifact_hash,
+                escrow.amount_cents,
+                self._acceptance_key,
             )
             if not hmac.compare_digest(evidence.acceptance_signature, expected):
                 return False, "invalid_acceptance_signature"
