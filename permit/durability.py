@@ -27,6 +27,7 @@ import hmac
 import json
 import logging
 import os
+import threading
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -118,6 +119,13 @@ class DurableLedger(Ledger):
         super().__init__()
         self._durable_dir = _durable_dir(durable_dir)
         self._lock_fd: int | None = None
+        # Serializes the WHOLE durable append (in-memory receipt, ledger
+        # line + fsync, ledger.head rewrite). Ledger._lock alone only covers
+        # the in-memory step, so two threads could interleave their file
+        # writes out of seq order and collide on ledger.head.tmp. Separate
+        # from Ledger._lock so readers (receipts(), verify_chain()) are not
+        # blocked behind fsync.
+        self._append_lock = threading.Lock()
         self._ledger_fd: int | None = None
         self._ledger_ino: int | None = None
         self._ledger_dev: int | None = None
@@ -279,6 +287,10 @@ class DurableLedger(Ledger):
         return _ledger_tip(self.receipts())
 
     def append(self, event_type: str, payload: dict) -> Receipt:
+        with self._append_lock:
+            return self._append_locked(event_type, payload)
+
+    def _append_locked(self, event_type: str, payload: dict) -> Receipt:
         receipt = super().append(event_type, payload)
         if self._durable_dir is not None:
             assert self._ledger_fd is not None
@@ -304,7 +316,10 @@ class DurableLedger(Ledger):
             _fsync_dir(self._durable_dir)
             # Commit length/hash after the line is durable so a later truncate
             # of ledger.jsonl is detectable on reload.
-            self._write_committed_head(self.tip())
+            # Under _append_lock this receipt is the tip; derive it directly
+            # instead of copying the whole chain (tip() is O(n)).
+            self._write_committed_head(
+                {"len": receipt.seq + 1, "seq": receipt.seq, "hash": receipt.hash})
         return receipt
 
 
