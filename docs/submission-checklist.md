@@ -8,7 +8,7 @@ The live proof the judge must see, in one command, is: grant → allowed capture
 
 ## Functional demo
 
-**Status: ready.** A judge can run it from a fresh checkout, fully offline. Python 3.10 or newer. No pip install, no API key, no `.env`, no network. Measured on this tree (2026-10-14): `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` reaches `VERIFIED` (26 receipts) in about a second; the receipt chain is deterministic. The cascade is included. A live run (no `--replay`) instead drives the real LLM agent and requires `PERMIT_GROK_CLI` to be set; there is no `--hold` flag.
+**Status: ready.** A judge can run it from a fresh checkout, fully offline. Python 3.10 or newer. No pip install, no API key, no `.env`, no network. Measured on this tree (2026-10-14): `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` reaches `VERIFIED` (26 receipts) in about a second; the receipt chain is deterministic. The cascade is included. A live run (no `--replay`) instead drives the real LLM agent and requires `PERMIT_AGENT_CLI` to be set; there is no `--hold` flag.
 
 | What the judge does | Where it lives | What it shows |
 | --- | --- | --- |
@@ -72,4 +72,4 @@ The recording has to say the camera run is the mock. It must not say the six bea
 | --- | --- |
 | Internal review notes (`CHATGPT-CRITIQUE-ACTIONS.md`) | Process log. Removed from the tree. |
 | One-off sandbox spike (`spike.py`, `spike-report.md`) | Printed `VERIFIED` for API probes. That word is the ledger's word. The Oct 2 facts live in `docs/sandbox-runbook.md`, labeled as API observations. Removed from the tree. |
-| `--live` with no `PERMIT_GROK_CLI` | Stops immediately and prints the offline command. |
+| `--live` with no `PERMIT_AGENT_CLI` | Stops immediately and prints the offline command. |

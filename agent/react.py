@@ -22,11 +22,25 @@ import re
 import subprocess
 import sys
 
-# Path to the LLM runner CLI, set via the PERMIT_GROK_CLI environment
-# variable. There is no built-in default, so the repo carries no local paths.
+# Path to the LLM runner CLI, set via the PERMIT_AGENT_CLI environment
+# variable (deprecated alias: PERMIT_GROK_CLI, read only when
+# PERMIT_AGENT_CLI is unset). There is no built-in default, so the repo
+# carries no local paths.
 # Resolved at call time by _grok_cli(); this constant mirrors the value seen
 # at import time ("" when unset).
-GROK_CLI = os.environ.get("PERMIT_GROK_CLI", "")
+AGENT_CLI_ENV = "PERMIT_AGENT_CLI"
+LEGACY_AGENT_CLI_ENV = "PERMIT_GROK_CLI"  # deprecated alias
+
+
+def _agent_cli_env() -> str:
+    """Return the runner path: PERMIT_AGENT_CLI first, then the legacy alias."""
+    cli = os.environ.get(AGENT_CLI_ENV, "").strip()
+    if not cli:
+        cli = os.environ.get(LEGACY_AGENT_CLI_ENV, "").strip()
+    return cli
+
+
+GROK_CLI = _agent_cli_env()
 
 SYSTEM_TEMPLATE = """You are a shopping agent with a spending permit. You can spend ONLY \
 through your tools - you have no other way to move money.
@@ -107,15 +121,15 @@ def parse_action(text: str):
 
 
 def _grok_cli() -> str:
-    """Resolve the LLM runner path from PERMIT_GROK_CLI at call time.
+    """Resolve the LLM runner path from PERMIT_AGENT_CLI at call time.
 
     Raises RuntimeError with setup guidance when the variable is unset.
     """
-    cli = os.environ.get("PERMIT_GROK_CLI", "").strip()
+    cli = _agent_cli_env()
     if not cli:
         raise RuntimeError(
-            "agent LLM backend not configured: PERMIT_GROK_CLI is not set. "
-            "Set PERMIT_GROK_CLI to the path of your Grok runner script, or run "
+            "agent LLM backend not configured: PERMIT_AGENT_CLI is not set. "
+            "Set PERMIT_AGENT_CLI to the path of your agent runner script, or run "
             "the demo with --replay <transcript> (fully offline)."
         )
     return cli
@@ -133,7 +147,7 @@ def llm_preflight() -> None:
     if not os.path.isfile(cli):
         raise RuntimeError(
             f"agent LLM backend unavailable: {cli!r} is not a file. "
-            "Set PERMIT_GROK_CLI to the Grok runner, or run the demo with "
+            "Set PERMIT_AGENT_CLI to the agent runner, or run the demo with "
             "--replay <transcript> (fully offline)."
         )
 
@@ -252,7 +266,7 @@ def run_agent(tools, task: str, transcript_path: str,
             raise ValueError(
                 f"replay transcript {replay!r} has no turns for beat {beat}: "
                 "the file is empty, truncated, or missing that beat. "
-                "Record a live run first (sets PERMIT_GROK_CLI) or use a "
+                "Record a live run first (sets PERMIT_AGENT_CLI) or use a "
                 "complete recorded transcript; replay cannot invent actions."
             )
         final = ""

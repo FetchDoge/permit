@@ -17,7 +17,7 @@ the fixture does not need regenerating when id generation changes —
 only when tool names/args or the beat tasks change.
 
 Re-recording against this HEAD with a live agent is the cleaner
-long-term state; it requires `PERMIT_GROK_CLI`, which the recording
+long-term state; it requires `PERMIT_AGENT_CLI`, which the recording
 environment must provide. Until then this file — replay-verified,
 not re-recorded — is the judge path, and it is labelled as such
 everywhere it is cited.
