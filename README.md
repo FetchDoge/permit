@@ -2,7 +2,7 @@
 
 **Permit puts enforceable spending authority between AI agents and PayPal. Every decision, allowed or blocked, writes a hash-chained receipt.**
 
-[![ci](https://github.com/marsojuji-cmyk/permit/actions/workflows/ci.yml/badge.svg)](https://github.com/marsojuji-cmyk/permit/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+[![ci](https://github.com/FetchDoge/permit/actions/workflows/ci.yml/badge.svg)](https://github.com/FetchDoge/permit/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 
 No spend without a permit. No timeout without a receipt.
 
@@ -99,7 +99,7 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 **Actors:** the **payer** approves, the **merchant** delivers, the **Permit operator** issues permits and holds the e-stop, and the **credential owner** holds the PayPal secret. The agent never holds credentials.
 
-**Lineage:** [Interlock](https://github.com/marsojuji-cmyk/interlock) is the conceptual origin of the leased-authority model. This repo's ledger is standalone.
+**Lineage:** [Interlock](https://github.com/FetchDoge/interlock) is the conceptual origin of the leased-authority model. This repo's ledger is standalone.
 
 ## Evidence
 
