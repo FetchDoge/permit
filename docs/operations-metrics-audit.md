@@ -1,4 +1,4 @@
-# Cook Supply-Chain / NVIDIA-Metrics Audit
+# Operations and metrics audit (supply-chain lens)
 
 **Date:** 2026-10-10
 **Lens:** Tim Cook's operations doctrine, applied to Permit as if it were a
@@ -197,7 +197,6 @@ earnings call.
 - Fortune profile of Tim Cook (2008), via secondary quotation;
   supplychaindigital.com; EE Times on Lashinsky's *Inside Apple*
 - Apple Q4 FY2021 earnings call transcript (Motley Fool)
-- Full research notes: `~/workspace/research_notes/cook-supply-chain-nvidia-metrics-20261011-0248/`
 
 *Inventory turns (~10.7 days Apple, ~92 days NVIDIA FY26) are derived
 arithmetic, not company-reported. TSMC share, "two suppliers per

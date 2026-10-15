@@ -1,8 +1,8 @@
 # SQLite durability design
 
-**Source:** Grok architect draft (2026-10-10, $0.0565), grounded against
-`permit/ledger.py` by Ektar. **Status:** design accepted; implementation
-is the heavy build (builder crew).
+**Source:** AI-assisted architecture draft (2026-10-10, $0.0565), checked
+against `permit/ledger.py`. **Status:** design accepted; implementation
+is the heavy build.
 
 ## Problem
 
@@ -84,7 +84,7 @@ forbidden.
 3. **Fail closed vs truncate-and-serve:** refuse to serve on any
    failure. Recovery is an operator procedure, not an automatic one.
 
-## Grounded facts (Ektar, from `permit/ledger.py`)
+## Grounded facts (from `permit/ledger.py`)
 
 - Genesis: `seq=0`, `prev_hash="0"*64` (`GENESIS_HASH`).
 - `Receipt.hash` = sha256 over canonical JSON
