@@ -51,7 +51,7 @@ The recording has to say the camera run is the mock. It must not say the six bea
 
 | Artifact | Status |
 | --- | --- |
-| `LICENSE` (MIT) | In the repo. |
+| `LICENSE` (Apache-2.0) and `NOTICE` | In the repo. |
 | README cold-start | In the repo. One command, stdlib only, reaches the running dashboard. |
 | This checkout's git remote | None. The public GitHub URL is a Devpost field still to fill. Do not treat a local branch as the published remote. |
 
