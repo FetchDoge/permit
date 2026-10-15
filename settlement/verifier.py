@@ -35,6 +35,7 @@ Retries return the same capture; the money moves at most once.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import threading
@@ -257,6 +258,22 @@ class ReleaseVerifier:
 
     def verify_and_capture(self, escrow_id: str, evidence: Evidence) -> VerifyResult:
         """
+        Single-flight, fail-closed release (see _verify_and_capture).
+
+        Once the late admission recheck takes settlement_gate, the gate stays
+        held until the outcome is committed (CAPTURED receipt, permit
+        settlement). An E-STOP is therefore receipted either before the
+        recheck (capture refused) or after CAPTURED, never in between (#22).
+        The gate is an RLock; gate_hold re-enters it and releases it when this
+        call returns or raises.
+        """
+        with contextlib.ExitStack() as gate_hold:
+            return self._verify_and_capture(escrow_id, evidence, gate_hold)
+
+    def _verify_and_capture(
+        self, escrow_id: str, evidence: Evidence, gate_hold: contextlib.ExitStack
+    ) -> VerifyResult:
+        """
         Single-flight, fail-closed release. The ONLY path to capture.
 
         Three phases:
@@ -350,6 +367,10 @@ class ReleaseVerifier:
             outcome = ("refused", self._void_hold_outside_lock(paypal_auth_id))
         else:
             with self.permits.settlement_gate:
+                # Keep the gate through Phase 3 so the commit cannot be
+                # overtaken by an E-STOP receipt (lock order: gate -> verifier
+                # -> permit, same as estop_cascade's gate -> permit).
+                gate_hold.enter_context(self.permits.settlement_gate)
                 late_reason = self.permits.release_block_reason(permit_id)
                 if late_reason is not None:
                     # Refuse: void the hold (I/O, no verifier lock).
@@ -407,7 +428,8 @@ class ReleaseVerifier:
                         else:
                             outcome = ("captured", capture)
 
-        # ---- Phase 3: commit. Verifier lock held, no provider I/O. ----
+        # ---- Phase 3: commit. Verifier lock held, no provider I/O. Still
+        # under settlement_gate when the release was admitted (Phase 2). ----
         with self._lock:
             escrow = self._escrows.get(escrow_id)
             # The escrow cannot vanish mid-flight (only this method drives
