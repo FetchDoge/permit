@@ -73,7 +73,7 @@ Permit fails closed. When state is uncertain, money does not move.
 **What it does not defend (production boundaries):**
 - With `--db PATH`, the SQLite ledger is durable (#24): survives crashes, restarts and a second writer on one machine; after some crashes an operator step is needed (rate unmeasured). Durable mode restores permits and reservations from receipts, but does not restore escrows, pending ops, or approvals (F3). Default (in-memory) mode still loses permits, escrows, revocations, and the ledger on restart.
 - HTTP POSTs require a single shared bearer token (`PERMIT_API_TOKEN`, #23) with no role split between principal and agent (F5). GETs, including `/api/ledger`, are unauthenticated; the server binds to 127.0.0.1.
-- Predicate A acceptance falls back to a hardcoded demo key when `PERMIT_ACCEPTANCE_KEY` is unset (F12).
+- Predicate A acceptance fails closed: the verifier refuses to construct without a configured acceptance key of at least 32 bytes (`PERMIT_ACCEPTANCE_KEY`); demos opt in explicitly to a per-run generated key (F12, #35).
 - The ledger is a hash chain, not a signature. It detects edits and reordering, but it cannot detect removal of final entries without an external checkpoint.
 - It is a single-merchant sandbox prototype, not a claim about all agent payments.
 - E-stop voids uncaptured authorizations. A completed capture needs a refund path, which is out of scope.

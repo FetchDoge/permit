@@ -13,7 +13,6 @@ from settlement.verifier import (
     Evidence,
     PredicateType,
     ReleaseVerifier,
-    sign_acceptance,
 )
 
 
@@ -63,7 +62,7 @@ def test_happy_path_type_d():
 
 def test_happy_path_type_a():
     verifier, paypal, permits, escrow, artifact = _setup(PredicateType.A)
-    sig = sign_acceptance("esc_1", escrow.artifact_hash, 3000)
+    sig = verifier.sign_acceptance("esc_1", escrow.artifact_hash, 3000)
     result = verifier.verify_and_capture("esc_1", Evidence(acceptance_signature=sig))
     assert result.released
     assert len(paypal.capture_calls) == 1
@@ -111,7 +110,7 @@ def test_n2_worker_signature_without_acceptance_no_capture():
 def test_replay_signature_on_other_escrow_fails():
     """Acceptance signature is bound to escrow id; replay fails."""
     verifier, paypal, permits, escrow, artifact = _setup(PredicateType.A)
-    sig_for_esc1 = sign_acceptance("esc_1", escrow.artifact_hash, 3000)
+    sig_for_esc1 = verifier.sign_acceptance("esc_1", escrow.artifact_hash, 3000)
     # Attacker replays esc_1's signature against a different escrow id.
     escrow.escrow_id = "esc_2"
     result = verifier.verify_and_capture(

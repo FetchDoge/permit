@@ -527,7 +527,7 @@ def main():
         paypal = MockPayPalClient()
         log.info("mock rail (no network, no credentials)")
 
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
+    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=MOCK_MODE)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
 
     if args.db:
@@ -539,7 +539,7 @@ def main():
         folded = fold_receipts(db_ledger.receipts())
         folded.ledger = db_ledger
         ledger, permits = db_ledger, folded
-        verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
+        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=MOCK_MODE)
         flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
         log.info(f"durable ledger at {args.db}"
                  f" ({len(ledger)} receipts restored)")
