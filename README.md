@@ -116,6 +116,10 @@ The project builds in the open toward the Nov 12, 2026 hackathon deadline.
 - **Implemented and tested:** permit core, 4-clause authority gate, spend pipeline, release verifier with UNKNOWN → reconcile, PayPal sandbox client with merchant binding and idempotent capture, e-stop with in-flight handling, delegation with cascade revoke, principal approvals, the agent spender, and the six-beat mock demo.
 - **Remaining:** the integrated sandbox run, the video (by Nov 8), and the Devpost package (by Nov 10).
 
+## Acknowledgments
+
+Two community PRs (#3, #10) were merged during development; neither remains in the current code. Built by Marcus Richards, directing AI coding agents.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
