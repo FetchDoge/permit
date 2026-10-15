@@ -92,7 +92,7 @@ def test_six_beat_replay_missing_beat4_is_named(tmp_path):
 
 
 def test_failed_live_run_preserves_transcript(tmp_path):
-    # A live run that fails preflight (no PERMIT_GROK_CLI) must not
+    # A live run that fails preflight (no PERMIT_AGENT_CLI) must not
     # truncate the existing recording — the 2026-10-14 self-destruction
     # mechanism this suite now guards.
     work = tmp_path / "repo"
@@ -103,7 +103,7 @@ def test_failed_live_run_preserves_transcript(tmp_path):
             "demo_transcript.replay.jsonl"))
     seeded = work / "demo_transcript.jsonl"
     seeded.write_bytes(SIX_BEAT_FIXTURE.read_bytes())
-    env = {k: v for k, v in os.environ.items() if k != "PERMIT_GROK_CLI"}
+    env = {k: v for k, v in os.environ.items() if k not in ("PERMIT_AGENT_CLI", "PERMIT_GROK_CLI")}
     proc = subprocess.run(
         [sys.executable, "demos/demo_six_beat.py", "--fast", "--port", "8499"],
         cwd=work, capture_output=True, text=True, timeout=120, env=env)

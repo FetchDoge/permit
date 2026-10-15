@@ -126,7 +126,7 @@ def main():
         if not _os.path.isfile(args.replay) or _os.path.getsize(args.replay) == 0:
             raise SystemExit(
                 f"replay transcript {args.replay!r} is missing or empty: "
-                "record a live run first (sets PERMIT_GROK_CLI) or pass a "
+                "record a live run first (sets PERMIT_AGENT_CLI) or pass a "
                 "complete recorded transcript."
             )
 
