@@ -1,5 +1,5 @@
 """
-ReAct runner: a real LLM (Grok) driving the spend tools in a loop.
+ReAct runner: a real LLM driving the spend tools in a loop.
 
 The LLM reasons in THOUGHT lines, acts with ACTION + ARGS lines, reads
 OBSERVATION lines, and finishes with ANSWER. The runner executes only
@@ -107,7 +107,7 @@ def parse_action(text: str):
 
 
 def _grok_cli() -> str:
-    """Resolve the Grok runner path from PERMIT_GROK_CLI at call time.
+    """Resolve the LLM runner path from PERMIT_GROK_CLI at call time.
 
     Raises RuntimeError with setup guidance when the variable is unset.
     """
@@ -196,7 +196,7 @@ def _learn_ids(recorded_text: str, fresh_text: str,
 
 
 def llm_turn(system: str, history: str) -> str:
-    """One Grok call. Returns the raw text (receipt stripped)."""
+    """One LLM call. Returns the raw text (receipt stripped)."""
     proc = subprocess.run(
         [sys.executable, _grok_cli(), "chat", history,
          "--system", system, "--temperature", "0.3",

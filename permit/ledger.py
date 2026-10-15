@@ -9,7 +9,7 @@ Each receipt commits to the previous receipt's hash. A deleted receipt,
 a reordered sequence, or a tampered payload breaks the chain, and the
 settlement verifier refuses to proceed on a broken chain.
 
-No external format dependency (Interlock cut 2026-10-02, Grok review).
+No external format dependency (Interlock cut 2026-10-02, agent review).
 Demo keys are hardcoded and labeled as such — no key-management scope.
 """
 

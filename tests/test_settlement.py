@@ -183,7 +183,7 @@ def _original_refusal_hash(ledger, escrow_id: str) -> str | None:
 
 
 def test_retry_on_refused_or_voided_writes_denial_receipt():
-    """REA F6: every refused retry on an already REFUSED/VOIDED escrow must
+    """Review F6: every refused retry on an already REFUSED/VOIDED escrow must
     append a denial receipt with a unique receipt_id referencing the original
     refusal; capture must never run; hash chain stays valid."""
     for terminal, expected_reason, first_release in (
@@ -229,7 +229,7 @@ def test_retry_on_refused_or_voided_writes_denial_receipt():
 
 
 def test_retry_denial_receipts_serial_and_parallel():
-    """REA F6 concurrency: 25 serial + 25 parallel refused retries each write a
+    """Review F6 concurrency: 25 serial + 25 parallel refused retries each write a
     unique denial receipt referencing the original refusal; none capture."""
     import threading
 
