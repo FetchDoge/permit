@@ -4,7 +4,7 @@
 import os
 import sys
 
-ROOT = os.path.expanduser("~/workspace/permit-main")
+ROOT = os.environ.get("PERMIT_ROOT", os.path.dirname(os.path.abspath(__file__)))
 
 env = dict(os.environ)
 with open(os.path.join(ROOT, ".env.sandbox")) as fh:
