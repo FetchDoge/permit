@@ -120,11 +120,11 @@ jobs:
           mkdir -p "$root/forge-demos"
           (cd /tmp && /tmp/forge-venv/bin/permit demo) 2>&1 | tee "$root/forge-demos/demo.out"
           (cd /tmp && /tmp/forge-venv/bin/permit demo-recovery) 2>&1 | tee "$root/forge-demos/demo-recovery.out"
-          c12=$(grep -c "LEDGER VERIFIED: 12" "$root/forge-demos/demo.out" || true)
+          c13=$(grep -c "LEDGER VERIFIED: 13" "$root/forge-demos/demo.out" || true)
           c6=$(grep -c "LEDGER VERIFIED: 6" "$root/forge-demos/demo-recovery.out" || true)
-          echo "demo LEDGER VERIFIED: 12 count=${c12}"
+          echo "demo LEDGER VERIFIED: 13 count=${c13}"
           echo "demo-recovery LEDGER VERIFIED: 6 count=${c6}"
-          test "$c12" -eq 1
+          test "$c13" -eq 1
           test "$c6" -eq 1
           grep -q "OFFLINE MOCK ONLY" "$root/forge-demos/demo.out"
           grep -q "NO DUPLICATE MOCK CAPTURE" "$root/forge-demos/demo-recovery.out"
