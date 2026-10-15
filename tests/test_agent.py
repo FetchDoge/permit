@@ -97,7 +97,7 @@ def test_system_prompt_lists_catalog():
 
 
 def test_llm_preflight_fails_with_guidance_when_cli_missing(monkeypatch):
-    """A missing Grok runner fails fast with setup guidance — not mid-demo."""
+    """A missing LLM runner fails fast with setup guidance — not mid-demo."""
     monkeypatch.setenv("PERMIT_GROK_CLI", "/nonexistent-xyz/grok.py")
     with pytest.raises(RuntimeError) as exc:
         llm_preflight()

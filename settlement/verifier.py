@@ -204,7 +204,7 @@ class ReleaseVerifier:
         return original_refused or original_voided
 
     def _append_retry_denial(self, escrow_id: str, reason: str) -> Receipt:
-        """REA F6: unique denial receipt for a refused retry; never captures."""
+        """Review F6: unique denial receipt for a refused retry; never captures."""
         original = self._original_refusal_id(escrow_id)
         return self.ledger.append(
             "REFUSED",
@@ -305,7 +305,7 @@ class ReleaseVerifier:
             if escrow.state == "CAPTURED":
                 return VerifyResult(True, "already_captured")
             if escrow.state in ("VOIDED", "REFUSED"):
-                # REA F6: every refused retry writes a unique denial receipt
+                # Review F6: every refused retry writes a unique denial receipt
                 # referencing the original refusal; money is never captured.
                 reason = f"already_{escrow.state.lower()}"
                 self._append_retry_denial(escrow_id, reason)

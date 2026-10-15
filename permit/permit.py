@@ -1,7 +1,7 @@
 """
 Permit: the authorization layer. Decides what an agent is ALLOWED to spend.
 
-Authority check (Grok review fix — cumulative reservation):
+Authority check (agent review fix — cumulative reservation):
     amount(a) <= remaining(P)
     AND merchant(a) IN allowlist(P)
     AND now < expiry(P)

@@ -10,7 +10,7 @@ use this path.
 
 Atomic write: write to *.tmp + fsync + os.rename + fsync dir.
 
-Integrity (REA R2):
+Integrity (review R2):
   - Exclusive writer flock for the process lifetime; a second opener fails closed.
   - ledger.head binding records committed length/hash; truncation fails closed.
   - permits.json is bound to the ledger head (hash + HMAC); rewind fails closed.

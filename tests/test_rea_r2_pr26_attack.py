@@ -1,6 +1,6 @@
-"""REA R2 attack suite vs Permit PR #26 durability (file-backed).
+"""Review R2 attack suite vs Permit PR #26 durability (file-backed).
 
-Ports the axes from the REA R2 review onto permit/durability.py.
+Ports the axes from the R2 review onto permit/durability.py.
 Each test that previously ACCEPTed a bypass must now REJECT (fail closed)
 or retain the reservation (axis E).
 """

@@ -1,8 +1,8 @@
 """
 Permit six-beat demo (mock PayPal rail: no PayPal credentials, no PayPal network).
 
-The human principal grants the permit; a REAL LLM agent (Grok, ReAct loop)
-decides what to spend — the agent's reasoning needs the Grok CLI (network
+The human principal grants the permit; a REAL LLM agent (ReAct loop)
+decides what to spend — the agent's reasoning needs the LLM CLI (network
 + credential) unless --replay is given. The fully offline, deterministic
 camera path is --replay demo_transcript.jsonl: the recorded reasoning is
 replayed verbatim and the recorded actions are re-executed against the
