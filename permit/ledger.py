@@ -58,6 +58,10 @@ class Receipt:
 class Ledger:
     """Thread-safe append-only receipt log with chain verification."""
 
+    # In-memory only: ReleaseVerifier skips acceptance-key commitment.
+    # Durable ledgers must leave this False (fail-closed default).
+    ephemeral_acceptance_key_commitment = True
+
     def __init__(self):
         self._lock = threading.Lock()
         self._receipts: list[Receipt] = []

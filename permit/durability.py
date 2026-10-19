@@ -132,9 +132,6 @@ class DurableLedger(Ledger):
         self._ledger_path: Path | None = None
         self._head_path: Path | None = None
         self._meta_path: Path | None = None
-        # File-backed durable stores must bind the acceptance-key commitment
-        # (REA seq 1888). Ephemeral DurableLedger (no dir) does not.
-        self.requires_acceptance_key_commitment = self._durable_dir is not None
         if self._durable_dir is not None:
             self._ledger_path = self._durable_dir / "ledger.jsonl"
             self._head_path = self._durable_dir / "ledger.head"
@@ -217,12 +214,30 @@ class DurableLedger(Ledger):
         except Exception:
             pass
 
+    @property
+    def ephemeral_acceptance_key_commitment(self) -> bool:
+        """Only a DurableLedger without durable_dir is ephemeral."""
+        return self._durable_dir is None
+
+    @property
+    def requires_acceptance_key_commitment(self) -> bool:
+        return not self.ephemeral_acceptance_key_commitment
+
     def _read_meta(self) -> dict:
-        if self._meta_path is None or not self._meta_path.exists():
+        """Load meta.json. Missing file → {}; corrupt file → ValueError (never empty)."""
+        if self._meta_path is None:
+            return {}
+        if not self._meta_path.exists():
             return {}
         try:
-            raw = json.loads(self._meta_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+            text = self._meta_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"corrupt durable meta.json: {exc}") from exc
+        if not text.strip():
+            raise ValueError("corrupt durable meta.json: empty file")
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as exc:
             raise ValueError(f"corrupt durable meta.json: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("corrupt durable meta.json: not an object")
@@ -231,8 +246,8 @@ class DurableLedger(Ledger):
     def get_meta(self, key: str) -> str | None:
         """Return a durable meta value, or None if unset.
 
-        Required for acceptance-key commitment when
-        ``requires_acceptance_key_commitment`` is true (REA seq 1888).
+        Required for acceptance-key commitment when the ledger is not
+        ephemeral (REA seq 1888 / round 5).
         """
         if self._meta_path is None:
             raise ValueError(
@@ -253,6 +268,23 @@ class DurableLedger(Ledger):
             meta = self._read_meta()
             meta[str(key)] = str(value)
             _atomic_write_json(self._meta_path, meta)
+
+    def try_bind_meta(self, key: str, value: str) -> str:
+        """Bind ``key`` only if absent; re-read and return the stored value."""
+        if self._meta_path is None:
+            raise ValueError(
+                "durable ledger cannot store acceptance key commitment "
+                "without durable_dir (refusing silent skip)"
+            )
+        with self._lock:
+            meta = self._read_meta()
+            if key not in meta:
+                meta[str(key)] = str(value)
+                _atomic_write_json(self._meta_path, meta)
+                meta = self._read_meta()
+            if key not in meta:
+                raise RuntimeError(f"meta bind failed for key {key!r}")
+            return str(meta[key])
 
     def _read_committed_head(self) -> dict | None:
         if self._head_path is None or not self._head_path.exists():
@@ -320,6 +352,10 @@ class DurableLedger(Ledger):
         ok, reason = self.verify_chain()
         if not ok:
             raise ValueError(f"ledger chain broken on load: {reason}")
+
+        # Fail closed on corrupt meta.json at open (never treat as empty).
+        if self._meta_path is not None and self._meta_path.exists():
+            self._read_meta()
 
         # Advance or create the committed head to match the loaded tip.
         if committed is None or int(committed.get("len", -1)) < tip["len"]:

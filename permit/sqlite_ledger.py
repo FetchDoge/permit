@@ -92,9 +92,6 @@ class SqliteLedger:
             raise ValueError("path is required")
         self._lock = threading.Lock()
         self._path = path
-        # File-backed sqlite must bind the acceptance-key commitment; an
-        # in-memory db is ephemeral and does not (REA seq 1888).
-        self.requires_acceptance_key_commitment = path != ":memory:"
         # check_same_thread=False: the lock (not the connection) is the
         # cross-thread guard; without this the shared connection is a trap.
         self._conn = sqlite3.connect(
@@ -279,6 +276,15 @@ class SqliteLedger:
             receipts = list(self._receipts)
         return self._verify_receipts(receipts)
 
+    @property
+    def ephemeral_acceptance_key_commitment(self) -> bool:
+        """Only ``:memory:`` is ephemeral; file-backed cannot opt out (seq 1888)."""
+        return self._path == ":memory:"
+
+    @property
+    def requires_acceptance_key_commitment(self) -> bool:
+        return not self.ephemeral_acceptance_key_commitment
+
     def get_meta(self, key: str) -> str | None:
         """Return a meta value, or None if unset."""
         with self._lock:
@@ -295,6 +301,24 @@ class SqliteLedger:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+    def try_bind_meta(self, key: str, value: str) -> str:
+        """Atomically bind ``key`` on first write (INSERT OR IGNORE), then re-read.
+
+        Concurrent first-boot: the winner's value sticks; losers re-read and
+        compare (REA seq round 5).
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
+                (key, value),
+            )
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"meta bind failed for key {key!r}")
+            return str(row[0])
 
     def close(self) -> None:
         """Close the database connection. The instance must not be used after."""

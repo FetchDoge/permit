@@ -131,13 +131,26 @@ def acceptance_key_commitment(key: bytes) -> str:
     return hmac.new(key, ACCEPTANCE_KEY_COMMITMENT_MSG, hashlib.sha256).hexdigest()
 
 
-def ensure_acceptance_key_commitment(db_ledger, key: bytes) -> None:
-    """Bind ``key`` to a durable ledger on first use; refuse rotation.
+_SILENT_REBIND_MSG = (
+    "acceptance key commitment missing on nonempty durable ledger: "
+    "refusing silent rebind (use rebind_acceptance_key_commitment "
+    "with the old key to migrate)"
+)
+_ROTATION_REFUSE_MSG = (
+    "acceptance key commitment mismatch with durable ledger: "
+    "rotating the acceptance key on an existing database refuses "
+    "startup (use rebind_acceptance_key_commitment with the old key)"
+)
 
-    Every durable ledger entry point (SqliteLedger ``--db``, DurableLedger /
-    harness) must call this after resolving the acceptance key. Rotating the
-    key on an existing store refuses startup — there is no rebind for now
-    (REA seq 1854 / 1888).
+
+def ensure_acceptance_key_commitment(db_ledger, key: bytes) -> None:
+    """Bind ``key`` to a durable ledger on first use; refuse silent rebind.
+
+    Only an *empty* store may bind a key for the first time. A nonempty store
+    without a commitment refuses startup (no silent rebind). Concurrent
+    first-boot uses ``try_bind_meta`` (INSERT OR IGNORE + re-read/compare)
+    when available. Rotating the key without ``rebind_acceptance_key_commitment``
+    refuses startup (REA seq 1854 / 1888 / round 5).
     """
     # Imported here to keep settlement.verifier free of a hard sqlite import
     # cycle at module load for callers that never touch durable mode.
@@ -146,29 +159,81 @@ def ensure_acceptance_key_commitment(db_ledger, key: bytes) -> None:
     digest = acceptance_key_commitment(key)
     stored = db_ledger.get_meta(ACCEPTANCE_KEY_COMMITMENT_META)
     if stored is None:
-        db_ledger.set_meta(ACCEPTANCE_KEY_COMMITMENT_META, digest)
+        if len(db_ledger) > 0:
+            raise ValueError(_SILENT_REBIND_MSG)
+        try_bind = getattr(db_ledger, "try_bind_meta", None)
+        if callable(try_bind):
+            bound = try_bind(ACCEPTANCE_KEY_COMMITMENT_META, digest)
+        else:
+            db_ledger.set_meta(ACCEPTANCE_KEY_COMMITMENT_META, digest)
+            bound = db_ledger.get_meta(ACCEPTANCE_KEY_COMMITMENT_META)
+        if bound is None or not hmac.compare_digest(str(bound), digest):
+            raise ValueError(_ROTATION_REFUSE_MSG)
         return
     if not hmac.compare_digest(stored, digest):
+        raise ValueError(_ROTATION_REFUSE_MSG)
+
+
+def rebind_acceptance_key_commitment(
+    db_ledger,
+    old_key: bytes | str,
+    new_key: bytes | str,
+) -> None:
+    """One-time migration: verify ``old_key``, then bind exact-32 ``new_key``.
+
+    Pre-exact-32 databases (e.g. bound at 19b62ce with ``token_hex(32)`` /
+    64 UTF-8 bytes) are locked out after the exact-32 upgrade. Operators pass
+    the OLD key (any non-empty length) plus a new exact-32-byte key. The OLD
+    key is checked against the stored commitment; on match the commitment is
+    replaced atomically via ``set_meta``.
+    """
+    from permit.sqlite_ledger import ACCEPTANCE_KEY_COMMITMENT_META
+
+    old = _coerce_key(old_key)
+    if old is None or old.strip() == b"":
+        raise ValueError("old acceptance key is empty or whitespace-only")
+    new = _coerce_key(new_key)
+    if new is None:
+        raise ValueError("new acceptance key is empty")
+    new = _require_valid_key(new, what="new acceptance key")
+
+    stored = db_ledger.get_meta(ACCEPTANCE_KEY_COMMITMENT_META)
+    if stored is None:
         raise ValueError(
-            "acceptance key commitment mismatch with durable ledger: "
-            "rotating the acceptance key on an existing database refuses "
-            "startup (no rebind for now)"
+            "no acceptance key commitment to rebind on this durable ledger"
         )
+    if not hmac.compare_digest(stored, acceptance_key_commitment(old)):
+        raise ValueError(
+            "old acceptance key does not match stored commitment; "
+            "refusing rebind"
+        )
+    new_digest = acceptance_key_commitment(new)
+    db_ledger.set_meta(ACCEPTANCE_KEY_COMMITMENT_META, new_digest)
+    bound = db_ledger.get_meta(ACCEPTANCE_KEY_COMMITMENT_META)
+    if bound is None or not hmac.compare_digest(str(bound), new_digest):
+        raise RuntimeError("acceptance key rebind failed to persist")
 
 
 def _bind_ledger_acceptance_key_commitment(ledger, key: bytes) -> None:
-    """Enforce commitment on durable ledgers; never skip silently (seq 1888).
+    """Enforce commitment unless the ledger is explicitly ephemeral (round 5).
 
-    Ledgers that opt in via ``requires_acceptance_key_commitment`` must expose
-    ``get_meta`` / ``set_meta``. Ephemeral in-memory ``Ledger`` does not opt
-    in and is left unbound.
+    Fail-closed default: commitment is *required*. Only ledgers marked
+    ``ephemeral_acceptance_key_commitment`` (in-memory ``Ledger``,
+    ``:memory:`` SqliteLedger, DurableLedger without ``durable_dir``) skip.
+    File-backed SqliteLedger cannot opt out (property with no setter).
     """
-    requires = bool(
-        getattr(ledger, "requires_acceptance_key_commitment", False)
+    ephemeral_prop = getattr(
+        type(ledger), "ephemeral_acceptance_key_commitment", None
     )
-    has_meta = hasattr(ledger, "get_meta") and hasattr(ledger, "set_meta")
-    if not requires:
+    if isinstance(ephemeral_prop, property) and ephemeral_prop.fget is not None:
+        ephemeral = bool(ephemeral_prop.fget(ledger))
+    else:
+        ephemeral = bool(
+            getattr(ledger, "ephemeral_acceptance_key_commitment", False)
+        )
+    if ephemeral:
         return
+    has_meta = hasattr(ledger, "get_meta") and hasattr(ledger, "set_meta")
     if not has_meta:
         raise ValueError(
             "durable ledger cannot store acceptance key commitment "
