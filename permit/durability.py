@@ -596,8 +596,8 @@ class DurableMockPayPalClient(MockPayPalClient):
 # ---------------------------------------------------------------------------
 
 class DurableReleaseVerifier(ReleaseVerifier):
-    def __init__(self, paypal, permits: DurablePermitStore, ledger: Optional[Ledger] = None, durable_dir=None):
-        super().__init__(paypal, permits, ledger=ledger)
+    def __init__(self, paypal, permits: DurablePermitStore, ledger: Optional[Ledger] = None, durable_dir=None, **key_kwargs):
+        super().__init__(paypal, permits, ledger=ledger, **key_kwargs)
         self._durable_dir = _durable_dir(durable_dir)
         if self._durable_dir is not None:
             self._escrows_path = self._durable_dir / "escrows.json"

@@ -39,7 +39,7 @@ def _build(durable_dir: Path):
     ledger = DurableLedger(durable_dir=durable_dir)
     permits = DurablePermitStore(ledger=ledger, durable_dir=durable_dir)
     paypal = DurableMockPayPalClient(durable_dir=durable_dir)
-    verifier = DurableReleaseVerifier(paypal, permits, ledger=ledger, durable_dir=durable_dir)
+    verifier = DurableReleaseVerifier(paypal, permits, ledger=ledger, durable_dir=durable_dir, allow_demo_key=True)
     flow = DurableSpendPipeline(permits, paypal, verifier, ledger=ledger, durable_dir=durable_dir)
     return ledger, permits, paypal, verifier, flow
 
@@ -103,7 +103,7 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
         ledger_c = DurableLedger(durable_dir=d)
         permits_c = DurablePermitStore(ledger=ledger_c, durable_dir=d)
         paypal_c = DurableMockPayPalClient(durable_dir=d)
-        verifier_c = DurableReleaseVerifier(paypal_c, permits_c, ledger=ledger_c, durable_dir=d)
+        verifier_c = DurableReleaseVerifier(paypal_c, permits_c, ledger=ledger_c, durable_dir=d, allow_demo_key=True)
         flow_c = DurableSpendPipeline(permits_c, paypal_c, verifier_c, ledger=ledger_c, durable_dir=d)
         permit_c = permits_c.get(permit_id)
         if permit_c is None:
@@ -348,7 +348,7 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
             check("no_duplicate_after_reconcile", len(paypal3.capture_calls) == before_calls, f"calls before={before_calls} after={len(paypal3.capture_calls)}")
             check("captures_still_one", len(paypal3.captures) == before_captures, f"captures={len(paypal3.captures)}")
             # Escrow should now be CAPTURED
-            verifier3 = DurableReleaseVerifier(paypal3, permits2, ledger=ledger2, durable_dir=durable_dir)
+            verifier3 = DurableReleaseVerifier(paypal3, permits2, ledger=ledger2, durable_dir=durable_dir, allow_demo_key=True)
             escrow3 = verifier3.get_escrow(escrow.escrow_id)
             if escrow3:
                 check("escrow_captured_after_reconcile", escrow3.state == "CAPTURED", f"state={escrow3.state}")

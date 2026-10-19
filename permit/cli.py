@@ -30,7 +30,7 @@ def _pipeline() -> tuple[
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     provider = MockPayPalClient()
-    verifier = ReleaseVerifier(provider, permits, ledger=ledger)
+    verifier = ReleaseVerifier(provider, permits, ledger=ledger, allow_demo_key=True)
     flow = SpendPipeline(permits, provider, verifier, ledger=ledger)
     return flow, provider, permits, verifier, ledger
 
