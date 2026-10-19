@@ -180,12 +180,41 @@ def _clear_nonblock(fd: int) -> None:
     _fcntl.fcntl(fd, _fcntl.F_SETFL, flags & ~getattr(_os, "O_NONBLOCK", 0))
 
 
+def _reject_foreign_demo_key_owner(key_path: _Path) -> None:
+    """Refuse foreign-owned key paths before open.
+
+    A 0600 file owned by another uid yields EACCES on open for a non-root
+    euid, which would mask the ownership failure. Check ``lstat`` first so
+    a real ``chown`` foreign-owner case reaches the owner check. Symlinks are
+    rejected here too; ``O_NOFOLLOW`` remains on the subsequent open.
+    """
+    try:
+        st = _os.lstat(key_path)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise _key_oserror(key_path, exc) from None
+    if _stat.S_ISLNK(st.st_mode):
+        raise ValueError(
+            f"demo acceptance key at {key_path} must not be a symlink"
+        )
+    euid = _os.geteuid()
+    if st.st_uid != euid:
+        raise ValueError(
+            f"demo acceptance key at {key_path} must be owned by euid "
+            f"{euid} (got uid {st.st_uid})"
+        )
+
+
 def _open_demo_key_readonly(key_path: _Path) -> int:
     """Open ``key_path`` with O_NOFOLLOW|O_NONBLOCK; map OSError → ValueError.
 
     O_NONBLOCK keeps a FIFO (or other blocking special file) from hanging
     startup forever; the regular-file check then rejects non-files.
+    Ownership is checked via ``lstat`` before open so foreign-owned 0600
+    files fail the owner check instead of masking as EACCES.
     """
+    _reject_foreign_demo_key_owner(key_path)
     flags = (
         _os.O_RDONLY
         | getattr(_os, "O_NOFOLLOW", 0)

@@ -100,13 +100,14 @@ def test_foreign_owner_real_chown_clean_valueerror(tmp_path, monkeypatch):
 
     Creates a 0600 key, then ``sudo -n chown nobody``. GitHub Ubuntu runners
     have passwordless sudo; if ``sudo -n`` fails, this test FAILS (does not
-    skip). Non-root open then hits EACCES; that must map to a clean
-    ValueError / ``acceptance key error`` (exit 1, no traceback). Cleanup
-    uses sudo too.
+    skip). Pre-open ``lstat`` ownership check must raise a clean
+    ``owned by euid`` ValueError (this is the only test that reaches that
+    check with a real foreign uid). Server must exit 1 with
+    ``acceptance key error`` and no traceback. Cleanup uses sudo too.
     """
     monkeypatch.delenv("PERMIT_ACCEPTANCE_KEY", raising=False)
     assert os.geteuid() != 0, (
-        "foreign-owner test must run as non-root so open hits EACCES; "
+        "foreign-owner test must run as non-root; "
         "do not skip — fix the environment"
     )
     path = tmp_path / "foreign.acceptance_key"
@@ -122,7 +123,7 @@ def test_foreign_owner_real_chown_clean_valueerror(tmp_path, monkeypatch):
         assert st.st_uid != os.geteuid(), "chown nobody did not change ownership"
         assert (st.st_mode & 0o777) == 0o600
 
-        with pytest.raises(ValueError, match="cannot be opened"):
+        with pytest.raises(ValueError, match="owned by euid"):
             load_or_create_demo_key(path)
 
         # Also exercise the server entry point: clean exit 1, no traceback.
@@ -161,6 +162,7 @@ def test_foreign_owner_real_chown_clean_valueerror(tmp_path, monkeypatch):
         out = (proc.stdout or "") + (proc.stderr or "")
         assert proc.returncode == 1, out
         assert "acceptance key error:" in out
+        assert "owned by euid" in out
         assert "Traceback" not in out
         assert "PermissionError" not in out
     finally:
