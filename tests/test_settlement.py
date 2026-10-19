@@ -1698,11 +1698,14 @@ def test_c5_creating_live_good_token_no_flock_rolled_back_refused():
 def test_a2b_creating_after_real_pid_reuse_refused():
     """A2b: recycled PID with the *new* process's start token, no flock.
 
-    Deterministic via fork: exit+wait a child, then fork until the kernel
-    reuses that PID; plant creating with the new start token. Fails on
-    7bb7c02 (accepts live pid+start without flock); head refuses.
+    Deterministic: keep a live decoy, stub ``/proc/<pid>/stat`` so its
+    starttime is a crafted post-reuse token, plant creating with that
+    pid+token (no flock, no DB row). Fails on 7bb7c02 (accepts live
+    pid+start without flock); head refuses.
     """
+    import multiprocessing as mp
     import tempfile
+    from io import StringIO
 
     from permit import retry_rate_store as rrs
     from permit.retry_rate_store import (
@@ -1710,72 +1713,67 @@ def test_a2b_creating_after_real_pid_reuse_refused():
         RetryRateIntegrityError,
         _HW_CREATING_INTENT,
         _atomic_write_hw_record,
-        _process_start_token,
         create_high_water,
         high_water_lock,
     )
     from permit.sqlite_ledger import SqliteLedger
 
-    with tempfile.TemporaryDirectory() as td:
-        stop = td + "/a2b_stop"
-        # First child: record PID, exit, parent reaps (slot free for reuse).
-        old_pid = os.fork()
-        if old_pid == 0:
-            os._exit(0)
-        os.waitpid(old_pid, 0)
+    FAKE_START = 424242
 
-        reused_pid = None
-        reused_start = None
-        live_child = None
-        for _ in range(4000):
-            pid = os.fork()
-            if pid == 0:
-                # Stay alive so kill(0)+starttoken succeed for the planted row.
-                while not os.path.exists(stop):
-                    __import__("time").sleep(0.01)
-                os._exit(0)
-            if pid == old_pid:
-                reused_pid = pid
-                reused_start = _process_start_token(pid)
-                live_child = pid
-                break
-            os.kill(pid, 9)
-            os.waitpid(pid, 0)
-        if reused_pid is None:
-            pytest.skip(
-                "A2b: kernel did not reuse PID within 4000 forks "
-                "(non-deterministic on this host)"
-            )
+    def _fake_stat_for(pid: int, start: int) -> str:
+        # /proc/<pid>/stat: fields after ") " — state at [0], starttime at [19].
+        tail = ["S"] + ["0"] * 18 + [str(start)] + ["0", "0"]
+        return f"{pid} (decoy) " + " ".join(tail) + "\n"
+
+    ctx = mp.get_context("spawn")
+    ready_q = ctx.Queue()
+    with tempfile.TemporaryDirectory() as td:
+        stop_path = td + "/stop"
+        decoy = ctx.Process(
+            target=_a63e7ff_child_hold, args=(ready_q, stop_path)
+        )
+        decoy.start()
+        live_pid, _real_start = ready_q.get(timeout=10)
+        assert live_pid != os.getpid()
+        real_open = open
+
+        def _stub_open(path, *a, **k):
+            if str(path) == f"/proc/{live_pid}/stat":
+                return StringIO(_fake_stat_for(live_pid, FAKE_START))
+            return real_open(path, *a, **k)
+
         try:
-            assert reused_start is not None
             path = td + "/ledger.sqlite"
             os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = td + "/hw"
             rrs.clear_retry_rate_mac_key_cache()
             ledger = SqliteLedger(path)
             ledger.close()
             create_high_water("esc_a2b", "rw_a2b", initial=0)
-            with high_water_lock("esc_a2b", "rw_a2b") as hwlock:
-                rec = HighWaterRecord(
-                    escrow_id="esc_a2b",
-                    window_id="rw_a2b",
-                    confirmed=0,
-                    intent=_HW_CREATING_INTENT,
-                    writer_pid=reused_pid,
-                    writer_start=reused_start,
-                )
-                _atomic_write_hw_record(hwlock._path, rec)
-            with pytest.raises(
-                RetryRateIntegrityError,
-                match="orphan|dead writer|stale|planted|pending|creating",
-            ):
-                SqliteLedger(path)
+            # Install stub only for the refuse path so create_high_water
+            # used the real /proc above.
+            rrs_open = __import__("builtins").open
+            __import__("builtins").open = _stub_open  # type: ignore[assignment]
+            try:
+                with high_water_lock("esc_a2b", "rw_a2b") as hwlock:
+                    rec = HighWaterRecord(
+                        escrow_id="esc_a2b",
+                        window_id="rw_a2b",
+                        confirmed=0,
+                        intent=_HW_CREATING_INTENT,
+                        writer_pid=live_pid,
+                        writer_start=FAKE_START,
+                    )
+                    _atomic_write_hw_record(hwlock._path, rec)
+                with pytest.raises(
+                    RetryRateIntegrityError,
+                    match="orphan|dead writer|stale|planted|pending|creating",
+                ):
+                    SqliteLedger(path)
+            finally:
+                __import__("builtins").open = rrs_open  # type: ignore[assignment]
         finally:
-            open(stop, "w").write("1")
-            if live_child is not None:
-                try:
-                    os.waitpid(live_child, 0)
-                except ChildProcessError:
-                    pass
+            open(stop_path, "w").write("1")
+            decoy.join(timeout=10)
 
 
 # C6 (documented pre-existing, not fixed here): between /proc/locks observation

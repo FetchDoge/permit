@@ -233,6 +233,25 @@ def test_mut_accept_non_creating_intent_never_true():
     assert _accept_live_creating_pending(rec, lock_path=path) is False
 
 
+def test_mut_accept_falsy_pid_uses_or_minus_one(monkeypatch):
+    """``writer_pid or -1`` (not ``or +1``): falsy pid is not treated as pid 1."""
+    monkeypatch.setattr(os, "getpid", lambda: 1)
+    monkeypatch.setattr(rrs.os, "getpid", lambda: 1)
+    monkeypatch.setattr(rrs, "_writer_holds_hw_flock", lambda lp, p: True)
+    monkeypatch.setattr(rrs, "_writer_still_alive", lambda p, s: True)
+    rec = HighWaterRecord(
+        escrow_id="e",
+        window_id="w",
+        confirmed=0,
+        intent=_HW_CREATING_INTENT,
+        writer_pid=0,  # falsy → `or -1` yields -1, not own pid
+        writer_start=1,
+    )
+    # Original: not same-pid, holds+alive → True.
+    # ``or +1`` mutant: treats pid as 1 == getpid() → False.
+    assert _accept_live_creating_pending(rec, lock_path="/x") is True
+
+
 def test_mut_writer_still_alive_none_pid_or_none_start():
     """Either missing pid or missing start → dead (not only both missing)."""
     assert _writer_still_alive(None, 1) is False
@@ -400,3 +419,414 @@ def test_mut_write_intent_clears_writer_pid_to_none_not_empty_str():
         rec = hwlock.read()
         assert rec.writer_pid == pid
         assert isinstance(rec.writer_pid, int)
+
+
+def test_mut_write_intent_error_messages_exact():
+    """Exact message text kills XX…XX / case-flip message mutants."""
+    create_high_water("esc_mut_msg", "rw_mut_msg", initial=0)
+    with high_water_lock("esc_mut_msg", "rw_mut_msg") as hwlock:
+        hwlock.write_intent(1)
+        with pytest.raises(
+            RetryRateIntegrityError,
+            match=r"^high-water intent already pending for ",
+        ):
+            hwlock.write_intent(1)
+    create_high_water("esc_mut_msg2", "rw_mut_msg2", initial=0)
+    with high_water_lock("esc_mut_msg2", "rw_mut_msg2") as hwlock:
+        with pytest.raises(
+            RetryRateIntegrityError,
+            match=r"^high-water intent must be confirmed\+1 for ",
+        ):
+            hwlock.write_intent(2)
+
+
+def test_mut_write_intent_marks_write_active(monkeypatch, tmp_path):
+    """write_intent must call _mark_write_active when marker is unset."""
+    active = tmp_path / "writing"
+    active.mkdir()
+    monkeypatch.setenv(rrs._ENV_WRITE_ACTIVE_DIR, str(active))
+    create_high_water("esc_mut_mk", "rw_mut_mk", initial=0)
+    with high_water_lock("esc_mut_mk", "rw_mut_mk") as hwlock:
+        assert hwlock._write_marker is None
+        hwlock.write_intent(1)
+        assert hwlock._write_marker is not None
+        assert os.path.exists(hwlock._write_marker)
+        assert list(active.glob("*.writing")), "write-active marker missing"
+
+
+def test_mut_zombie_missing_proc_is_not_zombie():
+    """OSError reading /proc/<pid>/stat → False (not True)."""
+    assert _writer_is_zombie(2_000_000_001) is False
+
+
+def test_mut_zombie_no_paren_is_not_zombie(monkeypatch):
+    """Missing ')' in /proc/stat → False (not True)."""
+
+    def _fake_open(path, *a, **k):
+        if str(path).endswith("/stat") and "/proc/" in str(path):
+            from io import StringIO
+
+            return StringIO("1 commwithoutparens Z 0 0 0\n")
+        return open(path, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert _writer_is_zombie(1) is False
+
+
+def test_mut_zombie_empty_tail_after_paren_is_not_zombie(monkeypatch):
+    """IndexError on empty tail after ')' → False (not True)."""
+
+    def _fake_open(path, *a, **k):
+        if str(path).endswith("/stat") and "/proc/" in str(path):
+            from io import StringIO
+
+            return StringIO("1 (x)")  # rfind ok, split()[0] IndexError
+        return open(path, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert _writer_is_zombie(1) is False
+
+
+def test_mut_zombie_rfind_not_find_when_comm_has_paren(monkeypatch):
+    """rfind(')') required when comm contains ')' (find would mis-parse)."""
+    # pid (name)with)paren) Z ...start fields...
+    # After rfind: state Z. After find: state is 'with)paren)' fragment.
+    fake = "1 (evil)name) Z 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99 0 0\n"
+
+    def _fake_open(path, *a, **k):
+        if str(path).endswith("/stat") and "/proc/" in str(path):
+            from io import StringIO
+
+            return StringIO(fake)
+        return open(path, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert _writer_is_zombie(1) is True
+
+
+def test_mut_zombie_rparen_zero_still_parses(monkeypatch):
+    """rparen == 0 must not be treated as missing ')' (`< 0` not `<= 0`)."""
+    fake = ") Z 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99 0 0\n"
+
+    def _fake_open(path, *a, **k):
+        if str(path).endswith("/stat") and "/proc/" in str(path):
+            from io import StringIO
+
+            return StringIO(fake)
+        return open(path, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert _writer_is_zombie(1) is True
+
+
+def test_mut_still_alive_dead_pid_false():
+    """kill(pid,0) OSError must yield False (not True)."""
+    assert _writer_still_alive(2_000_000_002, 1) is False
+
+
+def test_mut_still_alive_uses_signal_zero_only(monkeypatch):
+    """Existence probe must use signal 0 (not SIGHUP=1)."""
+    seen: list[int] = []
+
+    def _kill(pid, sig):
+        seen.append(int(sig))
+        if int(sig) != 0:
+            raise AssertionError(f"still_alive must use signal 0, got {sig}")
+        return None
+
+    # Patch both the global and the module binding mutmut rewrites.
+    monkeypatch.setattr(os, "kill", _kill)
+    monkeypatch.setattr(rrs.os, "kill", _kill)
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda p: False)
+    monkeypatch.setattr(rrs, "_process_start_token", lambda p: 5)
+    assert _writer_still_alive(os.getpid(), 5) is True
+    assert seen == [0]
+
+
+def test_mut_open_encoding_is_utf8_lowercase(monkeypatch):
+    """``encoding='utf-8'`` (not None / omitted / UTF-8) on /proc reads."""
+    seen: list[dict] = []
+    real_open = open
+
+    def _wrap(path, *a, **k):
+        if "/proc/" in str(path):
+            seen.append({"path": str(path), "args": a, "kwargs": dict(k)})
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", _wrap)
+    monkeypatch.setattr(rrs, "open", _wrap, raising=False)
+    # Drive both zombie and holds /proc opens.
+    _writer_is_zombie(os.getpid())
+    create_high_water("esc_mut_enc", "rw_mut_enc", initial=0)
+    with high_water_lock("esc_mut_enc", "rw_mut_enc") as hwlock:
+        rrs._writer_holds_hw_flock(hwlock._lock_path, os.getpid())
+    proc_opens = [s for s in seen if s["path"].startswith("/proc/")]
+    assert proc_opens, "expected /proc opens"
+    for s in proc_opens:
+        # Mode must be positional "r"; encoding must be exactly "utf-8"
+        # (kills omit-mode / encoding=None / encoding="UTF-8" mutants).
+        enc = s["kwargs"].get("encoding", None)
+        assert s["args"][:1] == ("r",), f"expected open(..., 'r', ...), got {s}"
+        assert enc == "utf-8", f"expected encoding='utf-8', got {s}"
+
+
+def test_mut_still_alive_missing_start_token_false(monkeypatch):
+    """When starttime is unavailable, still_alive is False (not True)."""
+    monkeypatch.setattr(rrs, "_process_start_token", lambda pid: None)
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+    # Live self pid; start token forced missing.
+    assert _writer_still_alive(os.getpid(), 12345) is False
+
+
+def test_mut_still_alive_pid_zero_and_one(monkeypatch):
+    """pid 0 and pid 1 are rejected by `<= 0` / must not use `< 0` or `<= 1` alone."""
+    # If the guard is weakened, make the rest claim alive so the mutant shows.
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+    monkeypatch.setattr(rrs, "_process_start_token", lambda pid: 99)
+
+    def _kill(pid, sig):
+        if int(pid) in (0, 1):
+            return None  # pretend signalable
+        raise OSError("nope")
+
+    monkeypatch.setattr(os, "kill", _kill)
+    assert _writer_still_alive(0, 99) is False
+    # pid 1 must still be allowed through the <=0 guard (only <=0 rejects).
+    # `<= 1` mutant wrongly rejects pid 1 → still_alive False; original True.
+    assert _writer_still_alive(1, 99) is True
+
+
+def test_mut_holds_fcntl_none_rejects_even_with_valid_pid(monkeypatch):
+    """`fcntl is None` alone must reject (`or`, not `and` with <=0)."""
+    create_high_water("esc_mut_fc", "rw_mut_fc", initial=0)
+    with high_water_lock("esc_mut_fc", "rw_mut_fc") as hwlock:
+        monkeypatch.setattr(rrs, "fcntl", None)
+        assert rrs._writer_holds_hw_flock(hwlock._lock_path, os.getpid()) is False
+
+
+def test_mut_holds_pid_zero_rejected_even_if_rest_would_match(monkeypatch):
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+    create_high_water("esc_mut_p0", "rw_mut_p0", initial=0)
+    path = rrs._hw_entry_path("esc_mut_p0", "rw_mut_p0")
+    lock_path = _hw_lock_path(path)
+    st = os.stat(lock_path)
+    maj, minor = os.major(st.st_dev), os.minor(st.st_dev)
+    # Fabricate a /proc/locks line for pid 0 matching this inode.
+    fake_line = (
+        f"1: FLOCK ADVISORY WRITE 0 {maj:x}:{minor:x}:{st.st_ino} 0 EOF\n"
+    )
+
+    def _fake_open(path, *a, **k):
+        if str(path) == "/proc/locks":
+            from io import StringIO
+
+            return StringIO(fake_line)
+        return open(path, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert rrs._writer_holds_hw_flock(lock_path, 0) is False
+
+
+def test_mut_holds_pid_one_allowed_by_guard(monkeypatch):
+    """`int(pid) <= 1` mutant wrongly rejects pid 1; original allows the check."""
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+    create_high_water("esc_mut_p1", "rw_mut_p1", initial=0)
+    path = rrs._hw_entry_path("esc_mut_p1", "rw_mut_p1")
+    lock_path = _hw_lock_path(path)
+    st = os.stat(lock_path)
+    maj, minor = os.major(st.st_dev), os.minor(st.st_dev)
+    fake_line = (
+        f"1: FLOCK ADVISORY WRITE 1 {maj:x}:{minor:x}:{st.st_ino} 0 EOF\n"
+    )
+
+    def _fake_open(path, *a, **k):
+        if str(path) == "/proc/locks":
+            from io import StringIO
+
+            return StringIO(fake_line)
+        return open(path, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert rrs._writer_holds_hw_flock(lock_path, 1) is True
+
+
+def test_mut_holds_zombie_never_true(monkeypatch):
+    """Zombie writer must not be reported as holding the flock."""
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: True)
+    create_high_water("esc_mut_hz", "rw_mut_hz", initial=0)
+    with high_water_lock("esc_mut_hz", "rw_mut_hz") as hwlock:
+        assert rrs._writer_holds_hw_flock(hwlock._lock_path, os.getpid()) is False
+
+
+def test_mut_holds_stat_oserror_false(monkeypatch):
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+
+    def _boom(path):
+        raise OSError("gone")
+
+    monkeypatch.setattr(os, "stat", _boom)
+    assert rrs._writer_holds_hw_flock("/no/such/lock", os.getpid()) is False
+
+
+def test_mut_holds_locks_oserror_false(monkeypatch):
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+    create_high_water("esc_mut_lk", "rw_mut_lk", initial=0)
+    path = rrs._hw_entry_path("esc_mut_lk", "rw_mut_lk")
+    lock_path = _hw_lock_path(path)
+
+    real_open = open
+
+    def _fake_open(p, *a, **k):
+        if str(p) == "/proc/locks":
+            raise OSError("no locks")
+        return real_open(p, *a, **k)
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert rrs._writer_holds_hw_flock(lock_path, os.getpid()) is False
+
+
+def test_mut_holds_short_line_continue_not_break(monkeypatch):
+    """A short /proc/locks line must `continue`, not `break`, before a match."""
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+    create_high_water("esc_mut_sh", "rw_mut_sh", initial=0)
+    path = rrs._hw_entry_path("esc_mut_sh", "rw_mut_sh")
+    lock_path = _hw_lock_path(path)
+    st = os.stat(lock_path)
+    maj, minor = os.major(st.st_dev), os.minor(st.st_dev)
+    pid = os.getpid()
+    short = "1: FLOCK\n"  # len(parts) < 6
+    match = (
+        f"2: FLOCK ADVISORY WRITE {pid} "
+        f"{maj:x}:{minor:x}:{st.st_ino} 0 EOF\n"
+    )
+
+    def _fake_open(p, *a, **k):
+        if str(p) == "/proc/locks":
+            from io import StringIO
+
+            return StringIO(short + match)
+        return open(p, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert rrs._writer_holds_hw_flock(lock_path, pid) is True
+
+
+def test_mut_holds_exactly_six_fields_still_parsed(monkeypatch):
+    """`len(parts) < 6` (not `<= 6` / `< 7`) so a 6-field match counts."""
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+    create_high_water("esc_mut_6", "rw_mut_6", initial=0)
+    path = rrs._hw_entry_path("esc_mut_6", "rw_mut_6")
+    lock_path = _hw_lock_path(path)
+    st = os.stat(lock_path)
+    maj, minor = os.major(st.st_dev), os.minor(st.st_dev)
+    pid = os.getpid()
+    # Exactly 6 whitespace-separated fields (no trailing "0 EOF").
+    six = f"1: FLOCK ADVISORY WRITE {pid} {maj:x}:{minor:x}:{st.st_ino}\n"
+
+    def _fake_open(p, *a, **k):
+        if str(p) == "/proc/locks":
+            from io import StringIO
+
+            return StringIO(six)
+        return open(p, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert rrs._writer_holds_hw_flock(lock_path, pid) is True
+
+
+def test_mut_holds_requires_both_ino_and_dev(monkeypatch):
+    """Matching inode alone (wrong device) must not count (`and`, not `or`)."""
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+    create_high_water("esc_mut_and", "rw_mut_and", initial=0)
+    path = rrs._hw_entry_path("esc_mut_and", "rw_mut_and")
+    lock_path = _hw_lock_path(path)
+    st = os.stat(lock_path)
+    pid = os.getpid()
+    # Same inode, wrong major:minor.
+    wrong = f"1: FLOCK ADVISORY WRITE {pid} 0:0:{st.st_ino} 0 EOF\n"
+
+    def _fake_open(p, *a, **k):
+        if str(p) == "/proc/locks":
+            from io import StringIO
+
+            return StringIO(wrong)
+        return open(p, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert rrs._writer_holds_hw_flock(lock_path, pid) is False
+
+
+def test_mut_holds_bad_pid_field_continue_not_break(monkeypatch):
+    """Non-int pid field must `continue` so a later matching line can win."""
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+    create_high_water("esc_mut_bp", "rw_mut_bp", initial=0)
+    path = rrs._hw_entry_path("esc_mut_bp", "rw_mut_bp")
+    lock_path = _hw_lock_path(path)
+    st = os.stat(lock_path)
+    maj, minor = os.major(st.st_dev), os.minor(st.st_dev)
+    pid = os.getpid()
+    bad = "1: FLOCK ADVISORY WRITE notapid fe:1:1 0 EOF\n"
+    good = (
+        f"2: FLOCK ADVISORY WRITE {pid} "
+        f"{maj:x}:{minor:x}:{st.st_ino} 0 EOF\n"
+    )
+
+    def _fake_open(p, *a, **k):
+        if str(p) == "/proc/locks":
+            from io import StringIO
+
+            return StringIO(bad + good)
+        return open(p, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert rrs._writer_holds_hw_flock(lock_path, pid) is True
+
+
+def test_mut_holds_wrong_pid_continue_not_break(monkeypatch):
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+    create_high_water("esc_mut_wp", "rw_mut_wp", initial=0)
+    path = rrs._hw_entry_path("esc_mut_wp", "rw_mut_wp")
+    lock_path = _hw_lock_path(path)
+    st = os.stat(lock_path)
+    maj, minor = os.major(st.st_dev), os.minor(st.st_dev)
+    pid = os.getpid()
+    other = f"1: FLOCK ADVISORY WRITE {pid + 7} {maj:x}:{minor:x}:{st.st_ino} 0 EOF\n"
+    good = (
+        f"2: FLOCK ADVISORY WRITE {pid} "
+        f"{maj:x}:{minor:x}:{st.st_ino} 0 EOF\n"
+    )
+
+    def _fake_open(p, *a, **k):
+        if str(p) == "/proc/locks":
+            from io import StringIO
+
+            return StringIO(other + good)
+        return open(p, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert rrs._writer_holds_hw_flock(lock_path, pid) is True
+
+
+def test_mut_holds_bad_dev_ino_continue_not_break(monkeypatch):
+    monkeypatch.setattr(rrs, "_writer_is_zombie", lambda pid: False)
+    create_high_water("esc_mut_bd", "rw_mut_bd", initial=0)
+    path = rrs._hw_entry_path("esc_mut_bd", "rw_mut_bd")
+    lock_path = _hw_lock_path(path)
+    st = os.stat(lock_path)
+    maj, minor = os.major(st.st_dev), os.minor(st.st_dev)
+    pid = os.getpid()
+    bad = f"1: FLOCK ADVISORY WRITE {pid} not-a-dev 0 EOF\n"
+    good = (
+        f"2: FLOCK ADVISORY WRITE {pid} "
+        f"{maj:x}:{minor:x}:{st.st_ino} 0 EOF\n"
+    )
+
+    def _fake_open(p, *a, **k):
+        if str(p) == "/proc/locks":
+            from io import StringIO
+
+            return StringIO(bad + good)
+        return open(p, *a, **k)  # noqa: SIM115
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert rrs._writer_holds_hw_flock(lock_path, pid) is True
