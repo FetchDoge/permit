@@ -990,11 +990,25 @@ def assert_high_water_files_for_rows(
                 rec = hwlock.read()
                 if (
                     rec.intent is not None
-                    and _writer_still_alive(rec.writer_pid, rec.writer_start)
                     and int(rec.writer_pid or -1) != os.getpid()
                 ):
-                    # Live foreign writer still pending — do not reconcile yet.
-                    continue
+                    if _writer_still_alive(rec.writer_pid, rec.writer_start):
+                        # Live foreign writer still pending — do not reconcile yet.
+                        continue
+                    # Creating intent outlives the create flock; don't
+                    # reconcile away a still-running writer's sentinel on a
+                    # start-token flicker (PID still alive).
+                    if (
+                        rec.intent == _HW_CREATING_INTENT
+                        and rec.writer_pid is not None
+                        and int(rec.writer_pid) > 0
+                    ):
+                        try:
+                            os.kill(int(rec.writer_pid), 0)
+                        except OSError:
+                            pass
+                        else:
+                            continue
                 hwlock.reconcile(count)
                 hwlock.check(count)
         except RetryRateIntegrityError:
@@ -1045,6 +1059,20 @@ def assert_high_water_files_for_rows(
                     if _writer_still_alive(rec.writer_pid, rec.writer_start):
                         # Live writer mid-flight — pending allowed.
                         continue
+                    # Creating intent outlives the create flock; a start-token
+                    # false-negative must not orphan a still-running writer.
+                    if (
+                        rec.intent == _HW_CREATING_INTENT
+                        and rec.writer_pid is not None
+                        and int(rec.writer_pid) > 0
+                    ):
+                        try:
+                            os.kill(int(rec.writer_pid), 0)
+                        except OSError:
+                            pass
+                        else:
+                            # PID still alive (start token may have flickered).
+                            continue
                     if not exists:
                         raise RetryRateIntegrityError(
                             f"orphan high-water sidecar at {fpath!r} "
@@ -1359,10 +1387,12 @@ class high_water_lock:
     def reconcile(self, db_count: int) -> int:
         """Resolve pending intent against DB; then require exact equality.
 
-        Live pending (writer alive with matching start token) is refused
-        here — callers must not reconcile while another writer still owns
-        the intent. Stale pending (dead/mismatched writer) is resolved
-        against the committed row when unambiguous; otherwise refused.
+        Creating intent (-1) may be observed under this flock while a foreign
+        writer is still alive (the create flock is released before INSERT
+        commits). When the row is visible, clear the sentinel; do not treat
+        that as planted. Live foreign *increment* intents under this flock
+        are still refused as planted. Stale/dead pending is resolved against
+        the committed row when unambiguous; otherwise refused.
         """
         rec = self.read()
         count = int(db_count)
@@ -1374,44 +1404,62 @@ class high_water_lock:
                     f"db_count={count} confirmed={rec.confirmed}; refuse"
                 )
         elif _writer_still_alive(rec.writer_pid, rec.writer_start):
-            # Exclusive flock held here. A concurrent live writer cannot also
-            # hold it — so either this is our own uncommitted intent (same
-            # process rollback) or a planted record claiming a live pid.
-            same_writer = (
-                int(rec.writer_pid or -1) == os.getpid()
-                and int(rec.writer_start or -1)
-                == int(_process_start_token(os.getpid()) or -2)
-            )
-            if same_writer and rec.intent == count and rec.confirmed == count - 1:
-                # Our own post-SQL pre-confirm crash: advance confirmed.
-                rec.confirmed = count
-                rec.intent = None
-                rec.writer_pid = None
-                rec.writer_start = None
-                _atomic_write_hw_record(self._path, rec)
-            elif same_writer and (
-                (
-                    rec.intent == rec.confirmed + 1
-                    and rec.confirmed == count
-                )
-                or (
-                    rec.intent == _HW_CREATING_INTENT
-                    and rec.confirmed == count
-                )
+            # Creating intent (-1) is left on disk AFTER the create flock is
+            # released, until the INSERT commits — so a concurrent startup
+            # can hold this exclusive lock and still observe a live foreign
+            # creating intent. That is not planted: if the row is visible
+            # (confirmed == db_count), clear the sentinel; otherwise leave
+            # it for the live writer (do not refuse).
+            if (
+                rec.intent == _HW_CREATING_INTENT
+                and int(rec.writer_pid or -1) != os.getpid()
             ):
-                # Our own uncommitted intent — clear.
-                rec.intent = None
-                rec.writer_pid = None
-                rec.writer_start = None
-                _atomic_write_hw_record(self._path, rec)
+                if rec.confirmed == count:
+                    rec.intent = None
+                    rec.writer_pid = None
+                    rec.writer_start = None
+                    _atomic_write_hw_record(self._path, rec)
+                # else: INSERT not visible yet / mismatch — leave pending.
             else:
-                raise RetryRateIntegrityError(
-                    "high-water pending intent claims live writer under "
-                    "exclusive lock for "
-                    f"escrow_id={self.escrow_id!r} "
-                    f"window_id={self.window_id!r} pid={rec.writer_pid}; "
-                    "refuse (stale/planted pending)"
+                # Increment intents are written under the same exclusive flock
+                # the writer holds through SQL+confirm. A live foreign
+                # increment intent under our flock is planted/stale, unless
+                # it is our own uncommitted intent (same process).
+                same_writer = (
+                    int(rec.writer_pid or -1) == os.getpid()
+                    and int(rec.writer_start or -1)
+                    == int(_process_start_token(os.getpid()) or -2)
                 )
+                if same_writer and rec.intent == count and rec.confirmed == count - 1:
+                    # Our own post-SQL pre-confirm crash: advance confirmed.
+                    rec.confirmed = count
+                    rec.intent = None
+                    rec.writer_pid = None
+                    rec.writer_start = None
+                    _atomic_write_hw_record(self._path, rec)
+                elif same_writer and (
+                    (
+                        rec.intent == rec.confirmed + 1
+                        and rec.confirmed == count
+                    )
+                    or (
+                        rec.intent == _HW_CREATING_INTENT
+                        and rec.confirmed == count
+                    )
+                ):
+                    # Our own uncommitted intent — clear.
+                    rec.intent = None
+                    rec.writer_pid = None
+                    rec.writer_start = None
+                    _atomic_write_hw_record(self._path, rec)
+                else:
+                    raise RetryRateIntegrityError(
+                        "high-water pending intent claims live writer under "
+                        "exclusive lock for "
+                        f"escrow_id={self.escrow_id!r} "
+                        f"window_id={self.window_id!r} pid={rec.writer_pid}; "
+                        "refuse (stale/planted pending)"
+                    )
         elif rec.intent == _HW_CREATING_INTENT and rec.confirmed == count:
             # Dead writer; INSERT landed — clear creating sentinel.
             rec.intent = None
