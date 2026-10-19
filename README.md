@@ -106,8 +106,8 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 ## Evidence
 
-- **389 tests pass, 1 skipped (390 collected):** `python -m pytest -q` on `main` at `21d7d7c`, 2026-10-15, both locally and in the green `ci` run for that commit. CI runs the same suite plus `python demo.py` on every push.
-- **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (16 receipts)` (run 2026-10-15 at `21d7d7c`).
+- **407 tests pass, 1 skipped (408 collected):** `python -m pytest -q` and `python -O -m pytest -q` on `launch/53-key-handling` (issue #53). CI runs the same suite plus `python demo.py` with a test-only `PERMIT_ACCEPTANCE_KEY` on every push.
+- **Mock end-to-end demo:** `PERMIT_ACCEPTANCE_KEY=... python demo.py` (or `python demo.py --allow-demo-key`) ends with `ledger chain: VERIFIED (16 receipts)`.
 - **Mock rail vs sandbox, kept separate:**
   - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_AGENT_CLI` or a recorded transcript — one ships as `demos/fixtures/demo_transcript.jsonl` for the offline replay path.
   - The Oct 2 sandbox spike made real REST calls (OAuth, order, authorize, capture, void) against PayPal sandbox and verified merchant identity. Its report left the tree in `3f88feb`. Read it with `git show 3f88feb^:spike-report.md`.
