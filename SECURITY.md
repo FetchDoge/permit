@@ -39,18 +39,46 @@ credit.
 ## Acceptance key + durable ledgers
 
 - `PERMIT_ACCEPTANCE_KEY`, when set, is always used (including with `--db --allow-demo-key`).
-  Empty, whitespace-only, and wrong-length values (not exactly 32 bytes after decoding)
-  refuse startup; the demo flag never papers over a bad configured key. The durable
-  key file uses the same exact-32-byte rule.
+  The value is taken as UTF-8 encoded bytes (nothing is decoded). Empty,
+  whitespace-only, and wrong-length values (not exactly 32 bytes) refuse startup;
+  the demo flag never papers over a bad configured key. The durable key file uses
+  the same exact-32-byte rule.
 - Every durable ledger binds an HMAC commitment of the acceptance key on first use
   (`ensure_acceptance_key_commitment` via `ReleaseVerifier`):
   - `SqliteLedger` (server `--db`)
   - `DurableLedger` (file-backed under `durable_dir`, including
     `harness/durability_harness.py`)
-  Ledgers that require the commitment but lack `get_meta` / `set_meta` refuse startup
-  (no silent skip). Ephemeral in-memory `Ledger` does not store a commitment.
-  **Rotating the acceptance key on an existing durable store refuses startup (no
-  rebind for now).**
+  Commitment is **required** unless the ledger is explicitly ephemeral (in-memory
+  `Ledger`, `:memory:` SqliteLedger, or DurableLedger without `durable_dir`).
+  File-backed SqliteLedger cannot opt out. Ledgers that need the commitment but
+  lack `get_meta` / `set_meta` refuse startup (no silent skip).
+  Only an **empty** store may bind a key for the first time; a nonempty store
+  without a commitment refuses startup (no silent rebind). Concurrent first-boot
+  binds atomically (`INSERT OR IGNORE`, then re-read and compare). Corrupt
+  `meta.json` is refused (never treated as empty).
+  **Rotating the acceptance key on an existing durable store refuses startup.**
+
+### Upgrading from a pre-exact-32 key (e.g. commit `19b62ce`)
+
+Databases bound with a key longer than 32 bytes (for example 64 hex characters from
+`secrets.token_hex(32)`) are locked out after the exact-32 upgrade. Run the one-time
+rebind with the OLD key and a new exact-32-byte key:
+
+```bash
+# OLD may be any non-empty length (e.g. 64 hex chars from token_hex(32)).
+# NEW must be exactly 32 UTF-8 bytes (e.g. token_hex(16)).
+printf '%s' "$OLD_LONG_KEY" > /tmp/old.key
+python -c 'import secrets; open("/tmp/new.key","w").write(secrets.token_hex(16))'
+
+python -m scripts.rebind_acceptance_key --db /path/to/ledger.db \
+  --old-key-file /tmp/old.key --new-key-file /tmp/new.key
+
+export PERMIT_ACCEPTANCE_KEY="$(cat /tmp/new.key)"
+python server.py --db /path/to/ledger.db
+```
+
+The command checks the OLD key against the stored HMAC commitment and rebinds
+atomically. A wrong OLD key is refused; the commitment is left unchanged.
 
 ## Related
 
