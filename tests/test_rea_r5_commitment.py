@@ -365,14 +365,22 @@ def test_k1_allow_demo_key_survives_reopen_without_env(tmp_path, monkeypatch):
     assert len(key_path.read_bytes()) == MIN
 
 
-def test_harness_cli_k1_allow_demo_key_no_env(tmp_path, monkeypatch):
+def test_durability_harness_py_k1_allow_demo_key_no_env_exit_0(
+    tmp_path, monkeypatch
+):
+    """Subprocess: durability_harness.py --kill-point K1 --allow-demo-key, no env.
+
+    Runs the harness script through kill + reopen and asserts exit 0 so CI
+    catches the r2 N-h bar without ci.yml changes (REA r5 fix 5).
+    """
     monkeypatch.delenv("PERMIT_ACCEPTANCE_KEY", raising=False)
     work = tmp_path / "cliK1"
+    harness_py = ROOT / "harness" / "durability_harness.py"
+    assert harness_py.is_file()
     proc = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "harness.durability_harness",
+            str(harness_py),
             "--kill-point",
             "K1",
             "--work-dir",
