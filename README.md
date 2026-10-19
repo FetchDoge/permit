@@ -2,7 +2,7 @@
 
 **Permit puts enforceable spending authority between AI agents and PayPal. Every decision, allowed or blocked, writes a hash-chained receipt.**
 
-[![ci](https://github.com/marsojuji-cmyk/permit/actions/workflows/ci.yml/badge.svg)](https://github.com/marsojuji-cmyk/permit/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+[![ci](https://github.com/FetchDoge/permit/actions/workflows/ci.yml/badge.svg)](https://github.com/FetchDoge/permit/actions/workflows/ci.yml) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 
 No spend without a permit. No timeout without a receipt.
 
@@ -52,7 +52,7 @@ python demos/demo_approval.py --fast   # LLM agent: auto-allow, approve, deny, f
 python demos/demo_admission.py         # offline: runaway loop refused at budget exhaustion, concurrent overspend cannot exceed cap
 ```
 
-The three LLM demos call the runner set by `PERMIT_GROK_CLI`. There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demos/demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl`. The file is gitignored, so a fresh clone has no transcript until you record one.
+The three LLM demos call the runner set by `PERMIT_AGENT_CLI` (the older name `PERMIT_GROK_CLI` is still read as a deprecated alias when `PERMIT_AGENT_CLI` is unset). There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demos/demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl` (gitignored — your own recordings stay local). A fresh clone ships one recorded transcript as a fixture, so the judge path runs with no recording of your own: `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` (provenance: `demos/fixtures/README.md`).
 
 ## How it fails
 
@@ -74,7 +74,7 @@ Permit fails closed. When state is uncertain, money does not move.
 **What it does not defend (production boundaries):**
 - With `--db PATH`, the SQLite ledger is durable (#24): survives crashes, restarts and a second writer on one machine; after some crashes an operator step is needed (rate unmeasured). Durable mode restores permits and reservations from receipts, but does not restore escrows, pending ops, or approvals (F3). Default (in-memory) mode still loses permits, escrows, revocations, and the ledger on restart.
 - HTTP POSTs require a single shared bearer token (`PERMIT_API_TOKEN`, #23) with no role split between principal and agent (F5). GETs, including `/api/ledger`, are unauthenticated; the server binds to 127.0.0.1.
-- Predicate A acceptance falls back to a hardcoded demo key when `PERMIT_ACCEPTANCE_KEY` is unset (F12).
+- Predicate A acceptance fails closed: the verifier refuses to construct without a configured acceptance key of at least 32 bytes (`PERMIT_ACCEPTANCE_KEY`); demos opt in explicitly to a per-run generated key (F12, #35).
 - The ledger is a hash chain, not a signature. It detects edits and reordering, but it cannot detect removal of final entries without an external checkpoint.
 - It is a single-merchant sandbox prototype, not a claim about all agent payments.
 - E-stop voids uncaptured authorizations. A completed capture needs a refund path, which is out of scope.
@@ -96,18 +96,18 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 **Service verbs (JSON):** issue (`POST /api/permits`), delegate (`POST /api/permits/<id>/delegate`), tighten (`POST /api/permits/<id>/tighten`: narrows cap, merchants, expiry, or approval threshold, never widens), check (read-only: no reservation, no receipt), spend, resume, release, reconcile, retry cleanup, e-stop, revoke a subtree (`POST /api/permits/<id>/revoke-cascade`), and read the ledger (`GET /api/ledger`). Mock mode is the default. `--sandbox` arms the real PayPal sandbox rail (needs `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET`).
 
-**Calibration score (advisory).** `permit/calibration.py` computes an advisory score S in [0, 1] (Sol 6.1). `check()` records S, the permit's tau and a MEETS/BELOW verdict on its ALLOWED and BLOCKED receipts, and the dashboard shows them. S never blocks a spend: the four-clause gate is unchanged, and a spend with S = 0 gets the same decision as before. Tau starts at 0.70 at grant and can only be raised; a lowering is refused with a `TAU_REFUSED` receipt. The weights and scales are uncalibrated fixtures.
+**Calibration score (advisory).** `permit/calibration.py` computes an advisory score S in [0, 1]. `check()` records S, the permit's tau and a MEETS/BELOW verdict on its ALLOWED and BLOCKED receipts, and the dashboard shows them. S never blocks a spend: the four-clause gate is unchanged, and a spend with S = 0 gets the same decision as before. Tau starts at 0.70 at grant and can only be raised; a lowering is refused with a `TAU_REFUSED` receipt. The weights and scales are uncalibrated fixtures.
 
 **Actors:** the **payer** approves, the **merchant** delivers, the **Permit operator** issues permits and holds the e-stop, and the **credential owner** holds the PayPal secret. The agent never holds credentials.
 
-**Lineage:** [Interlock](https://github.com/marsojuji-cmyk/interlock) is the conceptual origin of the leased-authority model. This repo's ledger is standalone.
+**Lineage:** [Interlock](https://github.com/FetchDoge/interlock) is the conceptual origin of the leased-authority model. This repo's ledger is standalone.
 
 ## Evidence
 
-- **337 tests pass:** `python -m pytest -q`, run 2026-10-13 on the REA F1/F2/F4 branch (332 on main at 9af721d + 5 new). CI runs the same suite plus `python demo.py` on every push.
-- **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (15 receipts)` (run 2026-10-07 at `dc0f3a5`).
+- **389 tests pass, 1 skipped (390 collected):** `python -m pytest -q` on `main` at `21d7d7c`, 2026-10-15, both locally and in the green `ci` run for that commit. CI runs the same suite plus `python demo.py` on every push.
+- **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (16 receipts)` (run 2026-10-15 at `21d7d7c`).
 - **Mock rail vs sandbox, kept separate:**
-  - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_GROK_CLI` or a recorded transcript.
+  - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_AGENT_CLI` or a recorded transcript — one ships as `demos/fixtures/demo_transcript.jsonl` for the offline replay path.
   - The Oct 2 sandbox spike made real REST calls (OAuth, order, authorize, capture, void) against PayPal sandbox and verified merchant identity. Its report left the tree in `3f88feb`. Read it with `git show 3f88feb^:spike-report.md`.
   - `docs/sandbox-runbook.md` is the scripted procedure for an integrated six-beat sandbox run. That run is not yet recorded.
 
@@ -117,6 +117,11 @@ The project builds in the open toward the Nov 12, 2026 hackathon deadline.
 - **Implemented and tested:** permit core, 4-clause authority gate, spend pipeline, release verifier with UNKNOWN → reconcile, PayPal sandbox client with merchant binding and idempotent capture, e-stop with in-flight handling, delegation with cascade revoke, principal approvals, the agent spender, and the six-beat mock demo.
 - **Remaining:** the integrated sandbox run, the video (by Nov 8), and the Devpost package (by Nov 10).
 
+## Acknowledgments
+
+Two community PRs (#3, #10) were merged during development; neither remains in the current code. Built by Marcus Richards, directing AI coding agents.
+
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Copyright 2026 Marcus Richards.
+Licensed under the Apache License 2.0. See LICENSE.

@@ -23,6 +23,12 @@ _HW_DIR = tempfile.mkdtemp(prefix="permit-retry-rate-hw-")
 _HW_FILE = os.path.join(_HW_DIR, "retry_rate.hw")
 os.environ.setdefault("PERMIT_RETRY_RATE_MAC_HW_FILE", _HW_FILE)
 
+# Test-only acceptance key for the mock-rail suite (issue #35: the library
+# has no fallback key, so tests configure one explicitly via env).
+os.environ.setdefault(
+    "PERMIT_ACCEPTANCE_KEY", "permit-test-only-acceptance-key-0123456789"
+)
+
 _SANDBOX_CREDS = (
     os.environ.get("PERMIT_PAYPAL_CLIENT_ID"),
     os.environ.get("PERMIT_PAYPAL_CLIENT_SECRET"),

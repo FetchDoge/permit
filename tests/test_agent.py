@@ -97,18 +97,34 @@ def test_system_prompt_lists_catalog():
 
 
 def test_llm_preflight_fails_with_guidance_when_cli_missing(monkeypatch):
-    """A missing Grok runner fails fast with setup guidance — not mid-demo."""
-    monkeypatch.setenv("PERMIT_GROK_CLI", "/nonexistent-xyz/grok.py")
+    """A missing LLM runner fails fast with setup guidance — not mid-demo."""
+    monkeypatch.setenv("PERMIT_AGENT_CLI", "/nonexistent-xyz/grok.py")
     with pytest.raises(RuntimeError) as exc:
         llm_preflight()
     msg = str(exc.value)
-    assert "PERMIT_GROK_CLI" in msg
+    assert "PERMIT_AGENT_CLI" in msg
     assert "--replay" in msg
 
 
 def test_llm_preflight_passes_for_existing_cli(monkeypatch):
-    monkeypatch.setenv("PERMIT_GROK_CLI", __file__)  # any real file
+    monkeypatch.setenv("PERMIT_AGENT_CLI", __file__)  # any real file
     llm_preflight()  # must not raise
+
+
+def test_llm_preflight_accepts_deprecated_alias(monkeypatch):
+    """PERMIT_GROK_CLI still works as a fallback when PERMIT_AGENT_CLI is unset."""
+    monkeypatch.delenv("PERMIT_AGENT_CLI", raising=False)
+    monkeypatch.setenv("PERMIT_GROK_CLI", __file__)
+    llm_preflight()  # must not raise
+
+
+def test_new_env_var_takes_precedence_over_alias(monkeypatch):
+    """PERMIT_AGENT_CLI wins over the deprecated PERMIT_GROK_CLI."""
+    monkeypatch.setenv("PERMIT_AGENT_CLI", "/nonexistent-xyz/runner.py")
+    monkeypatch.setenv("PERMIT_GROK_CLI", __file__)
+    with pytest.raises(RuntimeError) as exc:
+        llm_preflight()
+    assert "/nonexistent-xyz/runner.py" in str(exc.value)
 
 
 def _replay_transcript(path, lines):
@@ -119,7 +135,7 @@ def _replay_transcript(path, lines):
 
 def test_replay_never_touches_llm_backend(monkeypatch, tmp_path):
     """Replay mode is fully offline: it must not preflight the LLM runner."""
-    monkeypatch.setenv("PERMIT_GROK_CLI", "/nonexistent-xyz/grok.py")
+    monkeypatch.setenv("PERMIT_AGENT_CLI", "/nonexistent-xyz/grok.py")
     replay = tmp_path / "rec.jsonl"
     _replay_transcript(replay, [
         {"type": "beat", "n": 7, "task": "noop"},
@@ -177,12 +193,13 @@ def test_replay_reexecutes_actions_with_id_remap(tmp_path):
 
 
 def test_llm_preflight_fails_with_guidance_when_cli_unset(monkeypatch):
-    """No built-in default path: an unset PERMIT_GROK_CLI fails fast with guidance."""
+    """No built-in default path: an unset PERMIT_AGENT_CLI fails fast with guidance."""
+    monkeypatch.delenv("PERMIT_AGENT_CLI", raising=False)
     monkeypatch.delenv("PERMIT_GROK_CLI", raising=False)
     with pytest.raises(RuntimeError) as exc:
         llm_preflight()
     msg = str(exc.value)
-    assert "PERMIT_GROK_CLI" in msg
+    assert "PERMIT_AGENT_CLI" in msg
     assert "--replay" in msg
 
 # -- M3: the agent loop cannot escape its permit --------------------------------

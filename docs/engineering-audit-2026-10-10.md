@@ -1,6 +1,6 @@
-# Permit 360-degree engineering audit — through the Ternus lens
+# Permit 360-degree engineering audit (hardware-design lens)
 
-**Date:** 2026-10-10. **Auditor:** Ektar. **Scope:** `permit/` (authority core),
+**Date:** 2026-10-10. **Scope:** `permit/` (authority core),
 `settlement/` (money path), `server.py` (HTTP surface), `agent/`, `dashboard/`.
 **Method:** full read of the money path, lock-order analysis, API review.
 Tests: 184 passed, 0 failed (2026-10-09).

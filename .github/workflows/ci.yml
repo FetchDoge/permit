@@ -52,6 +52,13 @@ jobs:
           --cov=permit --cov=settlement
           --cov-report=xml:coverage.xml
           --cov-report=term-missing:skip-covered
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: matrix.python-version == '3.12'
+        with:
+          name: coverage-report
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 14
       - name: mock demo smoke
         if: matrix.python-version == '3.12'
         run: python demo.py

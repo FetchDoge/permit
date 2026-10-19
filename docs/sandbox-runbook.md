@@ -2,7 +2,7 @@
 
 Status: documented procedure. The automated, camera-ready beats (demos/demo_six_beat.py)
 run in **mock mode** (mock PayPal rail: no PayPal network, no PayPal
-credentials). The agent's reasoning is live (Grok CLI) unless
+credentials). The agent's reasoning is live (LLM CLI) unless
 `--replay demo_transcript.jsonl` is used — that is the fully offline,
 deterministic camera path. This document is
 the scripted procedure for the integrated SANDBOX run: every beat executed against

@@ -15,7 +15,6 @@ from settlement.verifier import (
     PredicateType,
     ReleaseVerifier,
     RetryRateIntegrityError,
-    sign_acceptance,
 )
 
 
@@ -65,7 +64,7 @@ def test_happy_path_type_d():
 
 def test_happy_path_type_a():
     verifier, paypal, permits, escrow, artifact = _setup(PredicateType.A)
-    sig = sign_acceptance("esc_1", escrow.artifact_hash, 3000)
+    sig = verifier.sign_acceptance("esc_1", escrow.artifact_hash, 3000)
     result = verifier.verify_and_capture("esc_1", Evidence(acceptance_signature=sig))
     assert result.released
     assert len(paypal.capture_calls) == 1
@@ -113,7 +112,7 @@ def test_n2_worker_signature_without_acceptance_no_capture():
 def test_replay_signature_on_other_escrow_fails():
     """Acceptance signature is bound to escrow id; replay fails."""
     verifier, paypal, permits, escrow, artifact = _setup(PredicateType.A)
-    sig_for_esc1 = sign_acceptance("esc_1", escrow.artifact_hash, 3000)
+    sig_for_esc1 = verifier.sign_acceptance("esc_1", escrow.artifact_hash, 3000)
     # Attacker replays esc_1's signature against a different escrow id.
     escrow.escrow_id = "esc_2"
     result = verifier.verify_and_capture(
@@ -185,7 +184,7 @@ def _original_refusal_hash(ledger, escrow_id: str) -> str | None:
 
 
 def test_retry_on_refused_or_voided_writes_denial_receipt():
-    """REA F6: every refused retry on an already REFUSED/VOIDED escrow must
+    """Review F6: every refused retry on an already REFUSED/VOIDED escrow must
     append a denial receipt with a unique receipt_id referencing the original
     refusal; capture must never run; hash chain stays valid."""
     for terminal, expected_reason, first_release in (
@@ -231,7 +230,7 @@ def test_retry_on_refused_or_voided_writes_denial_receipt():
 
 
 def test_retry_denial_receipts_serial_and_parallel():
-    """REA F6 concurrency: 25 serial + 25 parallel refused retries each write a
+    """Review F6 concurrency: 25 serial + 25 parallel refused retries each write a
     unique denial receipt referencing the original refusal; none capture."""
     import threading
 

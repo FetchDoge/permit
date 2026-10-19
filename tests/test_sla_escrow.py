@@ -12,7 +12,6 @@ from settlement.verifier import (
     Evidence,
     PredicateType,
     ReleaseVerifier,
-    sign_acceptance,
 )
 
 EXPIRY = datetime.now(timezone.utc) + timedelta(hours=1)
@@ -52,7 +51,7 @@ def test_capture_rolls_up_through_delegation():
         child.permit_id, 4000, MERCHANT, PredicateType.A, artifact_hash
     )
     assert attempt.allowed
-    sig = sign_acceptance(attempt.escrow_id, artifact_hash, 4000)
+    sig = verifier.sign_acceptance(attempt.escrow_id, artifact_hash, 4000)
     result = pipeline.release(
         attempt.escrow_id, Evidence(acceptance_signature=sig)
     )

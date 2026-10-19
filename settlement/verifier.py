@@ -35,6 +35,7 @@ Retries return the same capture; the money moves at most once.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import threading
@@ -168,28 +169,60 @@ class ReconcileResult:
     receipt: Receipt | None = None
 
 
-# Acceptance key: the counterparty's key in production. Defaults to the
-# hardcoded demo key ONLY when PERMIT_ACCEPTANCE_KEY is unset, and says
-# so loudly — a payment authority layer must never silently run on a
-# demo key. (Audit item 12: env-provided keys now; KMS/HSM story next.)
+# Acceptance key (issue #35): there is NO fallback key in library code.
+# A known fallback key lets anyone forge Type A acceptances in a default
+# deployment, so construction fails closed: the key must come from the
+# caller or from PERMIT_ACCEPTANCE_KEY, and must be at least 32 bytes.
+# Demo code opts in explicitly with allow_demo_key=True, which generates
+# a fresh random key per verifier instance (per run), never a constant.
 import os as _os
+import secrets as _secrets
 
-DEMO_ACCEPTANCE_KEY = b"demo-acceptance-key-NOT-FOR-PRODUCTION"
-ACCEPTANCE_KEY = _os.environ.get("PERMIT_ACCEPTANCE_KEY", "").encode() or DEMO_ACCEPTANCE_KEY
-if ACCEPTANCE_KEY is DEMO_ACCEPTANCE_KEY:
-    import warnings as _warnings
-    _warnings.warn(
-        "PERMIT_ACCEPTANCE_KEY unset: running on the demo acceptance key. "
-        "Set PERMIT_ACCEPTANCE_KEY in any real deployment.",
-        RuntimeWarning,
-        stacklevel=2,
-    )
+MIN_ACCEPTANCE_KEY_BYTES = 32
 
 
-def sign_acceptance(escrow_id: str, artifact_hash: str, amount_cents: int) -> str:
-    """What the counterparty (acceptance key holder) does off-camera."""
+def _coerce_key(key: bytes | str | None) -> bytes | None:
+    if key is None:
+        return None
+    return key.encode() if isinstance(key, str) else bytes(key)
+
+
+def resolve_acceptance_key(
+    key: bytes | str | None = None, *, allow_demo_key: bool = False
+) -> bytes:
+    """Resolve and validate the acceptance key, failing closed.
+
+    Order: explicit ``key`` argument, then PERMIT_ACCEPTANCE_KEY.
+    Missing, empty, or short (under 32 byte) keys raise ValueError,
+    unless ``allow_demo_key`` is set, in which case a fresh per-call
+    random key is generated (demo use only, off by default).
+    """
+    resolved = _coerce_key(key)
+    if resolved is None:
+        resolved = _coerce_key(_os.environ.get("PERMIT_ACCEPTANCE_KEY"))
+    if resolved is None or len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
+        if allow_demo_key:
+            return _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
+        raise ValueError(
+            "acceptance key missing, empty, or under "
+            f"{MIN_ACCEPTANCE_KEY_BYTES} bytes: pass acceptance_key or set "
+            "PERMIT_ACCEPTANCE_KEY (fail closed, issue #35)"
+        )
+    return resolved
+
+
+def sign_acceptance(
+    escrow_id: str, artifact_hash: str, amount_cents: int, key: bytes | str
+) -> str:
+    """What the counterparty (acceptance key holder) does off-camera.
+
+    The key is required: there is no module-level key to fall back to.
+    """
+    resolved = _coerce_key(key)
+    if resolved is None or len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
+        raise ValueError("sign_acceptance requires a key of at least 32 bytes")
     msg = f"{escrow_id}|{artifact_hash}|{amount_cents}".encode()
-    return hmac.new(ACCEPTANCE_KEY, msg, hashlib.sha256).hexdigest()
+    return hmac.new(resolved, msg, hashlib.sha256).hexdigest()
 
 
 class ReleaseVerifier:
@@ -199,6 +232,8 @@ class ReleaseVerifier:
         permits: PermitStore,
         ledger: Ledger | None = None,
         *,
+        acceptance_key: bytes | str | None = None,
+        allow_demo_key: bool = False,
         retry_rate_limit_n: int = DEFAULT_RETRY_RATE_LIMIT_N,
         retry_rate_limit_w: float = DEFAULT_RETRY_RATE_LIMIT_W,
         clock: Callable[[], float] | None = None,
@@ -206,6 +241,12 @@ class ReleaseVerifier:
         monotonic: Callable[[], float] | None = None,
         retry_rate_store=None,
     ):
+        # Fail closed at construction (issue #35): no usable acceptance
+        # key, no verifier. Demo callers pass allow_demo_key=True and get
+        # a fresh random key for this instance only.
+        self._acceptance_key = resolve_acceptance_key(
+            acceptance_key, allow_demo_key=allow_demo_key
+        )
         self.paypal = paypal
         self.permits = permits
         # NOTE: explicit None check — an empty Ledger is falsy via __len__.
@@ -251,6 +292,18 @@ class ReleaseVerifier:
                 store if store is not None else InMemoryRetryRateStore()
             )
         self._rebuild_retry_state()
+
+    def sign_acceptance(
+        self, escrow_id: str, artifact_hash: str, amount_cents: int
+    ) -> str:
+        """Sign with this verifier's acceptance key.
+
+        Demo/test convenience standing in for the off-camera counterparty
+        who holds the key in a real deployment.
+        """
+        return sign_acceptance(
+            escrow_id, artifact_hash, amount_cents, self._acceptance_key
+        )
 
     def register(self, escrow: Escrow) -> Receipt:
         """Register an escrow hold. Returns the AUTHORIZED receipt."""
@@ -631,6 +684,11 @@ class ReleaseVerifier:
                 continue
             restored[row.escrow_id] = state
         self._retry_rate_windows = restored
+
+    def get_escrow(self, escrow_id: str) -> Escrow | None:
+        """Read-only lookup of one escrow by id."""
+        with self._lock:
+            return self._escrows.get(escrow_id)
 
     def escrows_snapshot(self) -> list[dict]:
         """
@@ -1070,7 +1128,10 @@ class ReleaseVerifier:
             if evidence.acceptance_signature is None:
                 return False, "missing_acceptance_signature"
             expected = sign_acceptance(
-                escrow.escrow_id, escrow.artifact_hash, escrow.amount_cents
+                escrow.escrow_id,
+                escrow.artifact_hash,
+                escrow.amount_cents,
+                self._acceptance_key,
             )
             if not hmac.compare_digest(evidence.acceptance_signature, expected):
                 return False, "invalid_acceptance_signature"
@@ -1098,6 +1159,22 @@ class ReleaseVerifier:
             return False
 
     def verify_and_capture(self, escrow_id: str, evidence: Evidence) -> VerifyResult:
+        """
+        Single-flight, fail-closed release (see _verify_and_capture).
+
+        Once the late admission recheck takes settlement_gate, the gate stays
+        held until the outcome is committed (CAPTURED receipt, permit
+        settlement). An E-STOP is therefore receipted either before the
+        recheck (capture refused) or after CAPTURED, never in between (#22).
+        The gate is an RLock; gate_hold re-enters it and releases it when this
+        call returns or raises.
+        """
+        with contextlib.ExitStack() as gate_hold:
+            return self._verify_and_capture(escrow_id, evidence, gate_hold)
+
+    def _verify_and_capture(
+        self, escrow_id: str, evidence: Evidence, gate_hold: contextlib.ExitStack
+    ) -> VerifyResult:
         """
         Single-flight, fail-closed release. The ONLY path to capture.
 
@@ -1202,6 +1279,10 @@ class ReleaseVerifier:
             outcome = ("refused", self._void_hold_outside_lock(paypal_auth_id))
         else:
             with self.permits.settlement_gate:
+                # Keep the gate through Phase 3 so the commit cannot be
+                # overtaken by an E-STOP receipt (lock order: gate -> verifier
+                # -> permit, same as estop_cascade's gate -> permit).
+                gate_hold.enter_context(self.permits.settlement_gate)
                 late_reason = self.permits.release_block_reason(permit_id)
                 if late_reason is not None:
                     # Refuse: void the hold (I/O, no verifier lock).
@@ -1261,7 +1342,8 @@ class ReleaseVerifier:
                         else:
                             outcome = ("captured", capture)
 
-        # ---- Phase 3: commit. Verifier lock held, no provider I/O. ----
+        # ---- Phase 3: commit. Verifier lock held, no provider I/O. Still
+        # under settlement_gate when the release was admitted (Phase 2). ----
         with self._lock:
             escrow = self._escrows.get(escrow_id)
             # The escrow cannot vanish mid-flight (only this method drives

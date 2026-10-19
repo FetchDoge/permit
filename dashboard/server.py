@@ -67,6 +67,16 @@ class Dashboard:
             "approvals": approvals,
         }
 
+    def audit(self) -> dict:
+        """Read-only audit rollup of the ledger (see permit/audit.py).
+
+        Imported lazily: this module also runs standalone
+        (python3 dashboard/server.py) where the repo root, and so the
+        permit package, is not on sys.path.
+        """
+        from permit.audit import audit_summary
+        return audit_summary(self.ledger)
+
     def estop(self, permit_id: str) -> dict:
         if not self.flow:
             return {"ok": False, "error": "no flow bound"}
@@ -129,6 +139,8 @@ class Dashboard:
                         self._send(200, f.read(), "text/html")
                 elif self.path == "/api/state":
                     self._send(200, json.dumps(dash.state()))
+                elif self.path == "/api/audit":
+                    self._send(200, json.dumps(dash.audit()))
                 else:
                     self._send(404, b'{"error":"not found"}')
 

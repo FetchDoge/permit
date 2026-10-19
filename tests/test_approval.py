@@ -159,19 +159,41 @@ def test_approval_fails_closed_when_budget_moved():
     assert store.get_approval(a.approval_id).status == "approved"
 
 
-def test_approval_fails_closed_when_parent_revoked():
-    store, ledger, permit = make_store(cap=10000, threshold=2500)
-    flow, paypal = make_flow(store, ledger)
-    a = flow.spend(permit.permit_id, 4000, "m1", PredicateType.D, ah())
-    flow.approve_approval(a.approval_id)
-    # Revoke the permit (parent) before completion.
-    flow.estop(permit.permit_id)
-    before = len(paypal.authorize_calls)
-    c = flow.complete_approved_spend(a.approval_id)
-    assert not c.allowed
-    assert len(paypal.authorize_calls) == before
-    # Approval must NOT be consumed; only the authority recheck failed.
-    assert store.get_approval(a.approval_id).status == "approved"
+def test_revoke_subtree_between_approval_and_completion_blocks_spend():
+    """Issue #7: the principal approved, then the parent permit was revoked
+    via revoke_subtree() before the agent completed. Completion re-runs the
+    authority check, so it must come back BLOCKED (revoked) with zero PayPal
+    traffic, and the principal's approval must stay unconsumed."""
+    ledger = Ledger()
+    store = PermitStore(ledger)
+    parent, _ = store.grant(
+        "buyer", 8000, ["m1"],
+        datetime.now(timezone.utc) + timedelta(minutes=30),
+        approval_threshold_cents=1000,
+    )
+    rail = MockPayPalClient()
+    pipeline = SpendPipeline(store, rail, ReleaseVerifier(rail, store, ledger=ledger))
+
+    pending = pipeline.spend(parent.permit_id, 3500, "m1", PredicateType.D, ah())
+    assert pending.reason == "pending_principal_approval"
+    approval_id = pending.approval_id
+    pipeline.approve_approval(approval_id)
+    assert store.get_approval(approval_id).status == "approved"
+
+    store.revoke_subtree(parent.permit_id)
+    assert store.get(parent.permit_id).revoked
+
+    # Completing twice proves the failed recheck did not use up the approval.
+    for _ in range(2):
+        outcome = pipeline.complete_approved_spend(approval_id)
+        assert outcome.allowed is False
+        assert outcome.escrow_id is None
+        assert outcome.reason == "revoked"
+        assert [r.event_type for r in outcome.receipts][-1] == "BLOCKED"
+        assert store.get_approval(approval_id).status == "approved"
+
+    assert rail.authorize_calls == []
+    assert store.get(parent.permit_id).reserved_cents == 0
 
 
 def test_expired_approval_cannot_be_decided_or_completed():
