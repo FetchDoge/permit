@@ -490,7 +490,7 @@ MUTANTS = [
     ),
     (
         "harness_cli_no_persist",
-        "tests/test_rea_r5_commitment.py::test_harness_cli_k1_allow_demo_key_no_env",
+        "tests/test_rea_r5_commitment.py::test_durability_harness_py_k1_allow_demo_key_no_env_exit_0",
         """
         import harness.durability_harness as h
         from permit.durability import (
