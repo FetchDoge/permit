@@ -516,8 +516,9 @@ def main():
         help=(
             "Opt in to a generated acceptance key when PERMIT_ACCEPTANCE_KEY "
             "is unset (mock/demo only; off by default). With --db, the key is "
-            "persisted next to the ledger as <db>.acceptance_key mode 0600 "
-            "so restarts do not rotate it (#53)."
+            "persisted as <db>.acceptance_key (regular file, euid-owned, mode "
+            "0600, O_NOFOLLOW, exact 32 bytes, fsynced). If the ledger already "
+            "has entries and the key file is missing, refuse to start (#53)."
         ),
     )
     args = ap.parse_args()
