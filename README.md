@@ -36,23 +36,23 @@ where `remaining(P) = cap(P) − reserved(P) − captured(P)`. Four clauses, no 
 ```bash
 python -m pip install pytest
 python -m pytest -q        # full suite: mock rail, no credentials, no network
-python demo.py             # end-to-end mock demo, ends with the ledger chain check
+python demo.py --demo-key  # end-to-end mock demo, ends with the ledger chain check
 ```
 
 More demos (in `demos/`; `trace.py` is the canonical evidence path —
 it asserts the real gate and doubles as the run's evidence log):
 
 ```bash
-python demos/demo_sla_escrow.py        # offline: agent-to-agent SLA escrow, acceptance-signed capture, forged signature refused
-python server.py                 # the service at http://127.0.0.1:8741
-python trace.py                  # with server.py running: allow, block, delegate, cascade revoke, chain check
-python demos/demo_six_beat.py          # LLM agent: grant → capture → over-cap block → delegate + cascade → tampered evidence → timeout/reconcile
-python demos/demo_delegation.py --fast # LLM agents: buyer and researcher, five beats, live dashboard
-python demos/demo_approval.py --fast   # LLM agent: auto-allow, approve, deny, fail-closed
-python demos/demo_admission.py         # offline: runaway loop refused at budget exhaustion, concurrent overspend cannot exceed cap
+python demos/demo_sla_escrow.py --demo-key        # offline: agent-to-agent SLA escrow, acceptance-signed capture, forged signature refused
+python server.py --demo-key                 # the service at http://127.0.0.1:8741
+python trace.py --demo-key                  # starts its own server: allow, block, delegate, cascade revoke, chain check
+python demos/demo_six_beat.py --demo-key          # LLM agent: grant → capture → over-cap block → delegate + cascade → tampered evidence → timeout/reconcile
+python demos/demo_delegation.py --fast --demo-key # LLM agents: buyer and researcher, five beats, live dashboard
+python demos/demo_approval.py --fast --demo-key   # LLM agent: auto-allow, approve, deny, fail-closed
+python demos/demo_admission.py --demo-key         # offline: runaway loop refused at budget exhaustion, concurrent overspend cannot exceed cap
 ```
 
-The three LLM demos call the runner set by `PERMIT_AGENT_CLI` (the older name `PERMIT_GROK_CLI` is still read as a deprecated alias when `PERMIT_AGENT_CLI` is unset). There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demos/demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl` (gitignored — your own recordings stay local). A fresh clone ships one recorded transcript as a fixture, so the judge path runs with no recording of your own: `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` (provenance: `demos/fixtures/README.md`).
+The three LLM demos call the runner set by `PERMIT_AGENT_CLI` (the older name `PERMIT_GROK_CLI` is still read as a deprecated alias when `PERMIT_AGENT_CLI` is unset). There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demos/demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl` (gitignored; your own recordings stay local). A fresh clone ships one recorded transcript as a fixture, so the judge path runs with no recording of your own: `python3 demos/demo_six_beat.py --fast --demo-key --replay demos/fixtures/demo_transcript.jsonl` (provenance: `demos/fixtures/README.md`).
 
 ## How it fails
 
@@ -73,7 +73,7 @@ Permit fails closed. When state is uncertain, money does not move.
 **What it does not defend (production boundaries):**
 - With `--db PATH`, the SQLite ledger is durable (#24): survives crashes, restarts and a second writer on one machine; after some crashes an operator step is needed (rate unmeasured). Durable mode restores permits and reservations from receipts, but does not restore escrows, pending ops, or approvals (F3). Default (in-memory) mode still loses permits, escrows, revocations, and the ledger on restart.
 - HTTP POSTs require a single shared bearer token (`PERMIT_API_TOKEN`, #23) with no role split between principal and agent (F5). GETs, including `/api/ledger`, are unauthenticated; the server binds to 127.0.0.1.
-- Predicate A acceptance fails closed: the verifier refuses to construct without a configured acceptance key of at least 32 bytes (`PERMIT_ACCEPTANCE_KEY`); demos opt in explicitly to a per-run generated key (F12, #35).
+- Predicate A acceptance fails closed: the verifier refuses to construct without a configured acceptance key of at least 32 bytes (`PERMIT_ACCEPTANCE_KEY`). Whitespace-only keys are rejected, and a configured-but-invalid key (empty, under 32 bytes, whitespace) is fatal even in demo mode: the demo fallback applies only when no key is configured at all (#53). Demo entry points (`server.py`, `demo.py`, `demos/*`, `python -m permit`, `trace.py`) opt in only through an explicit `--demo-key` flag, off by default, generating a per-run key; with `server.py --db`, that key instead persists in a 0600 `<db>.demo-key` sidecar file so it does not change across restarts. API change (#35): `sign_acceptance` takes the key as a required argument; the old module-level fallback key is gone.
 - The ledger is a hash chain, not a signature. It detects edits and reordering, but it cannot detect removal of final entries without an external checkpoint.
 - It is a single-merchant sandbox prototype, not a claim about all agent payments.
 - E-stop voids uncaptured authorizations. A completed capture needs a refund path, which is out of scope.

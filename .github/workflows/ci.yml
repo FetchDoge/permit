@@ -50,7 +50,7 @@ jobs:
           retention-days: 14
       - name: mock demo smoke
         if: matrix.python-version == '3.12'
-        run: python demo.py
+        run: python demo.py --demo-key
 
   test-optimized:
     name: pytest (python -O)

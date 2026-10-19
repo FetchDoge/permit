@@ -118,8 +118,8 @@ jobs:
           set -euo pipefail
           root="$PWD"
           mkdir -p "$root/forge-demos"
-          (cd /tmp && /tmp/forge-venv/bin/permit demo) 2>&1 | tee "$root/forge-demos/demo.out"
-          (cd /tmp && /tmp/forge-venv/bin/permit demo-recovery) 2>&1 | tee "$root/forge-demos/demo-recovery.out"
+          (cd /tmp && /tmp/forge-venv/bin/permit demo --demo-key) 2>&1 | tee "$root/forge-demos/demo.out"
+          (cd /tmp && /tmp/forge-venv/bin/permit demo-recovery --demo-key) 2>&1 | tee "$root/forge-demos/demo-recovery.out"
           c13=$(grep -c "LEDGER VERIFIED: 13" "$root/forge-demos/demo.out" || true)
           c6=$(grep -c "LEDGER VERIFIED: 6" "$root/forge-demos/demo-recovery.out" || true)
           echo "demo LEDGER VERIFIED: 13 count=${c13}"

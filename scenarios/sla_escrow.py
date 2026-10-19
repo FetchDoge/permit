@@ -39,7 +39,7 @@ from permit.permit import PermitStore
 from settlement.verifier import (
     Evidence,
     PredicateType,
-    ReleaseVerifier,
+    entrypoint_verifier,
 )
 
 MERCHANT = "report_foundry"
@@ -50,11 +50,11 @@ def money(cents: int) -> str:
     return f"${cents / 100:.2f}"
 
 
-def run_sla_escrow(paypal, ledger: Ledger | None = None) -> dict:
+def run_sla_escrow(paypal, ledger: Ledger | None = None, demo_key: bool = False) -> dict:
     """Run the SLA escrow scenario. Returns a transcript dict of beats."""
     ledger = ledger if ledger is not None else Ledger()
     permits = PermitStore(ledger=ledger)
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=True)
+    verifier = entrypoint_verifier(paypal, permits, ledger=ledger, demo_key=demo_key)
     pipeline = SpendPipeline(permits, paypal, verifier, ledger=ledger)
     beats: list[dict] = []
     now = datetime.now(timezone.utc)
