@@ -33,11 +33,11 @@ jobs:
         run: python -m pip install --upgrade pip "pytest>=8" "pytest-cov>=5"
       - name: tests
         if: matrix.python-version != '3.12'
-        run: python -m pytest -q
+        run: python -m pytest -q -rs
       - name: tests with coverage
         if: matrix.python-version == '3.12'
         run: >
-          python -m pytest -q
+          python -m pytest -q -rs
           --cov=permit --cov=settlement
           --cov-report=xml:coverage.xml
           --cov-report=term-missing:skip-covered
@@ -67,7 +67,7 @@ jobs:
         run: python -m pip install --upgrade pip "pytest>=8"
       - name: tests under -O
         # Asserts are stripped under -O; suite must still pass (trust-boundary asserts are a known debt).
-        run: python -O -m pytest -q
+        run: python -O -m pytest -q -rs
 
   lint:
     name: ruff
