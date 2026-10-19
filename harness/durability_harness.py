@@ -35,11 +35,17 @@ from permit.durability import (
 from settlement.verifier import Evidence, PredicateType
 
 
-def _build(durable_dir: Path):
+def _build(durable_dir: Path, *, allow_demo_key: bool = False):
     ledger = DurableLedger(durable_dir=durable_dir)
     permits = DurablePermitStore(ledger=ledger, durable_dir=durable_dir)
     paypal = DurableMockPayPalClient(durable_dir=durable_dir)
-    verifier = DurableReleaseVerifier(paypal, permits, ledger=ledger, durable_dir=durable_dir, allow_demo_key=True)
+    verifier = DurableReleaseVerifier(
+        paypal,
+        permits,
+        ledger=ledger,
+        durable_dir=durable_dir,
+        allow_demo_key=allow_demo_key,
+    )
     flow = DurableSpendPipeline(permits, paypal, verifier, ledger=ledger, durable_dir=durable_dir)
     return ledger, permits, paypal, verifier, flow
 
@@ -69,12 +75,20 @@ def _artifact():
 KILL_POINTS = ("K1", "K2", "K3", "K4")
 
 
-def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -> dict:
+def _run_kill_point(
+    kill_point: str,
+    durable_dir: Path,
+    verbose: bool = False,
+    *,
+    allow_demo_key: bool = False,
+) -> dict:
     """Run one kill-point scenario. Returns dict with PASS/FAIL per expectation."""
     import multiprocessing
 
     artifact, digest = _artifact()
-    ledger, permits, paypal, verifier, flow = _build(durable_dir)
+    ledger, permits, paypal, verifier, flow = _build(
+        durable_dir, allow_demo_key=allow_demo_key
+    )
     permit = _grant(permits)
     permit_id = permit.permit_id
     # Release writer lock before fork/reload so the child (and the post-kill
@@ -92,7 +106,7 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
     # For K4, we need to drive to UNKNOWN via timeout then kill before reconcile
     # For all, child does spend with hooks that write sentinel at kill point
 
-    def child_main(q, kill_point_inner, durable_dir_str):
+    def child_main(q, kill_point_inner, durable_dir_str, allow_demo_key_inner):
         # Re-build inside child (same dir, but new objects)
         import pathlib
         d = pathlib.Path(durable_dir_str)
@@ -103,7 +117,13 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
         ledger_c = DurableLedger(durable_dir=d)
         permits_c = DurablePermitStore(ledger=ledger_c, durable_dir=d)
         paypal_c = DurableMockPayPalClient(durable_dir=d)
-        verifier_c = DurableReleaseVerifier(paypal_c, permits_c, ledger=ledger_c, durable_dir=d, allow_demo_key=True)
+        verifier_c = DurableReleaseVerifier(
+            paypal_c,
+            permits_c,
+            ledger=ledger_c,
+            durable_dir=d,
+            allow_demo_key=allow_demo_key_inner,
+        )
         flow_c = DurableSpendPipeline(permits_c, paypal_c, verifier_c, ledger=ledger_c, durable_dir=d)
         permit_c = permits_c.get(permit_id)
         if permit_c is None:
@@ -201,7 +221,10 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
 
     # Use a queue to get child status if it doesn't die
     q = ctx.Queue()
-    p = ctx.Process(target=child_main, args=(q, kill_point, str(durable_dir)))
+    p = ctx.Process(
+        target=child_main,
+        args=(q, kill_point, str(durable_dir), allow_demo_key),
+    )
     p.start()
 
     # Wait for sentinel
@@ -255,7 +278,9 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
     time.sleep(0.2)  # let fs finish
 
     # Fresh process reload: new objects from same dir (lock free after kill).
-    ledger2, permits2, paypal2, verifier2, flow2 = _build(durable_dir)
+    ledger2, permits2, paypal2, verifier2, flow2 = _build(
+        durable_dir, allow_demo_key=allow_demo_key
+    )
     permit2 = permits2.get(permit_id)
 
     result: dict = {"kill_point": kill_point, "pass": True, "details": []}
@@ -348,7 +373,13 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
             check("no_duplicate_after_reconcile", len(paypal3.capture_calls) == before_calls, f"calls before={before_calls} after={len(paypal3.capture_calls)}")
             check("captures_still_one", len(paypal3.captures) == before_captures, f"captures={len(paypal3.captures)}")
             # Escrow should now be CAPTURED
-            verifier3 = DurableReleaseVerifier(paypal3, permits2, ledger=ledger2, durable_dir=durable_dir, allow_demo_key=True)
+            verifier3 = DurableReleaseVerifier(
+                paypal3,
+                permits2,
+                ledger=ledger2,
+                durable_dir=durable_dir,
+                allow_demo_key=allow_demo_key,
+            )
             escrow3 = verifier3.get_escrow(escrow.escrow_id)
             if escrow3:
                 check("escrow_captured_after_reconcile", escrow3.state == "CAPTURED", f"state={escrow3.state}")
@@ -375,6 +406,15 @@ def main(argv=None):
     ap.add_argument("--all", action="store_true", help="run all kill points")
     ap.add_argument("--work-dir", help="durable dir (default: mktemp)")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--allow-demo-key",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to a generated acceptance key when PERMIT_ACCEPTANCE_KEY "
+            "is unset (demo only; off by default, #53)"
+        ),
+    )
     args = ap.parse_args(argv)
 
     if not args.kill_point and not args.all:
@@ -393,7 +433,12 @@ def main(argv=None):
         # Each kill point gets its own subdir to isolate
         sub = work_dir / kp
         sub.mkdir(parents=True, exist_ok=True)
-        res = _run_kill_point(kp, sub, verbose=args.verbose or args.all)
+        res = _run_kill_point(
+            kp,
+            sub,
+            verbose=args.verbose or args.all,
+            allow_demo_key=args.allow_demo_key,
+        )
         if not args.verbose and not args.all:
             # Single mode: print details
             print(f"[{kp}] {'PASS' if res['pass'] else 'FAIL'}")

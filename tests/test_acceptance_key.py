@@ -125,8 +125,9 @@ def test_demo_key_path_persists_across_resolve(monkeypatch, tmp_path):
     assert k1 == k2
     from settlement.verifier import load_or_create_demo_key
 
-    k3 = load_or_create_demo_key(path)
+    k3, mode = load_or_create_demo_key(path)
     assert k3 == k1
+    assert mode == 0o600
 
 
 def test_sign_acceptance_requires_a_real_key():

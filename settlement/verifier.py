@@ -109,11 +109,16 @@ class ReconcileResult:
 # with --allow-demo-key / allow_demo_key=True (off by default). When that
 # flag is set and no key is configured, a fresh random key is generated;
 # if a durable demo_key_path is also given (server --db), the key is
-# persisted mode 0600 so restarts do not rotate it. A key that IS set
-# (env or argument) but invalid always raises — the demo flag never
-# papered over a bad configured key.
+# persisted as a regular file owned by the server euid with mode exactly
+# 0600 (O_NOFOLLOW; create uses O_CREAT|O_EXCL|O_NOFOLLOW + fsync). A key
+# that IS set (env or argument) but invalid always raises — the demo flag
+# never papered over a bad configured key. If the durable ledger already
+# has entries and the key file is missing, startup refuses rather than
+# silently regenerating.
+import errno as _errno
 import os as _os
 import secrets as _secrets
+import stat as _stat
 from pathlib import Path as _Path
 
 MIN_ACCEPTANCE_KEY_BYTES = 32
@@ -139,30 +144,135 @@ def _require_valid_key(resolved: bytes, *, what: str = "acceptance key") -> byte
     return resolved
 
 
-def load_or_create_demo_key(path: str | _os.PathLike[str]) -> bytes:
-    """Load a demo acceptance key from ``path``, or create one at mode 0600.
+def _open_demo_key_readonly(key_path: _Path) -> int:
+    """Open ``key_path`` with O_NOFOLLOW; raise ValueError on symlink/missing."""
+    flags = _os.O_RDONLY | getattr(_os, "O_NOFOLLOW", 0)
+    try:
+        return _os.open(key_path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        if exc.errno in (
+            getattr(_errno, "ELOOP", -1),
+            getattr(_errno, "EMLINK", -1),
+        ):
+            raise ValueError(
+                f"demo acceptance key at {key_path} must not be a symlink"
+            ) from exc
+        # Some platforms surface symlink-via-NOFOLLOW as EPERM.
+        if exc.errno == _errno.EPERM:
+            raise ValueError(
+                f"demo acceptance key at {key_path} must not be a symlink"
+            ) from exc
+        raise
 
-    Used by durable mock mode (``server.py --db`` with ``--allow-demo-key``)
-    so the key does not silently rotate across restarts (#53).
+
+def _require_demo_key_fstat(fd: int, key_path: _Path) -> int:
+    """Require a regular file owned by euid with mode exactly 0600.
+
+    Returns the verified mode (always 0o600 on success).
+    """
+    st = _os.fstat(fd)
+    if not _stat.S_ISREG(st.st_mode):
+        raise ValueError(
+            f"demo acceptance key at {key_path} must be a regular file"
+        )
+    mode = _stat.S_IMODE(st.st_mode)
+    if mode != 0o600:
+        raise ValueError(
+            f"demo acceptance key at {key_path} must have mode 0600 "
+            f"(got {mode:04o})"
+        )
+    euid = _os.geteuid()
+    if st.st_uid != euid:
+        raise ValueError(
+            f"demo acceptance key at {key_path} must be owned by euid "
+            f"{euid} (got uid {st.st_uid})"
+        )
+    return mode
+
+
+def _read_exact_demo_key(fd: int, key_path: _Path) -> bytes:
+    """Read exactly MIN_ACCEPTANCE_KEY_BYTES and require EOF (no trailing)."""
+    data = _os.read(fd, MIN_ACCEPTANCE_KEY_BYTES + 1)
+    if len(data) < MIN_ACCEPTANCE_KEY_BYTES:
+        raise ValueError(
+            f"demo acceptance key at {key_path} is truncated "
+            f"({len(data)} bytes, need {MIN_ACCEPTANCE_KEY_BYTES})"
+        )
+    if len(data) > MIN_ACCEPTANCE_KEY_BYTES:
+        raise ValueError(
+            f"demo acceptance key at {key_path} has trailing bytes after "
+            f"{MIN_ACCEPTANCE_KEY_BYTES}-byte key"
+        )
+    return _require_valid_key(data, what=f"demo acceptance key at {key_path}")
+
+
+def _fsync_dir(dir_path: _Path) -> None:
+    dir_fd = _os.open(dir_path, _os.O_RDONLY | getattr(_os, "O_DIRECTORY", 0))
+    try:
+        _os.fsync(dir_fd)
+    finally:
+        _os.close(dir_fd)
+
+
+def load_or_create_demo_key(
+    path: str | _os.PathLike[str],
+    *,
+    db_nonempty: bool = False,
+) -> tuple[bytes, int]:
+    """Load or create a durable demo acceptance key file.
+
+    Security posture (REA #54 / seq 1690):
+    - Open existing files with ``O_NOFOLLOW``; refuse symlinks.
+    - Require a regular file owned by the process euid with mode exactly 0600.
+    - Read exactly 32 bytes and require EOF (no trailing newline/bytes).
+    - Create with ``O_CREAT|O_EXCL|O_NOFOLLOW`` at 0600, then ``fsync`` the
+      file and its directory.
+    - If ``db_nonempty`` and the key file is missing, refuse to regenerate.
+
+    Returns ``(key_bytes, verified_mode)`` so callers can log the mode only
+    after it has been checked.
     """
     key_path = _Path(path)
-    if key_path.exists():
-        return _require_valid_key(
-            key_path.read_bytes(), what=f"demo acceptance key at {key_path}"
-        )
-    key = _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = _os.open(
-        key_path,
-        _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL,
-        0o600,
-    )
     try:
-        _os.write(fd, key)
+        fd = _open_demo_key_readonly(key_path)
+    except FileNotFoundError:
+        if db_nonempty:
+            raise ValueError(
+                f"demo acceptance key missing at {key_path} but the durable "
+                "ledger has entries; refusing to regenerate (issue #53)"
+            )
+        return _create_demo_key_file(key_path)
+
+    try:
+        mode = _require_demo_key_fstat(fd, key_path)
+        key = _read_exact_demo_key(fd, key_path)
+        return key, mode
     finally:
         _os.close(fd)
-    _os.chmod(key_path, 0o600)
-    return key
+
+
+def _create_demo_key_file(key_path: _Path) -> tuple[bytes, int]:
+    key = _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = (
+        _os.O_WRONLY
+        | _os.O_CREAT
+        | _os.O_EXCL
+        | getattr(_os, "O_NOFOLLOW", 0)
+    )
+    fd = _os.open(key_path, flags, 0o600)
+    try:
+        _os.write(fd, key)
+        # umask may have cleared bits from the create mode; force 0600.
+        _os.fchmod(fd, 0o600)
+        _os.fsync(fd)
+        mode = _require_demo_key_fstat(fd, key_path)
+    finally:
+        _os.close(fd)
+    _fsync_dir(key_path.parent)
+    return key, mode
 
 
 def resolve_acceptance_key(
@@ -170,6 +280,7 @@ def resolve_acceptance_key(
     *,
     allow_demo_key: bool = False,
     demo_key_path: str | _os.PathLike[str] | None = None,
+    demo_key_db_nonempty: bool = False,
 ) -> bytes:
     """Resolve and validate the acceptance key, failing closed.
 
@@ -179,8 +290,9 @@ def resolve_acceptance_key(
     ``allow_demo_key`` is set (#53).
 
     When no key is configured at all and ``allow_demo_key`` is set:
-    if ``demo_key_path`` is given, load or create a 0600 key file there;
-    otherwise generate a fresh per-call random key (ephemeral demos).
+    if ``demo_key_path`` is given, load or create a 0600 key file there
+    (see ``load_or_create_demo_key``); otherwise generate a fresh per-call
+    random key (ephemeral demos).
     """
     if key is not None:
         resolved = _coerce_key(key)
@@ -194,7 +306,10 @@ def resolve_acceptance_key(
 
     if allow_demo_key:
         if demo_key_path is not None:
-            return load_or_create_demo_key(demo_key_path)
+            key_bytes, _mode = load_or_create_demo_key(
+                demo_key_path, db_nonempty=demo_key_db_nonempty
+            )
+            return key_bytes
         return _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
 
     raise ValueError(
@@ -230,6 +345,7 @@ class ReleaseVerifier:
         acceptance_key: bytes | str | None = None,
         allow_demo_key: bool = False,
         demo_key_path: str | _os.PathLike[str] | None = None,
+        demo_key_db_nonempty: bool = False,
     ):
         # Fail closed at construction (issues #35/#53): no usable
         # acceptance key, no verifier. Demo callers pass
@@ -238,6 +354,10 @@ class ReleaseVerifier:
             acceptance_key,
             allow_demo_key=allow_demo_key,
             demo_key_path=demo_key_path,
+            demo_key_db_nonempty=demo_key_db_nonempty,
+        )
+        self._demo_key_path = (
+            str(demo_key_path) if demo_key_path is not None else None
         )
         self.paypal = paypal
         self.permits = permits
