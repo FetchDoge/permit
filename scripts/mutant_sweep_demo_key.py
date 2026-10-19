@@ -332,7 +332,7 @@ MUTANTS = [
     ),
     (
         "rebind_skips_old_key_check",
-        "tests/test_rea_r5_commitment.py::test_rebind_refused_with_wrong_old_key",
+        "tests/test_rea_r5_commitment.py::test_rebind_refused_with_wrong_old_key[token_hex_32_64_chars]",
         """
         import settlement.verifier as v
         from permit.sqlite_ledger import ACCEPTANCE_KEY_COMMITMENT_META
@@ -450,7 +450,7 @@ MUTANTS = [
     ),
     (
         "rebind_accepts_wrong_then_overwrites",
-        "tests/test_rea_r5_commitment.py::test_rebind_refused_with_wrong_old_key",
+        "tests/test_rea_r5_commitment.py::test_rebind_refused_with_wrong_old_key[48_bytes]",
         """
         import settlement.verifier as v
         from permit.sqlite_ledger import ACCEPTANCE_KEY_COMMITMENT_META
@@ -652,7 +652,7 @@ MUTANTS = [
     ),
     (
         "rebind_success_path_noop",
-        "tests/test_rea_r5_commitment.py::test_rebind_succeeds_with_correct_old_key",
+        "tests/test_rea_r5_commitment.py::test_rebind_migration_refused_before_works_after[token_hex_32_64_chars]",
         """
         import settlement.verifier as v
         def rebind_noop(db_ledger, old_key, new_key):

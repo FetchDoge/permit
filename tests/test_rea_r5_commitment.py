@@ -406,40 +406,111 @@ def test_durability_harness_py_k1_allow_demo_key_no_env_exit_0(
 # ---------------------------------------------------------------------------
 
 
-def test_rebind_succeeds_with_correct_old_key(tmp_path):
+def _old_key_48() -> bytes:
+    return os.urandom(48)
+
+
+def _old_key_token_hex_32() -> bytes:
+    """64 UTF-8 characters from secrets.token_hex(32) (pre-exact-32 README)."""
+    import secrets
+
+    key = secrets.token_hex(32).encode("utf-8")
+    assert len(key) == 64
+    return key
+
+
+@pytest.mark.parametrize(
+    "old_key_factory,label",
+    [
+        (_old_key_48, "48_bytes"),
+        (_old_key_token_hex_32, "token_hex_32_64_chars"),
+    ],
+    ids=["48_bytes", "token_hex_32_64_chars"],
+)
+def test_rebind_migration_refused_before_works_after(
+    tmp_path, monkeypatch, old_key_factory, label
+):
+    """Long OLD keys are locked out at startup; rebind with the right OLD unlocks.
+
+    Covers 48-byte keys and 64-char token_hex(32) keys (REA r5 fix 6).
+    """
+    monkeypatch.delenv("PERMIT_ACCEPTANCE_KEY", raising=False)
+    from permit.ledger import Ledger
+    from permit.permit import PermitStore
     from permit.sqlite_ledger import (
         ACCEPTANCE_KEY_COMMITMENT_META,
         SqliteLedger,
     )
+    from settlement.paypal_client import MockPayPalClient
     from settlement.verifier import (
+        ReleaseVerifier,
         acceptance_key_commitment,
         ensure_acceptance_key_commitment,
         rebind_acceptance_key_commitment,
     )
 
-    # Simulate 19b62ce binding with token_hex(32) → 64 UTF-8 bytes.
-    old_key = os.urandom(32).hex().encode("utf-8")
-    assert len(old_key) == 64
+    old_key = old_key_factory()
+    assert len(old_key) != MIN, f"{label}: old key must not be exact-32"
     new_key = os.urandom(MIN)
-    db = tmp_path / "mig.db"
+    assert len(new_key) == MIN
+
+    db = tmp_path / f"mig_{label}.db"
     lg = SqliteLedger(str(db))
     try:
-        # Direct set_meta of old commitment (as 19b62ce would have stored).
+        # Simulate pre-upgrade bind (19b62ce stored HMAC of the long key).
         lg.set_meta(
             ACCEPTANCE_KEY_COMMITMENT_META,
             acceptance_key_commitment(old_key),
         )
         _append_one(lg)
+
+        # Before rebind: long OLD key refused at startup (exact-32 rule).
+        with pytest.raises(ValueError, match="exactly 32 bytes"):
+            ReleaseVerifier(
+                MockPayPalClient(),
+                PermitStore(ledger=Ledger()),
+                ledger=lg,
+                acceptance_key=old_key,
+            )
+
+        # Before rebind: a fresh exact-32 key is also refused (commitment mismatch).
+        with pytest.raises(ValueError, match=REFUSE):
+            ensure_acceptance_key_commitment(lg, new_key)
+        with pytest.raises(ValueError, match=REFUSE):
+            ReleaseVerifier(
+                MockPayPalClient(),
+                PermitStore(ledger=Ledger()),
+                ledger=lg,
+                acceptance_key=new_key,
+            )
+
+        # Rebind with the right OLD key → NEW binds.
         rebind_acceptance_key_commitment(lg, old_key, new_key)
         assert lg.get_meta(ACCEPTANCE_KEY_COMMITMENT_META) == (
             acceptance_key_commitment(new_key)
         )
+
+        # After rebind: startup with NEW succeeds.
         ensure_acceptance_key_commitment(lg, new_key)
+        ReleaseVerifier(
+            MockPayPalClient(),
+            PermitStore(ledger=Ledger()),
+            ledger=lg,
+            acceptance_key=new_key,
+        )
     finally:
         lg.close()
 
 
-def test_rebind_refused_with_wrong_old_key(tmp_path):
+@pytest.mark.parametrize(
+    "old_key_factory,label",
+    [
+        (_old_key_48, "48_bytes"),
+        (_old_key_token_hex_32, "token_hex_32_64_chars"),
+    ],
+    ids=["48_bytes", "token_hex_32_64_chars"],
+)
+def test_rebind_refused_with_wrong_old_key(tmp_path, old_key_factory, label):
     from permit.sqlite_ledger import (
         ACCEPTANCE_KEY_COMMITMENT_META,
         SqliteLedger,
@@ -449,10 +520,11 @@ def test_rebind_refused_with_wrong_old_key(tmp_path):
         rebind_acceptance_key_commitment,
     )
 
-    old_key = os.urandom(32).hex().encode("utf-8")
-    wrong = os.urandom(32).hex().encode("utf-8")
+    old_key = old_key_factory()
+    wrong = os.urandom(len(old_key))
+    assert wrong != old_key
     new_key = os.urandom(MIN)
-    db = tmp_path / "mig_bad.db"
+    db = tmp_path / f"mig_bad_{label}.db"
     lg = SqliteLedger(str(db))
     try:
         lg.set_meta(
