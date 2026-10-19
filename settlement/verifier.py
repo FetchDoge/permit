@@ -130,6 +130,30 @@ def acceptance_key_commitment(key: bytes) -> str:
     return hmac.new(key, ACCEPTANCE_KEY_COMMITMENT_MSG, hashlib.sha256).hexdigest()
 
 
+def ensure_acceptance_key_commitment(db_ledger, key: bytes) -> None:
+    """Bind ``key`` to a durable ledger on first use; refuse rotation.
+
+    Every ``--db`` / SqliteLedger entry point must call this after resolving
+    the acceptance key. Rotating the key on an existing database refuses
+    startup — there is no rebind for now (REA seq 1854).
+    """
+    # Imported here to keep settlement.verifier free of a hard sqlite import
+    # cycle at module load for callers that never touch durable mode.
+    from permit.sqlite_ledger import ACCEPTANCE_KEY_COMMITMENT_META
+
+    digest = acceptance_key_commitment(key)
+    stored = db_ledger.get_meta(ACCEPTANCE_KEY_COMMITMENT_META)
+    if stored is None:
+        db_ledger.set_meta(ACCEPTANCE_KEY_COMMITMENT_META, digest)
+        return
+    if not hmac.compare_digest(stored, digest):
+        raise ValueError(
+            "acceptance key commitment mismatch with durable ledger: "
+            "rotating the acceptance key on an existing database refuses "
+            "startup (no rebind for now)"
+        )
+
+
 def _coerce_key(key: bytes | str | None) -> bytes | None:
     if key is None:
         return None
@@ -445,6 +469,9 @@ class ReleaseVerifier:
         self.permits = permits
         # NOTE: explicit None check — an empty Ledger is falsy via __len__.
         self.ledger = ledger if ledger is not None else Ledger()
+        # Durable SqliteLedger (--db) entry point: bind/refuse key commitment.
+        if hasattr(self.ledger, "get_meta") and hasattr(self.ledger, "set_meta"):
+            ensure_acceptance_key_commitment(self.ledger, self._acceptance_key)
         self._escrows: dict[str, Escrow] = {}
         self._lock = threading.Lock()
 

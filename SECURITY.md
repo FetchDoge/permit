@@ -36,6 +36,16 @@ There is **no bug bounty**, and no monetary reward is offered or implied. This i
 research project maintained by one person. What it can offer is a fast, honest response and public
 credit.
 
+## Acceptance key + durable `--db` ledger
+
+- `PERMIT_ACCEPTANCE_KEY`, when set, is always used (including with `--db --allow-demo-key`).
+  Empty, whitespace-only, and under-32-byte values refuse startup; the demo flag never
+  papers over a bad configured key.
+- With `--db`, the ledger stores an HMAC commitment of the acceptance key on first use
+  (`ensure_acceptance_key_commitment`, enforced in `ReleaseVerifier` for every
+  `SqliteLedger` and again at `server.py --db`). **Rotating the acceptance key on an
+  existing database refuses startup (no rebind for now).**
+
 ## Related
 
 - Our agent-systems threat posture and the method behind these reviews: see the `adversarial-seat`

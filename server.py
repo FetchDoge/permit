@@ -57,8 +57,9 @@ from settlement.verifier import (
     Evidence,
     PredicateType,
     ReleaseVerifier,
-    acceptance_key_commitment,
+    ensure_acceptance_key_commitment,
     load_or_create_demo_key,
+    resolve_acceptance_key,
 )
 
 # ---------------------------------------------------------------- state
@@ -499,25 +500,6 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not_found")
 
 
-def _ensure_acceptance_key_commitment(db_ledger, key: bytes) -> None:
-    """Store HMAC(key, 'permit-acceptance-key-v1') on first use; refuse mismatch.
-
-    Raises ValueError on mismatch so callers can exit as 'acceptance key error'.
-    """
-    from permit.sqlite_ledger import ACCEPTANCE_KEY_COMMITMENT_META
-
-    digest = acceptance_key_commitment(key)
-    stored = db_ledger.get_meta(ACCEPTANCE_KEY_COMMITMENT_META)
-    if stored is None:
-        db_ledger.set_meta(ACCEPTANCE_KEY_COMMITMENT_META, digest)
-        return
-    if not hmac.compare_digest(stored, digest):
-        raise ValueError(
-            "acceptance key commitment mismatch with durable ledger "
-            "(HMAC key material changed since first use)"
-        )
-
-
 # ---------------------------------------------------------------- main
 
 def main():
@@ -563,9 +545,11 @@ def main():
     # Demo key is an explicit opt-in (#53), not implied by mock mode.
     # Open the durable ledger BEFORE resolving a demo key so a nonempty
     # db with a missing key file refuses to start instead of regenerating.
-    # Load the durable demo key at most once here, then pass the bytes into
-    # ReleaseVerifier — a second load could recreate a deleted file while
-    # the process kept signing with the first key (REA seq 1801).
+    # Key order (REA seq 1854 / regression from 2a1bbfe): whenever
+    # PERMIT_ACCEPTANCE_KEY is set, use that exact key (refuse empty /
+    # whitespace-only / wrong-length the same way 70b0fc6 did). Fall back
+    # to the durable key file only when the env var is unset. Load the
+    # file at most once, then pass the bytes into ReleaseVerifier.
     demo_key_path = None
     demo_key_bytes = None
     demo_key_mode = None
@@ -582,7 +566,15 @@ def main():
         if args.allow_demo_key:
             demo_key_path = f"{args.db}.acceptance_key"
 
-    if demo_key_path is not None:
+    env_key_set = "PERMIT_ACCEPTANCE_KEY" in os.environ
+    if env_key_set:
+        # Env wins over the durable file; invalid values fail closed even
+        # with --allow-demo-key (#53 bar 3).
+        try:
+            demo_key_bytes = resolve_acceptance_key()
+        except ValueError as exc:
+            raise SystemExit(f"acceptance key error: {exc}") from None
+    elif demo_key_path is not None:
         try:
             demo_key_bytes, demo_key_mode = load_or_create_demo_key(
                 demo_key_path, db_nonempty=demo_key_db_nonempty
@@ -612,14 +604,14 @@ def main():
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
 
     if args.db:
-        # Bind the acceptance key to the durable ledger on first use; refuse
-        # a same-length swapped key on later starts (REA seq 1801 / N-b).
+        # Explicit --db entry point: bind/refuse commitment (also enforced
+        # inside ReleaseVerifier for any SqliteLedger consumer).
         try:
-            _ensure_acceptance_key_commitment(ledger, verifier._acceptance_key)
+            ensure_acceptance_key_commitment(ledger, verifier._acceptance_key)
         except ValueError as exc:
             raise SystemExit(f"acceptance key error: {exc}") from None
 
-    if demo_key_path is not None and demo_key_mode is not None:
+    if demo_key_path is not None and demo_key_mode is not None and not env_key_set:
         log.info(
             f"demo acceptance key persisted at {demo_key_path} "
             f"(mode {demo_key_mode:04o})"
