@@ -1698,11 +1698,10 @@ def test_c5_creating_live_good_token_no_flock_rolled_back_refused():
 def test_a2b_creating_after_real_pid_reuse_refused():
     """A2b: recycled PID with the *new* process's start token, no flock.
 
-    Deterministic: kill a worker, respawn until the OS reuses its PID, plant
-    creating with that pid + the new start token. Fails on 7bb7c02 (accepts
-    live pid+start without flock); head refuses.
+    Deterministic via fork: exit+wait a child, then fork until the kernel
+    reuses that PID; plant creating with the new start token. Fails on
+    7bb7c02 (accepts live pid+start without flock); head refuses.
     """
-    import multiprocessing as mp
     import tempfile
 
     from permit import retry_rate_store as rrs
@@ -1711,51 +1710,44 @@ def test_a2b_creating_after_real_pid_reuse_refused():
         RetryRateIntegrityError,
         _HW_CREATING_INTENT,
         _atomic_write_hw_record,
+        _process_start_token,
         create_high_water,
         high_water_lock,
     )
     from permit.sqlite_ledger import SqliteLedger
 
-    ctx = mp.get_context("spawn")
-    ready_q = ctx.Queue()
     with tempfile.TemporaryDirectory() as td:
-        stop_path = td + "/stop"
-        first = ctx.Process(
-            target=_a63e7ff_child_hold, args=(ready_q, stop_path)
-        )
-        first.start()
-        old_pid, _old_start = ready_q.get(timeout=10)
-        open(stop_path, "w").write("1")
-        first.join(timeout=10)
-        try:
-            os.unlink(stop_path)
-        except OSError:
-            pass
+        stop = td + "/a2b_stop"
+        # First child: record PID, exit, parent reaps (slot free for reuse).
+        old_pid = os.fork()
+        if old_pid == 0:
+            os._exit(0)
+        os.waitpid(old_pid, 0)
 
-        reused = None
+        reused_pid = None
         reused_start = None
-        # Busy-spawn until the kernel hands back the same PID.
-        for _ in range(500):
-            rq = ctx.Queue()
-            stop2 = td + f"/stop_{_}"
-            child = ctx.Process(
-                target=_a63e7ff_child_hold, args=(rq, stop2)
-            )
-            child.start()
-            pid, start = rq.get(timeout=10)
+        live_child = None
+        for _ in range(4000):
+            pid = os.fork()
+            if pid == 0:
+                # Stay alive so kill(0)+starttoken succeed for the planted row.
+                while not os.path.exists(stop):
+                    __import__("time").sleep(0.01)
+                os._exit(0)
             if pid == old_pid:
-                reused = child
-                reused_start = start
-                stop_path = stop2
+                reused_pid = pid
+                reused_start = _process_start_token(pid)
+                live_child = pid
                 break
-            open(stop2, "w").write("1")
-            child.join(timeout=5)
-        if reused is None:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+        if reused_pid is None:
             pytest.skip(
-                "A2b: kernel did not reuse PID within 500 spawns "
+                "A2b: kernel did not reuse PID within 4000 forks "
                 "(non-deterministic on this host)"
             )
         try:
+            assert reused_start is not None
             path = td + "/ledger.sqlite"
             os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = td + "/hw"
             rrs.clear_retry_rate_mac_key_cache()
@@ -1768,7 +1760,7 @@ def test_a2b_creating_after_real_pid_reuse_refused():
                     window_id="rw_a2b",
                     confirmed=0,
                     intent=_HW_CREATING_INTENT,
-                    writer_pid=old_pid,
+                    writer_pid=reused_pid,
                     writer_start=reused_start,
                 )
                 _atomic_write_hw_record(hwlock._path, rec)
@@ -1778,8 +1770,12 @@ def test_a2b_creating_after_real_pid_reuse_refused():
             ):
                 SqliteLedger(path)
         finally:
-            open(stop_path, "w").write("1")
-            reused.join(timeout=10)
+            open(stop, "w").write("1")
+            if live_child is not None:
+                try:
+                    os.waitpid(live_child, 0)
+                except ChildProcessError:
+                    pass
 
 
 # C6 (documented pre-existing, not fixed here): between /proc/locks observation
