@@ -29,12 +29,15 @@ def _write_key(path: Path, data: bytes, mode: int = 0o600) -> None:
 
 
 def test_chmod_000_key_file_is_clean_valueerror(monkeypatch, tmp_path):
-    """Real unreadable file: EACCES must map to ValueError, not PermissionError."""
+    """Own-user mode-000 file: EACCES → ValueError (never skip; fail if root)."""
     monkeypatch.delenv("PERMIT_ACCEPTANCE_KEY", raising=False)
-    if os.geteuid() == 0:
-        pytest.skip("root bypasses mode bits; chmod-000 needs a non-root euid")
+    assert os.geteuid() != 0, (
+        "chmod-000 key test must run as non-root (root bypasses mode bits); "
+        "do not skip — fix the environment"
+    )
     path = tmp_path / "locked.acceptance_key"
     _write_key(path, os.urandom(MIN), 0o000)
+    assert path.stat().st_uid == os.geteuid()
     try:
         with pytest.raises(ValueError, match="cannot be opened"):
             load_or_create_demo_key(path)
@@ -43,15 +46,16 @@ def test_chmod_000_key_file_is_clean_valueerror(monkeypatch, tmp_path):
 
 
 def test_chmod_000_server_exits_clean_no_traceback(monkeypatch, tmp_path):
-    if os.geteuid() == 0:
-        pytest.skip("root bypasses mode bits; chmod-000 needs a non-root euid")
+    """Own-user mode-000 key: server exits 1 with clean acceptance key error."""
+    monkeypatch.delenv("PERMIT_ACCEPTANCE_KEY", raising=False)
+    assert os.geteuid() != 0, (
+        "chmod-000 server test must run as non-root; do not skip — fix the environment"
+    )
     db = tmp_path / "ledger.db"
     key = Path(f"{db}.acceptance_key")
     _write_key(key, os.urandom(MIN), 0o000)
-    # Touch an empty sqlite db path by letting server create it — but the key
-    # already exists (unreadable), so load fails before serve.
+    assert key.stat().st_uid == os.geteuid()
     env = {k: v for k, v in os.environ.items() if k != "PERMIT_ACCEPTANCE_KEY"}
-    # Pre-create a valid empty durable db so --db opens, then hits the key.
     from permit.sqlite_ledger import SqliteLedger
 
     SqliteLedger(str(db)).close()
@@ -75,27 +79,96 @@ def test_chmod_000_server_exits_clean_no_traceback(monkeypatch, tmp_path):
     finally:
         os.chmod(key, 0o600)
     out = (proc.stdout or "") + (proc.stderr or "")
-    assert proc.returncode != 0
+    assert proc.returncode == 1, out
     assert "acceptance key error:" in out
     assert "Traceback" not in out
     assert "PermissionError" not in out
 
 
-@pytest.mark.skipif(os.geteuid() != 0, reason="chown/seteuid requires root")
+def _sudo_n(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run ``sudo -n …``. Fail (never skip) if passwordless sudo is unavailable."""
+    return subprocess.run(
+        ["sudo", "-n", *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
 def test_foreign_owner_real_chown_clean_valueerror(tmp_path, monkeypatch):
-    """Real foreign-owned 0600 file: drop euid so open hits EACCES, map cleanly."""
+    """Real foreign-owned 0600 key via ``sudo -n chown nobody`` (never skip).
+
+    Creates a 0600 key, then ``sudo -n chown nobody``. GitHub Ubuntu runners
+    have passwordless sudo; if ``sudo -n`` fails, this test FAILS (does not
+    skip). Non-root open then hits EACCES; that must map to a clean
+    ValueError / ``acceptance key error`` (exit 1, no traceback). Cleanup
+    uses sudo too.
+    """
     monkeypatch.delenv("PERMIT_ACCEPTANCE_KEY", raising=False)
+    assert os.geteuid() != 0, (
+        "foreign-owner test must run as non-root so open hits EACCES; "
+        "do not skip — fix the environment"
+    )
     path = tmp_path / "foreign.acceptance_key"
     _write_key(path, os.urandom(MIN), 0o600)
-    # Keep ownership on root; switch euid to nobody so open fails with EACCES.
-    nobody = 65534
-    os.chown(path, 0, 0)
-    os.seteuid(nobody)
+
+    chown = _sudo_n("chown", "nobody", str(path))
+    assert chown.returncode == 0, (
+        "sudo -n chown nobody failed — passwordless sudo is required "
+        f"(never skip). stderr={chown.stderr!r} stdout={chown.stdout!r}"
+    )
     try:
+        st = os.stat(path)
+        assert st.st_uid != os.geteuid(), "chown nobody did not change ownership"
+        assert (st.st_mode & 0o777) == 0o600
+
         with pytest.raises(ValueError, match="cannot be opened"):
             load_or_create_demo_key(path)
+
+        # Also exercise the server entry point: clean exit 1, no traceback.
+        db = tmp_path / "foreign.db"
+        from permit.sqlite_ledger import SqliteLedger
+
+        SqliteLedger(str(db)).close()
+        server_key = Path(f"{db}.acceptance_key")
+        _write_key(server_key, os.urandom(MIN), 0o600)
+        chown2 = _sudo_n("chown", "nobody", str(server_key))
+        assert chown2.returncode == 0, chown2.stderr
+        env = {k: v for k, v in os.environ.items() if k != "PERMIT_ACCEPTANCE_KEY"}
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "server.py",
+                    "--port",
+                    "0",
+                    "--db",
+                    str(db),
+                    "--allow-demo-key",
+                ],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+        finally:
+            fix2 = _sudo_n(
+                "chown", f"{os.geteuid()}:{os.getegid()}", str(server_key)
+            )
+            assert fix2.returncode == 0, fix2.stderr
+            os.chmod(server_key, 0o600)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        assert proc.returncode == 1, out
+        assert "acceptance key error:" in out
+        assert "Traceback" not in out
+        assert "PermissionError" not in out
     finally:
-        os.seteuid(0)
+        fix = _sudo_n("chown", f"{os.geteuid()}:{os.getegid()}", str(path))
+        assert fix.returncode == 0, (
+            f"sudo cleanup chown failed: stderr={fix.stderr!r}"
+        )
+        os.chmod(path, 0o600)
 
 
 def test_fifo_at_key_path_fails_fast(monkeypatch, tmp_path):

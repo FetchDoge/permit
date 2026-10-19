@@ -106,7 +106,7 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 ## Evidence
 
-- **417 tests pass, 1 skipped (418 collected):** `python -m pytest -q` and `python -O -m pytest -q` on `launch/53-key-handling` (issue #53 / REA seq 1690). CI runs the same suite plus `python demo.py` with a test-only `PERMIT_ACCEPTANCE_KEY` on every push; forge also runs on pull_request.
+- **426 tests pass, 1 skipped (427 collected):** `python -m pytest -q` and `python -O -m pytest -q` on `launch/53-key-handling` (issue #53 / REA seq 1690 + 1801). CI runs the same suite plus `python demo.py` with a test-only `PERMIT_ACCEPTANCE_KEY` on every push; forge also runs on pull_request.
 - **Mock end-to-end demo:** `PERMIT_ACCEPTANCE_KEY=... python demo.py` (or `python demo.py --allow-demo-key`) ends with `ledger chain: VERIFIED (16 receipts)`.
 - **Mock rail vs sandbox, kept separate:**
   - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_AGENT_CLI` or a recorded transcript — one ships as `demos/fixtures/demo_transcript.jsonl` for the offline replay path.
