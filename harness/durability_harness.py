@@ -39,12 +39,18 @@ def _build(durable_dir: Path, *, allow_demo_key: bool = False):
     ledger = DurableLedger(durable_dir=durable_dir)
     permits = DurablePermitStore(ledger=ledger, durable_dir=durable_dir)
     paypal = DurableMockPayPalClient(durable_dir=durable_dir)
+    # r2 N-h / REA round 5: with --allow-demo-key and no env key, persist the
+    # demo key under the harness state dir (mode 0600) so kill/reopen survives.
+    key_kwargs: dict = {"allow_demo_key": allow_demo_key}
+    if allow_demo_key:
+        key_kwargs["demo_key_path"] = str(durable_dir / "acceptance_key")
+        key_kwargs["demo_key_db_nonempty"] = len(ledger) > 0
     verifier = DurableReleaseVerifier(
         paypal,
         permits,
         ledger=ledger,
         durable_dir=durable_dir,
-        allow_demo_key=allow_demo_key,
+        **key_kwargs,
     )
     flow = DurableSpendPipeline(permits, paypal, verifier, ledger=ledger, durable_dir=durable_dir)
     return ledger, permits, paypal, verifier, flow
@@ -117,12 +123,16 @@ def _run_kill_point(
         ledger_c = DurableLedger(durable_dir=d)
         permits_c = DurablePermitStore(ledger=ledger_c, durable_dir=d)
         paypal_c = DurableMockPayPalClient(durable_dir=d)
+        child_key_kwargs = {"allow_demo_key": allow_demo_key_inner}
+        if allow_demo_key_inner:
+            child_key_kwargs["demo_key_path"] = str(d / "acceptance_key")
+            child_key_kwargs["demo_key_db_nonempty"] = len(ledger_c) > 0
         verifier_c = DurableReleaseVerifier(
             paypal_c,
             permits_c,
             ledger=ledger_c,
             durable_dir=d,
-            allow_demo_key=allow_demo_key_inner,
+            **child_key_kwargs,
         )
         flow_c = DurableSpendPipeline(permits_c, paypal_c, verifier_c, ledger=ledger_c, durable_dir=d)
         permit_c = permits_c.get(permit_id)
