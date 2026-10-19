@@ -12,5 +12,8 @@ demo_transcript.replay.jsonl
 coverage.xml
 .coverage
 
+# Durable mock-mode demo acceptance keys (server.py --db --allow-demo-key).
+*.acceptance_key
+
 # The shipped replay fixture IS committed (judge path); local recordings stay ignored.
 !demos/fixtures/demo_transcript.jsonl

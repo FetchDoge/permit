@@ -101,14 +101,20 @@ class ReconcileResult:
     receipt: Receipt | None = None
 
 
-# Acceptance key (issue #35): there is NO fallback key in library code.
-# A known fallback key lets anyone forge Type A acceptances in a default
-# deployment, so construction fails closed: the key must come from the
-# caller or from PERMIT_ACCEPTANCE_KEY, and must be at least 32 bytes.
-# Demo code opts in explicitly with allow_demo_key=True, which generates
-# a fresh random key per verifier instance (per run), never a constant.
+# Acceptance key (issues #35, #53): there is NO fallback key in library
+# code. A known fallback key lets anyone forge Type A acceptances in a
+# default deployment, so construction fails closed: the key must come
+# from the caller or from PERMIT_ACCEPTANCE_KEY, be at least 32 bytes,
+# and must not be whitespace-only. Demo entry points opt in explicitly
+# with --allow-demo-key / allow_demo_key=True (off by default). When that
+# flag is set and no key is configured, a fresh random key is generated;
+# if a durable demo_key_path is also given (server --db), the key is
+# persisted mode 0600 so restarts do not rotate it. A key that IS set
+# (env or argument) but invalid always raises — the demo flag never
+# papered over a bad configured key.
 import os as _os
 import secrets as _secrets
+from pathlib import Path as _Path
 
 MIN_ACCEPTANCE_KEY_BYTES = 32
 
@@ -119,28 +125,83 @@ def _coerce_key(key: bytes | str | None) -> bytes | None:
     return key.encode() if isinstance(key, str) else bytes(key)
 
 
+def _require_valid_key(resolved: bytes, *, what: str = "acceptance key") -> bytes:
+    """Reject empty, whitespace-only, and short keys."""
+    if resolved.strip() == b"":
+        if len(resolved) == 0:
+            raise ValueError(f"{what} is empty")
+        raise ValueError(f"{what} is whitespace-only")
+    if len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
+        raise ValueError(
+            f"{what} under {MIN_ACCEPTANCE_KEY_BYTES} bytes "
+            f"(got {len(resolved)})"
+        )
+    return resolved
+
+
+def load_or_create_demo_key(path: str | _os.PathLike[str]) -> bytes:
+    """Load a demo acceptance key from ``path``, or create one at mode 0600.
+
+    Used by durable mock mode (``server.py --db`` with ``--allow-demo-key``)
+    so the key does not silently rotate across restarts (#53).
+    """
+    key_path = _Path(path)
+    if key_path.exists():
+        return _require_valid_key(
+            key_path.read_bytes(), what=f"demo acceptance key at {key_path}"
+        )
+    key = _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = _os.open(
+        key_path,
+        _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL,
+        0o600,
+    )
+    try:
+        _os.write(fd, key)
+    finally:
+        _os.close(fd)
+    _os.chmod(key_path, 0o600)
+    return key
+
+
 def resolve_acceptance_key(
-    key: bytes | str | None = None, *, allow_demo_key: bool = False
+    key: bytes | str | None = None,
+    *,
+    allow_demo_key: bool = False,
+    demo_key_path: str | _os.PathLike[str] | None = None,
 ) -> bytes:
     """Resolve and validate the acceptance key, failing closed.
 
     Order: explicit ``key`` argument, then PERMIT_ACCEPTANCE_KEY.
-    Missing, empty, or short (under 32 byte) keys raise ValueError,
-    unless ``allow_demo_key`` is set, in which case a fresh per-call
-    random key is generated (demo use only, off by default).
+    A key that is set (argument or env) but empty, whitespace-only, or
+    short (under 32 bytes) always raises ValueError — even when
+    ``allow_demo_key`` is set (#53).
+
+    When no key is configured at all and ``allow_demo_key`` is set:
+    if ``demo_key_path`` is given, load or create a 0600 key file there;
+    otherwise generate a fresh per-call random key (ephemeral demos).
     """
-    resolved = _coerce_key(key)
-    if resolved is None:
+    if key is not None:
+        resolved = _coerce_key(key)
+        if resolved is None:
+            raise ValueError("acceptance key is empty")
+        return _require_valid_key(resolved)
+
+    if "PERMIT_ACCEPTANCE_KEY" in _os.environ:
         resolved = _coerce_key(_os.environ.get("PERMIT_ACCEPTANCE_KEY"))
-    if resolved is None or len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
-        if allow_demo_key:
-            return _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
-        raise ValueError(
-            "acceptance key missing, empty, or under "
-            f"{MIN_ACCEPTANCE_KEY_BYTES} bytes: pass acceptance_key or set "
-            "PERMIT_ACCEPTANCE_KEY (fail closed, issue #35)"
-        )
-    return resolved
+        return _require_valid_key(resolved if resolved is not None else b"")
+
+    if allow_demo_key:
+        if demo_key_path is not None:
+            return load_or_create_demo_key(demo_key_path)
+        return _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
+
+    raise ValueError(
+        "acceptance key missing, empty, whitespace-only, or under "
+        f"{MIN_ACCEPTANCE_KEY_BYTES} bytes: pass acceptance_key or set "
+        "PERMIT_ACCEPTANCE_KEY (fail closed, issues #35/#53)"
+    )
 
 
 def sign_acceptance(
@@ -149,10 +210,12 @@ def sign_acceptance(
     """What the counterparty (acceptance key holder) does off-camera.
 
     The key is required: there is no module-level key to fall back to.
+    Empty, whitespace-only, and short keys are rejected (#53).
     """
     resolved = _coerce_key(key)
-    if resolved is None or len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
+    if resolved is None:
         raise ValueError("sign_acceptance requires a key of at least 32 bytes")
+    resolved = _require_valid_key(resolved, what="sign_acceptance key")
     msg = f"{escrow_id}|{artifact_hash}|{amount_cents}".encode()
     return hmac.new(resolved, msg, hashlib.sha256).hexdigest()
 
@@ -166,12 +229,15 @@ class ReleaseVerifier:
         *,
         acceptance_key: bytes | str | None = None,
         allow_demo_key: bool = False,
+        demo_key_path: str | _os.PathLike[str] | None = None,
     ):
-        # Fail closed at construction (issue #35): no usable acceptance
-        # key, no verifier. Demo callers pass allow_demo_key=True and get
-        # a fresh random key for this instance only.
+        # Fail closed at construction (issues #35/#53): no usable
+        # acceptance key, no verifier. Demo callers pass
+        # allow_demo_key=True only when no key is configured.
         self._acceptance_key = resolve_acceptance_key(
-            acceptance_key, allow_demo_key=allow_demo_key
+            acceptance_key,
+            allow_demo_key=allow_demo_key,
+            demo_key_path=demo_key_path,
         )
         self.paypal = paypal
         self.permits = permits

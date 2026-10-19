@@ -508,6 +508,17 @@ def main():
                          " default is in-memory (no persistence)")
     ap.add_argument("--sandbox", action="store_true",
                     help="use the real sandbox rail (needs env creds + interactive payer approval)")
+    ap.add_argument(
+        "--allow-demo-key",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to a generated acceptance key when PERMIT_ACCEPTANCE_KEY "
+            "is unset (mock/demo only; off by default). With --db, the key is "
+            "persisted next to the ledger as <db>.acceptance_key mode 0600 "
+            "so restarts do not rotate it (#53)."
+        ),
+    )
     args = ap.parse_args()
 
     if args.sandbox:
@@ -527,7 +538,28 @@ def main():
         paypal = MockPayPalClient()
         log.info("mock rail (no network, no credentials)")
 
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=MOCK_MODE)
+    # Demo key is an explicit opt-in (#53), not implied by mock mode.
+    # With --db, persist the demo key so durable mock mode does not
+    # rotate the signing key across restarts.
+    demo_key_path = (
+        f"{args.db}.acceptance_key"
+        if args.allow_demo_key and args.db
+        else None
+    )
+
+    def _build_verifier(active_permits, active_ledger):
+        try:
+            return ReleaseVerifier(
+                paypal,
+                active_permits,
+                ledger=active_ledger,
+                allow_demo_key=args.allow_demo_key,
+                demo_key_path=demo_key_path,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"acceptance key error: {exc}") from exc
+
+    verifier = _build_verifier(permits, ledger)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
 
     if args.db:
@@ -539,10 +571,12 @@ def main():
         folded = fold_receipts(db_ledger.receipts())
         folded.ledger = db_ledger
         ledger, permits = db_ledger, folded
-        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=MOCK_MODE)
+        verifier = _build_verifier(permits, ledger)
         flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
         log.info(f"durable ledger at {args.db}"
                  f" ({len(ledger)} receipts restored)")
+        if demo_key_path:
+            log.info(f"demo acceptance key persisted at {demo_key_path} (mode 0600)")
 
     # Reap TTL-expired payer-approval operations (daemon; 60s cadence).
     # /resume also reaps on hit, so an expired op never captures.

@@ -10,7 +10,8 @@ a reordered sequence, or a tampered payload breaks the chain, and the
 settlement verifier refuses to proceed on a broken chain.
 
 No external format dependency (Interlock cut 2026-10-02, agent review).
-Demo keys are hardcoded and labeled as such — no key-management scope.
+Acceptance keys are not managed here: settlement fails closed without a
+configured key (issues #35/#53); library code ships no demo-key fallback.
 """
 
 from __future__ import annotations

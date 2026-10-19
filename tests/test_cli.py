@@ -80,7 +80,7 @@ def test_help_lists_only_offline_demo_commands(tmp_path):
 
 
 def test_invariant_failure_returns_nonzero(monkeypatch, capsys):
-    def fail():
+    def fail(**_kwargs):
         raise cli.DemoInvariantError("boom")
 
     monkeypatch.setattr(cli, "run_demo", fail)

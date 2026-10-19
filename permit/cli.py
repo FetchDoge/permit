@@ -24,13 +24,15 @@ def _require(condition: bool, message: str) -> None:
         raise DemoInvariantError(message)
 
 
-def _pipeline() -> tuple[
-    SpendPipeline, MockPayPalClient, PermitStore, ReleaseVerifier, Ledger
-]:
+def _pipeline(
+    *, allow_demo_key: bool = False
+) -> tuple[SpendPipeline, MockPayPalClient, PermitStore, ReleaseVerifier, Ledger]:
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     provider = MockPayPalClient()
-    verifier = ReleaseVerifier(provider, permits, ledger=ledger, allow_demo_key=True)
+    verifier = ReleaseVerifier(
+        provider, permits, ledger=ledger, allow_demo_key=allow_demo_key
+    )
     flow = SpendPipeline(permits, provider, verifier, ledger=ledger)
     return flow, provider, permits, verifier, ledger
 
@@ -44,9 +46,11 @@ def _grant(permits: PermitStore, cap_cents: int, merchant: str):
     )[0]
 
 
-def run_demo() -> None:
+def run_demo(*, allow_demo_key: bool = False) -> None:
     """Exercise capture, cap blocking, and e-stop using only in-memory mocks."""
-    flow, provider, permits, _verifier, ledger = _pipeline()
+    flow, provider, permits, _verifier, ledger = _pipeline(
+        allow_demo_key=allow_demo_key
+    )
     merchant = "offline_demo_merchant"
     artifact = b"offline demo deliverable"
     digest = hashlib.sha256(artifact).hexdigest()
@@ -91,9 +95,11 @@ def run_demo() -> None:
     print("OFFLINE MOCK ONLY: no network, credentials, or real money were used")
 
 
-def run_recovery_demo() -> None:
+def run_recovery_demo(*, allow_demo_key: bool = False) -> None:
     """Exercise dropped-response reconciliation using only the mock provider."""
-    flow, provider, permits, verifier, ledger = _pipeline()
+    flow, provider, permits, verifier, ledger = _pipeline(
+        allow_demo_key=allow_demo_key
+    )
     merchant = "offline_demo_merchant"
     artifact = b"offline recovery deliverable"
     digest = hashlib.sha256(artifact).hexdigest()
@@ -135,20 +141,34 @@ def run_recovery_demo() -> None:
     print("OFFLINE MOCK ONLY: this is not restart recovery and no real money moved")
 
 
+def _add_allow_demo_key(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--allow-demo-key",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to a generated acceptance key when PERMIT_ACCEPTANCE_KEY "
+            "is unset (demo only; off by default, #53)"
+        ),
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="permit",
         description="Run credential-free, headless Permit mock demonstrations.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser(
+    demo = commands.add_parser(
         "demo",
         help="show mock capture, cap blocking, e-stop, and ledger verification",
     )
-    commands.add_parser(
+    _add_allow_demo_key(demo)
+    recovery = commands.add_parser(
         "demo-recovery",
         help="show mock UNKNOWN-to-CAPTURED reconciliation without duplicate capture",
     )
+    _add_allow_demo_key(recovery)
     return parser
 
 
@@ -156,10 +176,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "demo":
-            run_demo()
+            run_demo(allow_demo_key=args.allow_demo_key)
         elif args.command == "demo-recovery":
-            run_recovery_demo()
+            run_recovery_demo(allow_demo_key=args.allow_demo_key)
     except DemoInvariantError as exc:
         print(f"DEMO FAILED: {exc}")
+        return 1
+    except ValueError as exc:
+        print(f"acceptance key error: {exc}")
         return 1
     return 0
