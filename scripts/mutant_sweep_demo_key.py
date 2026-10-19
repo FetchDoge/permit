@@ -162,7 +162,7 @@ MUTANTS = [
             fd = v._os.open(key_path, flags, 0o600)
             try:
                 v._os.write(fd, key)
-                # fchmod dropped
+                # fchmod dropped — with umask 0o277 mode stays 0400
                 v._os.fsync(fd)
                 mode = v._require_demo_key_fstat(fd, key_path)
             finally:

@@ -131,9 +131,14 @@ class DurableLedger(Ledger):
         self._ledger_dev: int | None = None
         self._ledger_path: Path | None = None
         self._head_path: Path | None = None
+        self._meta_path: Path | None = None
+        # File-backed durable stores must bind the acceptance-key commitment
+        # (REA seq 1888). Ephemeral DurableLedger (no dir) does not.
+        self.requires_acceptance_key_commitment = self._durable_dir is not None
         if self._durable_dir is not None:
             self._ledger_path = self._durable_dir / "ledger.jsonl"
             self._head_path = self._durable_dir / "ledger.head"
+            self._meta_path = self._durable_dir / "meta.json"
             self._acquire_writer_lock()
             self._load()
             self._open_ledger_fd()
@@ -211,6 +216,43 @@ class DurableLedger(Ledger):
             self.close()
         except Exception:
             pass
+
+    def _read_meta(self) -> dict:
+        if self._meta_path is None or not self._meta_path.exists():
+            return {}
+        try:
+            raw = json.loads(self._meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(f"corrupt durable meta.json: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ValueError("corrupt durable meta.json: not an object")
+        return {str(k): str(v) for k, v in raw.items()}
+
+    def get_meta(self, key: str) -> str | None:
+        """Return a durable meta value, or None if unset.
+
+        Required for acceptance-key commitment when
+        ``requires_acceptance_key_commitment`` is true (REA seq 1888).
+        """
+        if self._meta_path is None:
+            raise ValueError(
+                "durable ledger cannot store acceptance key commitment "
+                "without durable_dir (refusing silent skip)"
+            )
+        with self._lock:
+            return self._read_meta().get(key)
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Persist a meta value atomically under durable_dir/meta.json."""
+        if self._meta_path is None:
+            raise ValueError(
+                "durable ledger cannot store acceptance key commitment "
+                "without durable_dir (refusing silent skip)"
+            )
+        with self._lock:
+            meta = self._read_meta()
+            meta[str(key)] = str(value)
+            _atomic_write_json(self._meta_path, meta)
 
     def _read_committed_head(self) -> dict | None:
         if self._head_path is None or not self._head_path.exists():

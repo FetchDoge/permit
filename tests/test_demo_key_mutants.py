@@ -91,10 +91,14 @@ def test_mutant_file_and_dir_fsync_order(monkeypatch, tmp_path):
 
 
 def test_mutant_fchmod_0600_on_create(monkeypatch, tmp_path):
-    """Dropping chmod/fchmod: umask would leave non-0600 without fchmod."""
+    """Dropping fchmod: umask 0o277 yields 0400 from open(..., 0o600).
+
+    umask 0o177 does *not* change 0600 (0600 & ~0177 == 0600), so it can
+    never kill an fchmod-drop mutant. 0o277 yields 0400 without fchmod.
+    """
     monkeypatch.delenv("PERMIT_ACCEPTANCE_KEY", raising=False)
     path = tmp_path / "mode.acceptance_key"
-    old = os.umask(0o177)  # open(..., 0o600) → 0o400 without fchmod
+    old = os.umask(0o277)  # open(..., 0o600) → 0o400 without fchmod
     try:
         key, mode = load_or_create_demo_key(path)
     finally:

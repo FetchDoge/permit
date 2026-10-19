@@ -101,7 +101,25 @@ def test_env_key_and_explicit_key_construct(monkeypatch):
     _rig()
     monkeypatch.delenv("PERMIT_ACCEPTANCE_KEY")
     _rig(acceptance_key=GOOD_KEY)
-    _rig(acceptance_key="s" * 40)  # str keys are encoded
+    _rig(acceptance_key="s" * 32)  # str keys are encoded; must be exactly 32
+
+
+def test_long_key_33_and_64_refused(monkeypatch):
+    """Keys must be exactly 32 bytes after decoding (same as the key file)."""
+    monkeypatch.delenv("PERMIT_ACCEPTANCE_KEY", raising=False)
+    for bad in (b"x" * 33, b"y" * 64, "z" * 33, "w" * 64):
+        with pytest.raises(ValueError, match="exactly 32 bytes"):
+            _rig(acceptance_key=bad)
+    monkeypatch.setenv("PERMIT_ACCEPTANCE_KEY", "e" * 33)
+    with pytest.raises(ValueError, match="exactly 32 bytes"):
+        _rig()
+    monkeypatch.setenv("PERMIT_ACCEPTANCE_KEY", "e" * 64)
+    with pytest.raises(ValueError, match="exactly 32 bytes"):
+        _rig()
+    with pytest.raises(ValueError, match="exactly 32 bytes"):
+        sign_acceptance("esc", "hash", 100, b"L" * 33)
+    with pytest.raises(ValueError, match="exactly 32 bytes"):
+        sign_acceptance("esc", "hash", 100, b"L" * 64)
 
 
 def test_demo_opt_in_generates_per_instance_key(monkeypatch):

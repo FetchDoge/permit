@@ -104,7 +104,7 @@ class ReconcileResult:
 # Acceptance key (issues #35, #53): there is NO fallback key in library
 # code. A known fallback key lets anyone forge Type A acceptances in a
 # default deployment, so construction fails closed: the key must come
-# from the caller or from PERMIT_ACCEPTANCE_KEY, be at least 32 bytes,
+# from the caller or from PERMIT_ACCEPTANCE_KEY, be exactly 32 bytes,
 # and must not be whitespace-only. Demo entry points opt in explicitly
 # with --allow-demo-key / allow_demo_key=True (off by default). When that
 # flag is set and no key is configured, a fresh random key is generated;
@@ -114,7 +114,8 @@ class ReconcileResult:
 # that IS set (env or argument) but invalid always raises — the demo flag
 # never papered over a bad configured key. If the durable ledger already
 # has entries and the key file is missing, startup refuses rather than
-# silently regenerating.
+# silently regenerating. Durable ledgers also bind an HMAC commitment of
+# the key (SqliteLedger and DurableLedger); rotation refuses startup.
 import errno as _errno
 import os as _os
 import secrets as _secrets
@@ -133,9 +134,10 @@ def acceptance_key_commitment(key: bytes) -> str:
 def ensure_acceptance_key_commitment(db_ledger, key: bytes) -> None:
     """Bind ``key`` to a durable ledger on first use; refuse rotation.
 
-    Every ``--db`` / SqliteLedger entry point must call this after resolving
-    the acceptance key. Rotating the key on an existing database refuses
-    startup — there is no rebind for now (REA seq 1854).
+    Every durable ledger entry point (SqliteLedger ``--db``, DurableLedger /
+    harness) must call this after resolving the acceptance key. Rotating the
+    key on an existing store refuses startup — there is no rebind for now
+    (REA seq 1854 / 1888).
     """
     # Imported here to keep settlement.verifier free of a hard sqlite import
     # cycle at module load for callers that never touch durable mode.
@@ -154,6 +156,27 @@ def ensure_acceptance_key_commitment(db_ledger, key: bytes) -> None:
         )
 
 
+def _bind_ledger_acceptance_key_commitment(ledger, key: bytes) -> None:
+    """Enforce commitment on durable ledgers; never skip silently (seq 1888).
+
+    Ledgers that opt in via ``requires_acceptance_key_commitment`` must expose
+    ``get_meta`` / ``set_meta``. Ephemeral in-memory ``Ledger`` does not opt
+    in and is left unbound.
+    """
+    requires = bool(
+        getattr(ledger, "requires_acceptance_key_commitment", False)
+    )
+    has_meta = hasattr(ledger, "get_meta") and hasattr(ledger, "set_meta")
+    if not requires:
+        return
+    if not has_meta:
+        raise ValueError(
+            "durable ledger cannot store acceptance key commitment "
+            "(get_meta/set_meta required; refusing silent skip)"
+        )
+    ensure_acceptance_key_commitment(ledger, key)
+
+
 def _coerce_key(key: bytes | str | None) -> bytes | None:
     if key is None:
         return None
@@ -161,14 +184,14 @@ def _coerce_key(key: bytes | str | None) -> bytes | None:
 
 
 def _require_valid_key(resolved: bytes, *, what: str = "acceptance key") -> bytes:
-    """Reject empty, whitespace-only, and short keys."""
+    """Reject empty, whitespace-only, and wrong-length keys (exactly 32 bytes)."""
     if resolved.strip() == b"":
         if len(resolved) == 0:
             raise ValueError(f"{what} is empty")
         raise ValueError(f"{what} is whitespace-only")
-    if len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
+    if len(resolved) != MIN_ACCEPTANCE_KEY_BYTES:
         raise ValueError(
-            f"{what} under {MIN_ACCEPTANCE_KEY_BYTES} bytes "
+            f"{what} must be exactly {MIN_ACCEPTANCE_KEY_BYTES} bytes "
             f"(got {len(resolved)})"
         )
     return resolved
@@ -419,7 +442,7 @@ def resolve_acceptance_key(
         return _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
 
     raise ValueError(
-        "acceptance key missing, empty, whitespace-only, or under "
+        "acceptance key missing, empty, whitespace-only, or not exactly "
         f"{MIN_ACCEPTANCE_KEY_BYTES} bytes: pass acceptance_key or set "
         "PERMIT_ACCEPTANCE_KEY (fail closed, issues #35/#53)"
     )
@@ -431,11 +454,13 @@ def sign_acceptance(
     """What the counterparty (acceptance key holder) does off-camera.
 
     The key is required: there is no module-level key to fall back to.
-    Empty, whitespace-only, and short keys are rejected (#53).
+    Empty, whitespace-only, and wrong-length keys are rejected (#53 / seq 1888).
     """
     resolved = _coerce_key(key)
     if resolved is None:
-        raise ValueError("sign_acceptance requires a key of at least 32 bytes")
+        raise ValueError(
+            "sign_acceptance requires a key of exactly 32 bytes"
+        )
     resolved = _require_valid_key(resolved, what="sign_acceptance key")
     msg = f"{escrow_id}|{artifact_hash}|{amount_cents}".encode()
     return hmac.new(resolved, msg, hashlib.sha256).hexdigest()
@@ -469,9 +494,11 @@ class ReleaseVerifier:
         self.permits = permits
         # NOTE: explicit None check — an empty Ledger is falsy via __len__.
         self.ledger = ledger if ledger is not None else Ledger()
-        # Durable SqliteLedger (--db) entry point: bind/refuse key commitment.
-        if hasattr(self.ledger, "get_meta") and hasattr(self.ledger, "set_meta"):
-            ensure_acceptance_key_commitment(self.ledger, self._acceptance_key)
+        # Durable ledgers (SqliteLedger --db, DurableLedger / harness) must
+        # bind/refuse the acceptance-key commitment; never skip silently.
+        _bind_ledger_acceptance_key_commitment(
+            self.ledger, self._acceptance_key
+        )
         self._escrows: dict[str, Escrow] = {}
         self._lock = threading.Lock()
 

@@ -36,15 +36,21 @@ There is **no bug bounty**, and no monetary reward is offered or implied. This i
 research project maintained by one person. What it can offer is a fast, honest response and public
 credit.
 
-## Acceptance key + durable `--db` ledger
+## Acceptance key + durable ledgers
 
 - `PERMIT_ACCEPTANCE_KEY`, when set, is always used (including with `--db --allow-demo-key`).
-  Empty, whitespace-only, and under-32-byte values refuse startup; the demo flag never
-  papers over a bad configured key.
-- With `--db`, the ledger stores an HMAC commitment of the acceptance key on first use
-  (`ensure_acceptance_key_commitment`, enforced in `ReleaseVerifier` for every
-  `SqliteLedger` and again at `server.py --db`). **Rotating the acceptance key on an
-  existing database refuses startup (no rebind for now).**
+  Empty, whitespace-only, and wrong-length values (not exactly 32 bytes after decoding)
+  refuse startup; the demo flag never papers over a bad configured key. The durable
+  key file uses the same exact-32-byte rule.
+- Every durable ledger binds an HMAC commitment of the acceptance key on first use
+  (`ensure_acceptance_key_commitment` via `ReleaseVerifier`):
+  - `SqliteLedger` (server `--db`)
+  - `DurableLedger` (file-backed under `durable_dir`, including
+    `harness/durability_harness.py`)
+  Ledgers that require the commitment but lack `get_meta` / `set_meta` refuse startup
+  (no silent skip). Ephemeral in-memory `Ledger` does not store a commitment.
+  **Rotating the acceptance key on an existing durable store refuses startup (no
+  rebind for now).**
 
 ## Related
 

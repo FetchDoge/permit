@@ -92,6 +92,9 @@ class SqliteLedger:
             raise ValueError("path is required")
         self._lock = threading.Lock()
         self._path = path
+        # File-backed sqlite must bind the acceptance-key commitment; an
+        # in-memory db is ephemeral and does not (REA seq 1888).
+        self.requires_acceptance_key_commitment = path != ":memory:"
         # check_same_thread=False: the lock (not the connection) is the
         # cross-thread guard; without this the shared connection is a trap.
         self._conn = sqlite3.connect(

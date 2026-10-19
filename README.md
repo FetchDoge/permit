@@ -36,7 +36,7 @@ where `remaining(P) = cap(P) − reserved(P) − captured(P)`. Four clauses, no 
 ```bash
 python -m pip install pytest
 python -m pytest -q        # full suite: mock rail, no credentials, no network
-export PERMIT_ACCEPTANCE_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+export PERMIT_ACCEPTANCE_KEY="$(python -c 'import secrets; print(secrets.token_hex(16))')"
 python demo.py             # end-to-end mock demo, ends with the ledger chain check
 # Or, for a one-shot mock demo only: python demo.py --allow-demo-key
 ```
@@ -75,8 +75,8 @@ Permit fails closed. When state is uncertain, money does not move.
 **What it does not defend (production boundaries):**
 - With `--db PATH`, the SQLite ledger is durable (#24): survives crashes, restarts and a second writer on one machine; after some crashes an operator step is needed (rate unmeasured). Durable mode restores permits and reservations from receipts, but does not restore escrows, pending ops, or approvals (F3). Default (in-memory) mode still loses permits, escrows, revocations, and the ledger on restart. If you also pass `--allow-demo-key` (and leave `PERMIT_ACCEPTANCE_KEY` unset), the demo key is persisted next to the ledger as `<db>.acceptance_key`: a regular file owned by the server euid, mode exactly `0600`, opened with `O_NOFOLLOW`, exactly 32 bytes with EOF, created via `O_CREAT|O_EXCL|O_NOFOLLOW` and fsynced (file + directory). If the ledger already has entries and the key file is missing, startup refuses rather than regenerating (#53 / REA seq 1690). Whenever `PERMIT_ACCEPTANCE_KEY` is set it wins over the file key; empty, whitespace-only, and wrong-length env values still refuse startup (#53 bar 3 / REA seq 1854). The durable ledger also stores an HMAC commitment of the acceptance key on first use; **rotating the acceptance key on an existing database refuses startup (no rebind for now)**.
 - HTTP POSTs require a single shared bearer token (`PERMIT_API_TOKEN`, #23) with no role split between principal and agent (F5). GETs, including `/api/ledger`, are unauthenticated; the server binds to 127.0.0.1.
-- Predicate A acceptance fails closed: the verifier refuses to construct without a configured acceptance key of at least 32 non-whitespace bytes (`PERMIT_ACCEPTANCE_KEY`). Whitespace-only keys are rejected. A key that is set but invalid (missing content, under 32 bytes, or whitespace-only) raises even when `--allow-demo-key` is on. Demo entry points (`demo.py`, `demos/*`, `python -m permit`, `trace.py`, `server.py` mock mode) require that flag to generate a key; it is off by default (#35, #53).
-- `sign_acceptance(escrow_id, artifact_hash, amount_cents, key)` requires an explicit key argument of at least 32 bytes. There is no module-level fallback key (#35/#53 API change).
+- Predicate A acceptance fails closed: the verifier refuses to construct without a configured acceptance key of exactly 32 non-whitespace bytes (`PERMIT_ACCEPTANCE_KEY`). Whitespace-only keys are rejected. A key that is set but invalid (missing content, not exactly 32 bytes, or whitespace-only) raises even when `--allow-demo-key` is on. Demo entry points (`demo.py`, `demos/*`, `python -m permit`, `trace.py`, `server.py` mock mode) require that flag to generate a key; it is off by default (#35, #53).
+- `sign_acceptance(escrow_id, artifact_hash, amount_cents, key)` requires an explicit key argument of exactly 32 bytes. There is no module-level fallback key (#35/#53 API change).
 - The ledger is a hash chain, not a signature. It detects edits and reordering, but it cannot detect removal of final entries without an external checkpoint.
 - It is a single-merchant sandbox prototype, not a claim about all agent payments.
 - E-stop voids uncaptured authorizations. A completed capture needs a refund path, which is out of scope.
@@ -106,7 +106,7 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 ## Evidence
 
-- **439 tests pass, 1 skipped (440 collected):** `python -m pytest -rs -v` and `python -O -m pytest -rs -v` on `launch/53-key-handling` (issue #53 / REA seq 1690 + 1801 + 1854). CI runs the same suite (`-v -rs`) plus `python demo.py` with a test-only `PERMIT_ACCEPTANCE_KEY` on every push; forge also runs on pull_request.
+- **439+ tests pass, 1 skipped:** `python -m pytest -rs` and `python -O -m pytest -rs` on `launch/53-key-handling` (issue #53 / REA seq 1690 + 1801 + 1854 + 1888). CI runs the suite with `-q -rs`, plus `-v` for the key-file tests only; also `python demo.py` with a test-only `PERMIT_ACCEPTANCE_KEY` on every push; forge also runs on pull_request.
 - **Mock end-to-end demo:** `PERMIT_ACCEPTANCE_KEY=... python demo.py` (or `python demo.py --allow-demo-key`) ends with `ledger chain: VERIFIED (16 receipts)`.
 - **Mock rail vs sandbox, kept separate:**
   - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_AGENT_CLI` or a recorded transcript — one ships as `demos/fixtures/demo_transcript.jsonl` for the offline replay path.

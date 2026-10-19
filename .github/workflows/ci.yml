@@ -60,7 +60,7 @@ jobs:
         if: matrix.python-version == '3.12'
         env:
           # Test-only key for the smoke path (#53: demo key is off by default).
-          PERMIT_ACCEPTANCE_KEY: permit-ci-only-acceptance-key-0123456789ab
+          PERMIT_ACCEPTANCE_KEY: permit-ci-only-key-32bytes!!!!!!
         run: python demo.py
 
   test-optimized:
