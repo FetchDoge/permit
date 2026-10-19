@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import sys
 import threading
 import uuid
 
@@ -37,6 +38,7 @@ from .retry_rate_store import (
     assert_high_water_files_for_rows,
     consult_anchor_at_startup,
     create_high_water,
+    flock_timeout_s,
     high_water_lock,
     clear_high_water_creating_intent,
     get_high_water,
@@ -158,8 +160,14 @@ class SqliteLedger:
             raise ValueError("path is required")
         # Fail before any decision if the MAC key is missing/empty/short.
         require_retry_rate_mac_key()
+        # Refuse bad PERMIT_RETRY_RATE_FLOCK_TIMEOUT_S at startup (not later).
+        flock_timeout_s()
         self._lock = threading.Lock()
         self._path = path
+        # Held create flock (cm + lock) until COMMIT + clear_creating_intent.
+        self._hw_create_cm = None
+        self._hw_create_lock = None
+        self._hw_created_pending = None
         # check_same_thread=False: the lock (not the connection) is the
         # cross-thread guard; without this the shared connection is a trap.
         self._conn = sqlite3.connect(
@@ -929,8 +937,11 @@ class SqliteLedger:
         with self._lock:
             cached: list[Receipt] = []
             # Set by _ensure_open_window_unlocked when it creates a new HW file
-            # so ROLLBACK can remove the orphan sidecar.
+            # so ROLLBACK can remove the orphan sidecar. Create flock is held
+            # on self._hw_create_cm until COMMIT + clear (see helper below).
             self._hw_created_pending = None
+            self._hw_create_cm = None
+            self._hw_create_lock = None
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 wid, wstart_f, chain_indiv, rlim, cur_mac, prev_mac = (
@@ -992,10 +1003,8 @@ class SqliteLedger:
                             f"escrow_id={escrow_id!r} window_id={wid!r}"
                         )
                     self._conn.execute("COMMIT")
-                    # Drop pending before clear so a clear failure cannot
-                    # trigger remove_high_water on a committed row.
-                    self._hw_created_pending = None
-                    clear_high_water_creating_intent(escrow_id, wid)
+                    # Clear creating under the held create flock, then unlock.
+                    self._finish_hw_create_unlocked(escrow_id, wid)
                     for r in cached:
                         self._cache_receipt_unlocked(r)
                     self._cache_receipt_unlocked(denial)
@@ -1005,8 +1014,7 @@ class SqliteLedger:
                 # then flock → fresh write conn. Holding the ledger lock
                 # across flock/SQL would block other escrows (bar 4).
                 self._conn.execute("COMMIT")
-                self._hw_created_pending = None
-                clear_high_water_creating_intent(escrow_id, wid)
+                self._finish_hw_create_unlocked(escrow_id, wid)
                 for r in cached:
                     self._cache_receipt_unlocked(r)
                 cached.clear()
@@ -1026,11 +1034,41 @@ class SqliteLedger:
                     ).fetchone()
                     if row is None:
                         remove_high_water(pending[0], pending[1])
+                self._abort_hw_create_unlocked()
                 raise
             # Fall through outside self._lock.
         return self._increment_rate_limited_unlocked(
             escrow_id, wid, already_reason
         )
+
+    def _finish_hw_create_unlocked(self, escrow_id: str, wid: str) -> None:
+        """Clear creating intent under the held create flock, then release it.
+
+        Must not call ``clear_high_water_creating_intent`` (new FD) while the
+        create flock is still held — Linux flock is not re-entrant across FDs.
+        """
+        self._hw_created_pending = None
+        hwlock = getattr(self, "_hw_create_lock", None)
+        cm = getattr(self, "_hw_create_cm", None)
+        self._hw_create_lock = None
+        self._hw_create_cm = None
+        if hwlock is not None:
+            try:
+                hwlock.clear_creating_intent()
+            finally:
+                if cm is not None:
+                    cm.__exit__(None, None, None)
+            return
+        # Adopted / pre-existing window: no create flock held.
+        clear_high_water_creating_intent(escrow_id, wid)
+
+    def _abort_hw_create_unlocked(self) -> None:
+        """Release a held create flock without clearing (sidecar may be gone)."""
+        cm = getattr(self, "_hw_create_cm", None)
+        self._hw_create_lock = None
+        self._hw_create_cm = None
+        if cm is not None:
+            cm.__exit__(None, None, None)
 
     def _increment_rate_limited_unlocked(
         self,
@@ -1223,12 +1261,18 @@ class SqliteLedger:
         # Lock order must match increments: per-window flock THEN SQL
         # BEGIN IMMEDIATE. The caller already opened BEGIN, so commit it
         # before taking the flock (otherwise SQL→flock vs flock→SQL deadlocks).
+        #
+        # Hold the create flock through INSERT + outer COMMIT + clear so a
+        # concurrent starter cannot observe 'creating' without the writer
+        # still holding the flock (flock-only accept; A1a/C5).
         self._conn.execute("COMMIT")
         for _ in range(3):
             wid = f"rw_{uuid.uuid4().hex}"
             created = False
             adopt_row = None
-            with high_water_create(escrow_id, wid, initial=0) as hwlock:
+            create_cm = high_water_create(escrow_id, wid, initial=0)
+            hwlock = create_cm.__enter__()
+            try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 open_row = self._load_open_window_unlocked(escrow_id)
                 if open_row is not None:
@@ -1255,13 +1299,22 @@ class SqliteLedger:
                             adopt_row = open_row
                     else:
                         # Leave creating intent (-1)+writer identity until
-                        # the outer COMMIT so concurrent startups see a
-                        # live pending file rather than an orphan.
+                        # outer COMMIT+clear; keep create flock held so
+                        # accept sees a verifiable flock holder.
                         created = True
                         self._hw_created_pending = (escrow_id, wid)
+                        self._hw_create_cm = create_cm
+                        self._hw_create_lock = hwlock
+            except BaseException:
+                create_cm.__exit__(*sys.exc_info())
+                self._hw_create_cm = None
+                self._hw_create_lock = None
+                raise
             if created:
-                # BEGIN IMMEDIATE still open for the caller.
+                # BEGIN IMMEDIATE still open; create flock still held.
                 return wid, now, 0, 0, "", ""
+            # Not our create — release flock before adopting/retrying.
+            create_cm.__exit__(None, None, None)
             if adopt_row is None:
                 try:
                     in_tx = self._conn.in_transaction

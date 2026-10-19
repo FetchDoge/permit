@@ -44,11 +44,11 @@ jobs:
         run: python -m pip install --upgrade pip "pytest>=8" "pytest-cov>=5"
       - name: tests
         if: matrix.python-version != '3.12'
-        run: python -m pytest -q --ignore=tests/test_f7_perf.py
+        run: python -m pytest -q -rs --ignore=tests/test_f7_perf.py
       - name: tests with coverage
         if: matrix.python-version == '3.12'
         run: >
-          python -m pytest -q --ignore=tests/test_f7_perf.py
+          python -m pytest -q -rs --ignore=tests/test_f7_perf.py
           --cov=permit --cov=settlement
           --cov-report=xml:coverage.xml
           --cov-report=term-missing:skip-covered
@@ -75,7 +75,7 @@ jobs:
         run: python -m pip install --upgrade pip "pytest>=8"
       - name: tests under -O
         # Asserts are stripped under -O; suite must still pass (trust-boundary asserts are a known debt).
-        run: python -O -m pytest -q --ignore=tests/test_f7_perf.py
+        run: python -O -m pytest -q -rs --ignore=tests/test_f7_perf.py
 
   # F7 timing/isolation benchmarks — NOT part of the required `test` aggregate.
   perf-f7:
@@ -90,7 +90,7 @@ jobs:
         run: python -m pip install --upgrade pip "pytest>=8"
       - name: F7 perf tests
         # -s so hostile ratio medians print on green runs (not only on failure).
-        run: python -m pytest -q -s tests/test_f7_perf.py
+        run: python -m pytest -q -rs -s tests/test_f7_perf.py
 
   lint:
     name: ruff

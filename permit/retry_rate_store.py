@@ -47,6 +47,7 @@ At most one OPEN window (tally_flushed=0) per escrow — UNIQUE partial index.
 from __future__ import annotations
 
 import hashlib
+import math
 import secrets
 import hmac
 import json
@@ -70,9 +71,13 @@ _ENV_KEY_FILE = "PERMIT_RETRY_RATE_MAC_KEY_FILE"
 # Optional explicit high-water sidecar path (else ``{KEY_FILE}.hw``).
 _ENV_HW_FILE = "PERMIT_RETRY_RATE_MAC_HW_FILE"
 # Bounded wait for per-window (and root) exclusive flock at startup/writes.
-# Seconds; default 30. Expiry → RetryRateIntegrityError (never hang).
+# Seconds; default 30 when unset. Expiry → RetryRateIntegrityError (never hang).
+# Explicit blank / non-finite / negative / above _MAX_FLOCK_TIMEOUT_S → refuse.
 _ENV_FLOCK_TIMEOUT_S = "PERMIT_RETRY_RATE_FLOCK_TIMEOUT_S"
 _DEFAULT_FLOCK_TIMEOUT_S = 30.0
+# Hard ceiling (10 minutes). Values like 1e12 would otherwise park a starter
+# for centuries; refuse at construction/startup instead.
+_MAX_FLOCK_TIMEOUT_S = 600.0
 
 _MIN_KEY_LEN = 32
 
@@ -445,8 +450,26 @@ def _current_writer_identity() -> tuple[int, int]:
     return pid, int(start)
 
 
+def _writer_is_zombie(pid: int) -> bool:
+    """True if ``pid`` exists as a zombie (kill succeeds; starttime may match)."""
+    try:
+        with open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8") as fh:
+            buf = fh.read()
+    except (OSError, ValueError):
+        return False
+    try:
+        rparen = buf.rfind(")")
+        if rparen < 0:
+            return False
+        # Field 3 of /proc/<pid>/stat is state; first token after ") ".
+        state = buf[rparen + 2 :].split()[0]
+        return state == "Z"
+    except (IndexError, ValueError):
+        return False
+
+
 def _writer_still_alive(pid: int | None, start: int | None) -> bool:
-    """True only when pid is live AND /proc starttime matches ``start``."""
+    """True only when pid is live (non-zombie) AND starttime matches ``start``."""
     if pid is None or start is None:
         return False
     if int(pid) <= 0:
@@ -455,6 +478,9 @@ def _writer_still_alive(pid: int | None, start: int | None) -> bool:
         os.kill(int(pid), 0)
     except OSError:
         return False
+    if _writer_is_zombie(int(pid)):
+        # Zombies are not writers — treat as dead (A3a).
+        return False
     cur = _process_start_token(int(pid))
     if cur is None:
         return False
@@ -462,19 +488,40 @@ def _writer_still_alive(pid: int | None, start: int | None) -> bool:
 
 
 def flock_timeout_s() -> float:
-    """Configured exclusive-flock wait budget (seconds)."""
-    raw = os.environ.get(_ENV_FLOCK_TIMEOUT_S, "").strip()
-    if not raw:
+    """
+    Configured exclusive-flock wait budget (seconds).
+
+    - Unset → default ``_DEFAULT_FLOCK_TIMEOUT_S`` (30).
+    - Explicit blank, non-finite (nan/inf), ≤0, or > ``_MAX_FLOCK_TIMEOUT_S``
+      (600s) → ``RetryRateIntegrityError`` (refuse at startup / lock acquire).
+    """
+    if _ENV_FLOCK_TIMEOUT_S not in os.environ:
         return _DEFAULT_FLOCK_TIMEOUT_S
-    try:
-        val = float(raw)
-    except ValueError as exc:
+    raw = os.environ.get(_ENV_FLOCK_TIMEOUT_S, "")
+    if not str(raw).strip():
         raise RetryRateIntegrityError(
-            f"{_ENV_FLOCK_TIMEOUT_S}={raw!r} is not a float; refuse"
+            f"{_ENV_FLOCK_TIMEOUT_S} is blank; refuse "
+            f"(set a value in (0, {_MAX_FLOCK_TIMEOUT_S:g}] seconds or unset "
+            f"for default {_DEFAULT_FLOCK_TIMEOUT_S:g}s)"
+        )
+    try:
+        val = float(str(raw).strip())
+    except (ValueError, OverflowError) as exc:
+        raise RetryRateIntegrityError(
+            f"{_ENV_FLOCK_TIMEOUT_S}={raw!r} is not a finite float; refuse"
         ) from exc
+    if not math.isfinite(val):
+        raise RetryRateIntegrityError(
+            f"{_ENV_FLOCK_TIMEOUT_S}={raw!r} is not finite; refuse"
+        )
     if val <= 0:
         raise RetryRateIntegrityError(
             f"{_ENV_FLOCK_TIMEOUT_S}={val!r} must be > 0; refuse"
+        )
+    if val > _MAX_FLOCK_TIMEOUT_S:
+        raise RetryRateIntegrityError(
+            f"{_ENV_FLOCK_TIMEOUT_S}={val!r} exceeds max "
+            f"{_MAX_FLOCK_TIMEOUT_S:g}s; refuse"
         )
     return val
 
@@ -484,8 +531,10 @@ def _flock_ex(fd: int, *, what: str = "high-water lock") -> None:
     Acquire exclusive flock with a bounded wait.
 
     Polls ``LOCK_EX|LOCK_NB`` until the budget from
-    ``PERMIT_RETRY_RATE_FLOCK_TIMEOUT_S`` (default 30s) expires, then
-    raises ``RetryRateIntegrityError`` instead of hanging forever.
+    ``PERMIT_RETRY_RATE_FLOCK_TIMEOUT_S`` (default 30s, max 600s) expires,
+    then raises ``RetryRateIntegrityError`` instead of hanging forever.
+    Caller must close ``fd`` on this error (``high_water_lock.__enter__``
+    and ``high_water_create`` do so).
     """
     if fcntl is None:  # pragma: no cover - non-Unix
         return
@@ -511,10 +560,12 @@ def _writer_holds_hw_flock(lock_path: str, pid: int | None) -> bool:
     """
     True if ``pid`` appears in /proc/locks as holding a flock on ``lock_path``.
 
-    Best-effort Linux check. Used so a live creating writer that still holds
-    the create flock is accepted without relying on kill-only PID matching.
+    Best-effort Linux check. A 'creating' record is accepted only while this
+    is true for the recorded writer (pid+start alone is not enough).
     """
     if pid is None or int(pid) <= 0 or fcntl is None:
+        return False
+    if _writer_is_zombie(int(pid)):
         return False
     try:
         st = os.stat(lock_path)
@@ -528,24 +579,18 @@ def _writer_holds_hw_flock(lock_path: str, pid: int | None) -> bool:
     except OSError:
         return False
     for line in lines:
-        # e.g. "1: FLOCK  ADVISORY  WRITE 1234 08:01:123456 0 EOF"
+        # e.g. "1: FLOCK  ADVISORY  WRITE 1234 fe:20:356966 0 EOF"
         parts = line.split()
         if len(parts) < 6:
             continue
-        kind = parts[1].upper() if len(parts) > 1 else ""
-        if kind not in ("FLOCK", "POSIX"):
-            # Some kernels put id then type at [1]; tolerate "FLOCK" at [1].
-            pass
         try:
             lock_pid = int(parts[4])
         except (ValueError, IndexError):
             continue
         if lock_pid != int(pid):
             continue
-        # device:inode field — often "maj:min:inode"
         try:
-            dev_ino = parts[5]
-            maj_s, min_s, ino_s = dev_ino.split(":")
+            maj_s, min_s, ino_s = parts[5].split(":")
             maj, minor, ino = int(maj_s, 16), int(min_s, 16), int(ino_s)
             dev = os.makedev(maj, minor)
         except (ValueError, IndexError):
@@ -559,20 +604,23 @@ def _accept_live_creating_pending(
     rec: "HighWaterRecord", *, lock_path: str
 ) -> bool:
     """
-    Accept a foreign 'creating' pending record only when identity is real.
+    Accept a foreign 'creating' pending record only if the writer holds
+    the HW flock right now (and is a non-zombie with matching start token).
 
-    Requires pid AND process start token (via ``_writer_still_alive``), or
-    that the recorded writer verifiably still holds the HW flock. A live
-    same-user PID with a bogus start token is refused (C2/C3).
+    Matching pid+start alone is not enough (A1a/C5): a planted orphan can
+    name any live process. Under our exclusive flock a foreign writer cannot
+    also hold it — so this returns False and the caller refuses/reconciles.
+    Creating is only valid while ``high_water_create`` holds the flock
+    through INSERT+COMMIT+clear (starters block on that flock).
     """
     if rec.intent != _HW_CREATING_INTENT:
         return False
     if int(rec.writer_pid or -1) == os.getpid():
         return False
-    if _writer_still_alive(rec.writer_pid, rec.writer_start):
-        return True
-    # Writer may still hold the create flock (start-token read flickered).
-    return _writer_holds_hw_flock(lock_path, rec.writer_pid)
+    # Must hold the flock *and* match pid+start (not zombie).
+    if not _writer_holds_hw_flock(lock_path, rec.writer_pid):
+        return False
+    return _writer_still_alive(rec.writer_pid, rec.writer_start)
 
 
 def _hw_record_mac(
@@ -1110,9 +1158,10 @@ def assert_high_water_files_for_rows(
                     rec.intent is not None
                     and int(rec.writer_pid or -1) != os.getpid()
                 ):
-                    # Creating: require pid+start (or flock still held). Never
-                    # accept on kill(pid) alone — a planted orphan can name
-                    # any live same-user PID with a bogus start token (C2/C3).
+                    # Creating: accept only while writer holds the HW flock
+                    # (and pid+start match, non-zombie). Pid+start alone is
+                    # not enough (A1a/C5). Never accept on kill(pid) alone
+                    # (C2/C3).
                     if rec.intent == _HW_CREATING_INTENT:
                         if _accept_live_creating_pending(
                             rec, lock_path=_hw_lock_path(path)
@@ -1172,7 +1221,7 @@ def assert_high_water_files_for_rows(
                         if _accept_live_creating_pending(
                             rec, lock_path=hwlock._lock_path
                         ):
-                            # Live creating writer (pid+start or holds flock).
+                            # Writer holds create flock right now.
                             continue
                     elif _writer_still_alive(rec.writer_pid, rec.writer_start):
                         # Live writer mid-flight — pending allowed.
@@ -1385,13 +1434,22 @@ class high_water_lock:
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         self._fd = os.open(self._lock_path, flags, 0o600)
-        _flock_ex(
-            self._fd,
-            what=(
-                f"high-water lock escrow_id={self.escrow_id!r} "
-                f"window_id={self.window_id!r}"
-            ),
-        )
+        try:
+            _flock_ex(
+                self._fd,
+                what=(
+                    f"high-water lock escrow_id={self.escrow_id!r} "
+                    f"window_id={self.window_id!r}"
+                ),
+            )
+        except BaseException:
+            # Close on timeout / any acquire error so open-fd count is stable.
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = -1
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -1402,7 +1460,10 @@ class high_water_lock:
                 if fcntl is not None:
                     fcntl.flock(self._fd, fcntl.LOCK_UN)
             finally:
-                os.close(self._fd)
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
                 self._fd = -1
 
     def read(self) -> HighWaterRecord:
@@ -1496,12 +1557,14 @@ class high_water_lock:
     def reconcile(self, db_count: int) -> int:
         """Resolve pending intent against DB; then require exact equality.
 
-        Creating intent (-1) may be observed under this flock while a foreign
-        writer is still alive (the create flock is released before INSERT
-        commits). When the row is visible, clear the sentinel; do not treat
-        that as planted. Live foreign *increment* intents under this flock
-        are still refused as planted. Stale/dead pending is resolved against
-        the committed row when unambiguous; otherwise refused.
+        Creating intent (-1) under this exclusive flock means the recorded
+        writer does not hold the flock (we do). Production create holds the
+        flock through COMMIT+clear, so a live foreign creating here is a
+        leftover (clear failed) or planted. When the row is visible
+        (confirmed == db_count), clear the sentinel; otherwise refuse via
+        the confirmed!=count check below. Live foreign *increment* intents
+        under this flock are refused as planted. Stale/dead pending is
+        resolved against the committed row when unambiguous; otherwise refused.
         """
         rec = self.read()
         count = int(db_count)
@@ -1513,12 +1576,9 @@ class high_water_lock:
                     f"db_count={count} confirmed={rec.confirmed}; refuse"
                 )
         elif _writer_still_alive(rec.writer_pid, rec.writer_start):
-            # Creating intent (-1) is left on disk AFTER the create flock is
-            # released, until the INSERT commits — so a concurrent startup
-            # can hold this exclusive lock and still observe a live foreign
-            # creating intent. That is not planted: if the row is visible
-            # (confirmed == db_count), clear the sentinel; otherwise leave
-            # it for the live writer (do not refuse).
+            # Creating under our exclusive flock: writer cannot also hold it.
+            # Clear leftover sentinel when confirmed matches the row; else
+            # fall through so confirmed!=count refuses (C5).
             if (
                 rec.intent == _HW_CREATING_INTENT
                 and int(rec.writer_pid or -1) != os.getpid()
@@ -1528,7 +1588,7 @@ class high_water_lock:
                     rec.writer_pid = None
                     rec.writer_start = None
                     _atomic_write_hw_record(self._path, rec)
-                # else: INSERT not visible yet / mismatch — leave pending.
+                # else: mismatch — leave pending; confirmed!=count raises.
             else:
                 # Increment intents are written under the same exclusive flock
                 # the writer holds through SQL+confirm. A live foreign

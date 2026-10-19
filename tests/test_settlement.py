@@ -1489,6 +1489,392 @@ def test_startup_flock_timeout_refuses_instead_of_hanging():
             th.join(timeout=5)
 
 
+def test_a1a_creating_live_pid_good_token_no_flock_row_deleted_refused():
+    """A1a: live PID + matching start token + no flock + no DB row → orphan.
+
+    Fails on 7bb7c02 (pid+start alone accepted creating); head requires flock.
+    """
+    import multiprocessing as mp
+    import tempfile
+
+    from permit import retry_rate_store as rrs
+    from permit.retry_rate_store import (
+        HighWaterRecord,
+        RetryRateIntegrityError,
+        _HW_CREATING_INTENT,
+        _atomic_write_hw_record,
+        create_high_water,
+        high_water_lock,
+    )
+    from permit.sqlite_ledger import SqliteLedger
+
+    ctx = mp.get_context("spawn")
+    ready_q = ctx.Queue()
+    with tempfile.TemporaryDirectory() as td:
+        stop_path = td + "/stop"
+        decoy = ctx.Process(
+            target=_a63e7ff_child_hold, args=(ready_q, stop_path)
+        )
+        decoy.start()
+        live_pid, live_start = ready_q.get(timeout=10)
+        assert live_pid != os.getpid()
+        try:
+            path = td + "/ledger.sqlite"
+            os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = td + "/hw"
+            rrs.clear_retry_rate_mac_key_cache()
+            ledger = SqliteLedger(path)
+            ledger.close()
+            create_high_water("esc_a1a", "rw_a1a", initial=0)
+            with high_water_lock("esc_a1a", "rw_a1a") as hwlock:
+                rec = HighWaterRecord(
+                    escrow_id="esc_a1a",
+                    window_id="rw_a1a",
+                    confirmed=0,
+                    intent=_HW_CREATING_INTENT,
+                    writer_pid=live_pid,
+                    writer_start=live_start,
+                )
+                _atomic_write_hw_record(hwlock._path, rec)
+            # No DB row (row deleted / never inserted).
+            with pytest.raises(
+                RetryRateIntegrityError,
+                match="orphan|dead writer|stale|planted|pending|creating",
+            ):
+                SqliteLedger(path)
+        finally:
+            open(stop_path, "w").write("1")
+            decoy.join(timeout=10)
+
+
+def test_a3a_creating_zombie_writer_good_token_refused():
+    """A3a: zombie PID with matching start token is dead — refuse creating.
+
+    Fails on 7bb7c02 (kill(0) succeeds on zombies); head treats Z as dead.
+    """
+    import tempfile
+
+    from permit import retry_rate_store as rrs
+    from permit.retry_rate_store import (
+        HighWaterRecord,
+        RetryRateIntegrityError,
+        _HW_CREATING_INTENT,
+        _atomic_write_hw_record,
+        _process_start_token,
+        create_high_water,
+        high_water_lock,
+    )
+    from permit.sqlite_ledger import SqliteLedger
+
+    # Fork a child that exits immediately; unreaped → zombie.
+    zombie_pid = os.fork()
+    if zombie_pid == 0:
+        os._exit(0)
+    # Wait until /proc shows state Z (or give up).
+    z_start = None
+    for _ in range(200):
+        try:
+            with open(f"/proc/{zombie_pid}/stat", "r", encoding="utf-8") as fh:
+                buf = fh.read()
+            rparen = buf.rfind(")")
+            state = buf[rparen + 2 :].split()[0]
+            if state == "Z":
+                z_start = _process_start_token(zombie_pid)
+                break
+        except OSError:
+            break
+        __import__("time").sleep(0.01)
+    try:
+        assert z_start is not None, "failed to observe unreaped zombie"
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/ledger.sqlite"
+            os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = td + "/hw"
+            rrs.clear_retry_rate_mac_key_cache()
+            ledger = SqliteLedger(path)
+            ledger.close()
+            create_high_water("esc_a3a", "rw_a3a", initial=0)
+            with high_water_lock("esc_a3a", "rw_a3a") as hwlock:
+                rec = HighWaterRecord(
+                    escrow_id="esc_a3a",
+                    window_id="rw_a3a",
+                    confirmed=0,
+                    intent=_HW_CREATING_INTENT,
+                    writer_pid=zombie_pid,
+                    writer_start=z_start,
+                )
+                _atomic_write_hw_record(hwlock._path, rec)
+            with pytest.raises(
+                RetryRateIntegrityError,
+                match="orphan|dead writer|stale|planted|pending|creating",
+            ):
+                SqliteLedger(path)
+    finally:
+        try:
+            os.waitpid(zombie_pid, 0)
+        except ChildProcessError:
+            pass
+
+
+def test_c5_creating_live_good_token_no_flock_rolled_back_refused():
+    """C5: live PID + good start + no flock + DB row with rolled-back counter.
+
+    Fails on 7bb7c02 (accepts creating on pid+start, skips reconcile);
+    head requires flock → reconcile → confirmed!=count refuses.
+    """
+    import multiprocessing as mp
+    import tempfile
+
+    from permit import retry_rate_store as rrs
+    from permit.retry_rate_store import (
+        HighWaterRecord,
+        RetryRateIntegrityError,
+        RetryRateRow,
+        _HW_CREATING_INTENT,
+        _atomic_write_hw_record,
+        create_high_water,
+        get_high_water,
+        high_water_lock,
+    )
+    from permit.sqlite_ledger import SqliteLedger
+
+    ctx = mp.get_context("spawn")
+    ready_q = ctx.Queue()
+    with tempfile.TemporaryDirectory() as td:
+        stop_path = td + "/stop"
+        decoy = ctx.Process(
+            target=_a63e7ff_child_hold, args=(ready_q, stop_path)
+        )
+        decoy.start()
+        live_pid, live_start = ready_q.get(timeout=10)
+        assert live_pid != os.getpid()
+        try:
+            path = td + "/ledger.sqlite"
+            os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = td + "/hw"
+            rrs.clear_retry_rate_mac_key_cache()
+            ledger = SqliteLedger(path)
+            create_high_water("esc_c5", "rw_c5", initial=0)
+            ledger.retry_rate_store.upsert(
+                RetryRateRow(
+                    escrow_id="esc_c5",
+                    window_id="rw_c5",
+                    window_start=1.0,
+                    individual=0,
+                    rate_limited=5,
+                    covered_reason="already_refused",
+                    tally_flushed=False,
+                )
+            )
+            with high_water_lock("esc_c5", "rw_c5") as hwlock:
+                hwlock.write_intent(1)
+                hwlock.confirm(1)
+            for n in range(2, 6):
+                with high_water_lock("esc_c5", "rw_c5") as hwlock:
+                    hwlock.write_intent(n)
+                    hwlock.confirm(n)
+            assert get_high_water("esc_c5", "rw_c5") == 5
+            with high_water_lock("esc_c5", "rw_c5") as hwlock:
+                rec = HighWaterRecord(
+                    escrow_id="esc_c5",
+                    window_id="rw_c5",
+                    confirmed=0,
+                    intent=_HW_CREATING_INTENT,
+                    writer_pid=live_pid,
+                    writer_start=live_start,
+                )
+                _atomic_write_hw_record(hwlock._path, rec)
+            ledger.close()
+            with pytest.raises(
+                RetryRateIntegrityError,
+                match=(
+                    "orphan|dead writer|stale|planted|pending|creating|"
+                    "confirmed|high-water|rate_mac|mismatch|intent"
+                ),
+            ):
+                SqliteLedger(path)
+        finally:
+            open(stop_path, "w").write("1")
+            decoy.join(timeout=10)
+
+
+def test_a2b_creating_after_real_pid_reuse_refused():
+    """A2b: recycled PID with the *new* process's start token, no flock.
+
+    Deterministic: kill a worker, respawn until the OS reuses its PID, plant
+    creating with that pid + the new start token. Fails on 7bb7c02 (accepts
+    live pid+start without flock); head refuses.
+    """
+    import multiprocessing as mp
+    import tempfile
+
+    from permit import retry_rate_store as rrs
+    from permit.retry_rate_store import (
+        HighWaterRecord,
+        RetryRateIntegrityError,
+        _HW_CREATING_INTENT,
+        _atomic_write_hw_record,
+        create_high_water,
+        high_water_lock,
+    )
+    from permit.sqlite_ledger import SqliteLedger
+
+    ctx = mp.get_context("spawn")
+    ready_q = ctx.Queue()
+    with tempfile.TemporaryDirectory() as td:
+        stop_path = td + "/stop"
+        first = ctx.Process(
+            target=_a63e7ff_child_hold, args=(ready_q, stop_path)
+        )
+        first.start()
+        old_pid, _old_start = ready_q.get(timeout=10)
+        open(stop_path, "w").write("1")
+        first.join(timeout=10)
+        try:
+            os.unlink(stop_path)
+        except OSError:
+            pass
+
+        reused = None
+        reused_start = None
+        # Busy-spawn until the kernel hands back the same PID.
+        for _ in range(500):
+            rq = ctx.Queue()
+            stop2 = td + f"/stop_{_}"
+            child = ctx.Process(
+                target=_a63e7ff_child_hold, args=(rq, stop2)
+            )
+            child.start()
+            pid, start = rq.get(timeout=10)
+            if pid == old_pid:
+                reused = child
+                reused_start = start
+                stop_path = stop2
+                break
+            open(stop2, "w").write("1")
+            child.join(timeout=5)
+        if reused is None:
+            pytest.skip(
+                "A2b: kernel did not reuse PID within 500 spawns "
+                "(non-deterministic on this host)"
+            )
+        try:
+            path = td + "/ledger.sqlite"
+            os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = td + "/hw"
+            rrs.clear_retry_rate_mac_key_cache()
+            ledger = SqliteLedger(path)
+            ledger.close()
+            create_high_water("esc_a2b", "rw_a2b", initial=0)
+            with high_water_lock("esc_a2b", "rw_a2b") as hwlock:
+                rec = HighWaterRecord(
+                    escrow_id="esc_a2b",
+                    window_id="rw_a2b",
+                    confirmed=0,
+                    intent=_HW_CREATING_INTENT,
+                    writer_pid=old_pid,
+                    writer_start=reused_start,
+                )
+                _atomic_write_hw_record(hwlock._path, rec)
+            with pytest.raises(
+                RetryRateIntegrityError,
+                match="orphan|dead writer|stale|planted|pending|creating",
+            ):
+                SqliteLedger(path)
+        finally:
+            open(stop_path, "w").write("1")
+            reused.join(timeout=10)
+
+
+# C6 (documented pre-existing, not fixed here): between /proc/locks observation
+# and acting on it there is an inherent TOCTOU; a writer can drop the flock
+# after we sampled holds=True (or acquire after holds=False). Closing that
+# race would need kernel help or a different protocol. Leave as known debt.
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["1e12", "inf", "nan", "1e400", "", "-1"],
+)
+def test_flock_timeout_env_refuses_non_finite_negative_huge_blank(raw):
+    """Refuse PERMIT_RETRY_RATE_FLOCK_TIMEOUT_S when blank/non-finite/≤0/>600."""
+    import tempfile
+
+    from permit import retry_rate_store as rrs
+    from permit.retry_rate_store import (
+        RetryRateIntegrityError,
+        _ENV_FLOCK_TIMEOUT_S,
+        flock_timeout_s,
+    )
+    from permit.sqlite_ledger import SqliteLedger
+
+    prev = os.environ.get(_ENV_FLOCK_TIMEOUT_S)
+    os.environ[_ENV_FLOCK_TIMEOUT_S] = raw
+    try:
+        with pytest.raises(RetryRateIntegrityError):
+            flock_timeout_s()
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = td + "/hw"
+            rrs.clear_retry_rate_mac_key_cache()
+            with pytest.raises(RetryRateIntegrityError):
+                SqliteLedger(td + "/ledger.sqlite")
+    finally:
+        if prev is None:
+            os.environ.pop(_ENV_FLOCK_TIMEOUT_S, None)
+        else:
+            os.environ[_ENV_FLOCK_TIMEOUT_S] = prev
+    # Documented hard ceiling is 600s (10 minutes).
+    assert getattr(rrs, "_MAX_FLOCK_TIMEOUT_S", 600.0) == 600.0
+
+
+def test_flock_timeout_does_not_leak_open_fds():
+    """N flock timeouts must leave the process open-fd count unchanged."""
+    import tempfile
+    import threading
+
+    from permit.retry_rate_store import (
+        RetryRateIntegrityError,
+        _ENV_FLOCK_TIMEOUT_S,
+        create_high_water,
+        high_water_lock,
+    )
+
+    def _fd_count() -> int:
+        return len(os.listdir(f"/proc/{os.getpid()}/fd"))
+
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = td + "/hw"
+        create_high_water("esc_fd", "rw_fd", initial=0)
+        held = threading.Event()
+        release = threading.Event()
+
+        def _holder():
+            with high_water_lock("esc_fd", "rw_fd"):
+                held.set()
+                release.wait(timeout=120)
+
+        th = threading.Thread(target=_holder, daemon=True)
+        th.start()
+        assert held.wait(timeout=5)
+        prev = os.environ.get(_ENV_FLOCK_TIMEOUT_S)
+        os.environ[_ENV_FLOCK_TIMEOUT_S] = "0.05"
+        try:
+            before = _fd_count()
+            for _ in range(8):
+                with pytest.raises(
+                    RetryRateIntegrityError, match="flock wait exceeded"
+                ):
+                    with high_water_lock("esc_fd", "rw_fd"):
+                        pass
+            after = _fd_count()
+            assert after == before, (
+                f"open-fd leak after flock timeouts: before={before} after={after}"
+            )
+        finally:
+            if prev is None:
+                os.environ.pop(_ENV_FLOCK_TIMEOUT_S, None)
+            else:
+                os.environ[_ENV_FLOCK_TIMEOUT_S] = prev
+            release.set()
+            th.join(timeout=5)
+
+
 def test_retry_rate_limit_side_table_tamper_row_deleted():
     """Side row deleted while chain tally remains → refuse to start."""
     import tempfile
