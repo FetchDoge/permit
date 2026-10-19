@@ -57,6 +57,7 @@ from settlement.verifier import (
     Evidence,
     PredicateType,
     ReleaseVerifier,
+    acceptance_key_commitment,
     load_or_create_demo_key,
 )
 
@@ -498,6 +499,25 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not_found")
 
 
+def _ensure_acceptance_key_commitment(db_ledger, key: bytes) -> None:
+    """Store HMAC(key, 'permit-acceptance-key-v1') on first use; refuse mismatch.
+
+    Raises ValueError on mismatch so callers can exit as 'acceptance key error'.
+    """
+    from permit.sqlite_ledger import ACCEPTANCE_KEY_COMMITMENT_META
+
+    digest = acceptance_key_commitment(key)
+    stored = db_ledger.get_meta(ACCEPTANCE_KEY_COMMITMENT_META)
+    if stored is None:
+        db_ledger.set_meta(ACCEPTANCE_KEY_COMMITMENT_META, digest)
+        return
+    if not hmac.compare_digest(stored, digest):
+        raise ValueError(
+            "acceptance key commitment mismatch with durable ledger "
+            "(HMAC key material changed since first use)"
+        )
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -590,6 +610,14 @@ def main():
 
     verifier = _build_verifier(permits, ledger)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
+
+    if args.db:
+        # Bind the acceptance key to the durable ledger on first use; refuse
+        # a same-length swapped key on later starts (REA seq 1801 / N-b).
+        try:
+            _ensure_acceptance_key_commitment(ledger, verifier._acceptance_key)
+        except ValueError as exc:
+            raise SystemExit(f"acceptance key error: {exc}") from None
 
     if demo_key_path is not None and demo_key_mode is not None:
         log.info(

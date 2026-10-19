@@ -122,6 +122,12 @@ import stat as _stat
 from pathlib import Path as _Path
 
 MIN_ACCEPTANCE_KEY_BYTES = 32
+ACCEPTANCE_KEY_COMMITMENT_MSG = b"permit-acceptance-key-v1"
+
+
+def acceptance_key_commitment(key: bytes) -> str:
+    """HMAC(key, 'permit-acceptance-key-v1') as hex — durable binding (REA N-b)."""
+    return hmac.new(key, ACCEPTANCE_KEY_COMMITMENT_MSG, hashlib.sha256).hexdigest()
 
 
 def _coerce_key(key: bytes | str | None) -> bytes | None:
