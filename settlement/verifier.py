@@ -144,27 +144,53 @@ def _require_valid_key(resolved: bytes, *, what: str = "acceptance key") -> byte
     return resolved
 
 
+def _key_oserror(key_path: _Path, exc: OSError) -> ValueError:
+    """Map any open/read OSError to a clean ValueError (no raw traceback)."""
+    err = _errno.errorcode.get(exc.errno, str(exc.errno))
+    if exc.errno in (
+        getattr(_errno, "ELOOP", -1),
+        getattr(_errno, "EMLINK", -1),
+    ):
+        return ValueError(
+            f"demo acceptance key at {key_path} must not be a symlink"
+        )
+    if exc.errno == _errno.EPERM and "symlink" in (exc.strerror or "").lower():
+        return ValueError(
+            f"demo acceptance key at {key_path} must not be a symlink"
+        )
+    return ValueError(
+        f"demo acceptance key at {key_path} cannot be opened "
+        f"({err}: {exc.strerror})"
+    )
+
+
+def _clear_nonblock(fd: int) -> None:
+    """Clear O_NONBLOCK so the subsequent read blocks normally on a regular file."""
+    try:
+        import fcntl as _fcntl
+    except ImportError:  # pragma: no cover - non-POSIX
+        return
+    flags = _fcntl.fcntl(fd, _fcntl.F_GETFL)
+    _fcntl.fcntl(fd, _fcntl.F_SETFL, flags & ~getattr(_os, "O_NONBLOCK", 0))
+
+
 def _open_demo_key_readonly(key_path: _Path) -> int:
-    """Open ``key_path`` with O_NOFOLLOW; raise ValueError on symlink/missing."""
-    flags = _os.O_RDONLY | getattr(_os, "O_NOFOLLOW", 0)
+    """Open ``key_path`` with O_NOFOLLOW|O_NONBLOCK; map OSError → ValueError.
+
+    O_NONBLOCK keeps a FIFO (or other blocking special file) from hanging
+    startup forever; the regular-file check then rejects non-files.
+    """
+    flags = (
+        _os.O_RDONLY
+        | getattr(_os, "O_NOFOLLOW", 0)
+        | getattr(_os, "O_NONBLOCK", 0)
+    )
     try:
         return _os.open(key_path, flags)
     except FileNotFoundError:
         raise
     except OSError as exc:
-        if exc.errno in (
-            getattr(_errno, "ELOOP", -1),
-            getattr(_errno, "EMLINK", -1),
-        ):
-            raise ValueError(
-                f"demo acceptance key at {key_path} must not be a symlink"
-            ) from exc
-        # Some platforms surface symlink-via-NOFOLLOW as EPERM.
-        if exc.errno == _errno.EPERM:
-            raise ValueError(
-                f"demo acceptance key at {key_path} must not be a symlink"
-            ) from exc
-        raise
+        raise _key_oserror(key_path, exc) from None
 
 
 def _require_demo_key_fstat(fd: int, key_path: _Path) -> int:
@@ -172,7 +198,10 @@ def _require_demo_key_fstat(fd: int, key_path: _Path) -> int:
 
     Returns the verified mode (always 0o600 on success).
     """
-    st = _os.fstat(fd)
+    try:
+        st = _os.fstat(fd)
+    except OSError as exc:
+        raise _key_oserror(key_path, exc) from None
     if not _stat.S_ISREG(st.st_mode):
         raise ValueError(
             f"demo acceptance key at {key_path} must be a regular file"
@@ -194,7 +223,10 @@ def _require_demo_key_fstat(fd: int, key_path: _Path) -> int:
 
 def _read_exact_demo_key(fd: int, key_path: _Path) -> bytes:
     """Read exactly MIN_ACCEPTANCE_KEY_BYTES and require EOF (no trailing)."""
-    data = _os.read(fd, MIN_ACCEPTANCE_KEY_BYTES + 1)
+    try:
+        data = _os.read(fd, MIN_ACCEPTANCE_KEY_BYTES + 1)
+    except OSError as exc:
+        raise _key_oserror(key_path, exc) from None
     if len(data) < MIN_ACCEPTANCE_KEY_BYTES:
         raise ValueError(
             f"demo acceptance key at {key_path} is truncated "
@@ -209,7 +241,12 @@ def _read_exact_demo_key(fd: int, key_path: _Path) -> bytes:
 
 
 def _fsync_dir(dir_path: _Path) -> None:
-    dir_fd = _os.open(dir_path, _os.O_RDONLY | getattr(_os, "O_DIRECTORY", 0))
+    try:
+        dir_fd = _os.open(
+            dir_path, _os.O_RDONLY | getattr(_os, "O_DIRECTORY", 0)
+        )
+    except OSError as exc:
+        raise _key_oserror(dir_path, exc) from None
     try:
         _os.fsync(dir_fd)
     finally:
@@ -223,16 +260,18 @@ def load_or_create_demo_key(
 ) -> tuple[bytes, int]:
     """Load or create a durable demo acceptance key file.
 
-    Security posture (REA #54 / seq 1690):
-    - Open existing files with ``O_NOFOLLOW``; refuse symlinks.
+    Security posture (REA #54 / seq 1690 + seq 1801):
+    - Open existing files with ``O_NOFOLLOW|O_NONBLOCK``; refuse symlinks and
+      non-regular files (FIFOs must not hang startup).
+    - Map every open/read ``OSError`` (including EACCES) to ``ValueError``.
     - Require a regular file owned by the process euid with mode exactly 0600.
-    - Read exactly 32 bytes and require EOF (no trailing newline/bytes).
+    - Clear O_NONBLOCK, then read exactly 32 bytes and require EOF.
     - Create with ``O_CREAT|O_EXCL|O_NOFOLLOW`` at 0600, then ``fsync`` the
       file and its directory.
     - If ``db_nonempty`` and the key file is missing, refuse to regenerate.
 
     Returns ``(key_bytes, verified_mode)`` so callers can log the mode only
-    after it has been checked.
+    after it has been checked — and without opening the file a second time.
     """
     key_path = _Path(path)
     try:
@@ -246,7 +285,9 @@ def load_or_create_demo_key(
         return _create_demo_key_file(key_path)
 
     try:
+        # Reject FIFO/device/etc. before clearing NONBLOCK / reading.
         mode = _require_demo_key_fstat(fd, key_path)
+        _clear_nonblock(fd)
         key = _read_exact_demo_key(fd, key_path)
         return key, mode
     finally:
@@ -262,12 +303,18 @@ def _create_demo_key_file(key_path: _Path) -> tuple[bytes, int]:
         | _os.O_EXCL
         | getattr(_os, "O_NOFOLLOW", 0)
     )
-    fd = _os.open(key_path, flags, 0o600)
     try:
-        _os.write(fd, key)
-        # umask may have cleared bits from the create mode; force 0600.
-        _os.fchmod(fd, 0o600)
-        _os.fsync(fd)
+        fd = _os.open(key_path, flags, 0o600)
+    except OSError as exc:
+        raise _key_oserror(key_path, exc) from None
+    try:
+        try:
+            _os.write(fd, key)
+            # umask may have cleared bits from the create mode; force 0600.
+            _os.fchmod(fd, 0o600)
+            _os.fsync(fd)
+        except OSError as exc:
+            raise _key_oserror(key_path, exc) from None
         mode = _require_demo_key_fstat(fd, key_path)
     finally:
         _os.close(fd)

@@ -543,7 +543,12 @@ def main():
     # Demo key is an explicit opt-in (#53), not implied by mock mode.
     # Open the durable ledger BEFORE resolving a demo key so a nonempty
     # db with a missing key file refuses to start instead of regenerating.
+    # Load the durable demo key at most once here, then pass the bytes into
+    # ReleaseVerifier — a second load could recreate a deleted file while
+    # the process kept signing with the first key (REA seq 1801).
     demo_key_path = None
+    demo_key_bytes = None
+    demo_key_mode = None
     demo_key_db_nonempty = False
     if args.db:
         from permit.sqlite_ledger import SqliteLedger, fold_receipts
@@ -557,30 +562,39 @@ def main():
         if args.allow_demo_key:
             demo_key_path = f"{args.db}.acceptance_key"
 
+    if demo_key_path is not None:
+        try:
+            demo_key_bytes, demo_key_mode = load_or_create_demo_key(
+                demo_key_path, db_nonempty=demo_key_db_nonempty
+            )
+        except ValueError as exc:
+            raise SystemExit(f"acceptance key error: {exc}") from None
+
     def _build_verifier(active_permits, active_ledger):
         try:
+            if demo_key_bytes is not None:
+                return ReleaseVerifier(
+                    paypal,
+                    active_permits,
+                    ledger=active_ledger,
+                    acceptance_key=demo_key_bytes,
+                )
             return ReleaseVerifier(
                 paypal,
                 active_permits,
                 ledger=active_ledger,
                 allow_demo_key=args.allow_demo_key,
-                demo_key_path=demo_key_path,
-                demo_key_db_nonempty=demo_key_db_nonempty,
             )
         except ValueError as exc:
-            raise SystemExit(f"acceptance key error: {exc}") from exc
+            raise SystemExit(f"acceptance key error: {exc}") from None
 
     verifier = _build_verifier(permits, ledger)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
 
-    if demo_key_path:
-        # Re-open via the same fail-closed helper so the log reports the
-        # verified mode only after O_NOFOLLOW / owner / 0600 / exact-32 checks.
-        _key, mode = load_or_create_demo_key(
-            demo_key_path, db_nonempty=demo_key_db_nonempty
-        )
+    if demo_key_path is not None and demo_key_mode is not None:
         log.info(
-            f"demo acceptance key persisted at {demo_key_path} (mode {mode:04o})"
+            f"demo acceptance key persisted at {demo_key_path} "
+            f"(mode {demo_key_mode:04o})"
         )
 
     # Reap TTL-expired payer-approval operations (daemon; 60s cadence).
