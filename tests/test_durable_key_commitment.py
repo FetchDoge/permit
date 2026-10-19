@@ -86,8 +86,9 @@ def test_no_ledger_type_silently_skips_commitment():
     """Every durable ledger type either enforces or raises — never skips."""
     from settlement.verifier import _bind_ledger_acceptance_key_commitment
 
-    # In-memory Ledger: no commitment required.
+    # In-memory Ledger: explicitly ephemeral (fail-closed default otherwise).
     mem = Ledger()
+    assert mem.ephemeral_acceptance_key_commitment is True
     assert not getattr(mem, "requires_acceptance_key_commitment", False)
 
     # Sqlite file-backed + DurableLedger: meta API present.
@@ -96,9 +97,9 @@ def test_no_ledger_type_silently_skips_commitment():
     assert hasattr(SqliteLedger, "get_meta")
     assert hasattr(SqliteLedger, "set_meta")
 
-    # A durable ledger that opts in but lacks meta must raise (no silent skip).
+    # Fail-closed: no ephemeral mark and no meta → refuse (silent skip banned).
     class _BrokenDurable:
-        requires_acceptance_key_commitment = True
+        pass
 
     with pytest.raises(ValueError, match="refusing silent skip"):
         _bind_ledger_acceptance_key_commitment(_BrokenDurable(), b"k" * MIN)
