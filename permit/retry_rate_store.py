@@ -334,39 +334,6 @@ def _hw_lock_path(data_path: str) -> str:
     return data_path + ".lock"
 
 
-def _hw_root_lock_path() -> str:
-    return os.path.join(_hw_root_dir(), ".root.lock")
-
-
-@contextmanager
-def high_water_root_lock() -> Iterator[None]:
-    """
-    Exclusive flock over the HW root.
-
-    Held across create_high_water + the matching DB INSERT, and across the
-    startup orphan cross-check, so a live writer cannot plant a counter file
-    that a concurrent opener lists as an orphan (or the reverse).
-    """
-    root = _hw_root_dir()
-    _refuse_if_symlink(root, what="high-water parent directory")
-    lock_path = _hw_root_lock_path()
-    _refuse_if_symlink(lock_path, what="high-water root lock file")
-    flags = os.O_CREAT | os.O_RDWR
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(lock_path, flags, 0o600)
-    try:
-        _flock_ex(fd, what="high-water root lock")
-        yield
-    finally:
-        if fcntl is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        os.close(fd)
-
-
 def remove_high_water(escrow_id: str, window_id: str) -> None:
     """
     Delete a counter file + lock after a lost INSERT race (file created,
@@ -1112,15 +1079,14 @@ def assert_high_water_files_for_rows(
       confirmed must equal DB ``rate_limited``.
     - every counter file under the HW root maps to a DB row (no orphans).
 
-    Runs under ``high_water_root_lock``. Pending intent is allowed only when
-    the recorded writer is still alive (and held the lock while writing);
-    under this exclusive lock a live concurrent writer cannot also hold it,
-    so unmatched pending files are resolved against the committed row or
-    refused (stale dead writer / planted pending with deleted row).
+    Uses per-window ``high_water_lock`` (not a root flock — locking the root
+    across per-window flocks deadlocks with the writer order flock→SQL).
+    Pending intent is allowed only when the recorded writer is still alive
+    (and held the lock while writing). Unmatched pending files are resolved
+    against the committed row or refused (stale dead writer / planted
+    pending with deleted row).
     """
     _note_startup_overlap_if_writers_active()
-    # No root lock here: writers use per-window flock → SQL. Holding a
-    # root lock across per-window flocks deadlocks with that order.
     if refresh_rows is not None:
         rows = list(refresh_rows())
 

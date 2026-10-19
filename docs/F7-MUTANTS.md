@@ -6,11 +6,12 @@ Security-critical subset: `flock_timeout_s`, `_accept_live_creating_pending`,
 
 - **Total mutants (subset):** 196
 - **Killed (tests):** 189
-- **Equivalent (survived with proof):** 7
+- **Equivalent (survived with proof):** 7 (+ semantic `sem_timeout_no_blank_check`)
 - **Unexplained:** 0
 
 Killer suite: `tests/test_mutmut_f7_killers.py` (plus A1a/A3a/C5/A2b/timeout
-tests in `tests/test_settlement.py`).
+tests in `tests/test_settlement.py`). Raise-removal killers:
+`tests/test_raise_refusal_killers.py`.
 
 ## Priority: timeout bound checks (`≤0`, `>600`, non-finite)
 
@@ -80,8 +81,8 @@ tests in `tests/test_settlement.py`).
 | `x__writer_holds_hw_flock__mutmut_66` | 598 | `if ino == want_ino and dev == want_dev:` → `if ino == want_ino or dev == want_dev:` | **killed** by `tests/test_mutmut_f7_killers.py::test_mut_holds_* / test_mut_open_encoding_is_utf8_lowercase` |
 | `x__accept_live_creating_pending__mutmut_5` | 618 | `if int(rec.writer_pid or -1) == os.getpid():` → `if int(rec.writer_pid or +1) == os.getpid():` | **killed** by `tests/test_mutmut_f7_killers.py::test_mut_accept_*` |
 | `x__accept_live_creating_pending__mutmut_6` | 618 | `if int(rec.writer_pid or -1) == os.getpid():` → `if int(rec.writer_pid or -2) == os.getpid():` | **equivalent**: `writer_pid or -1` vs `or -2`: for any falsy pid (`None`/`0`), both yield a negative sentinel ≠ any live `getpid()`; for any truthy pid both yield the pid. Control flow identical. |
-| `xǁhigh_water_lockǁwrite_intent__mutmut_4` | 779 | `rec.writer_pid = None` → `rec.writer_pid = ""` | **equivalent**: Sets `writer_pid=""` while clearing creating (`intent=None`), but `_atomic_write_hw_record` immediately forces `writer_pid=None` when `intent is None` (L778–780) before MAC/serialize. |
-| `xǁhigh_water_lockǁwrite_intent__mutmut_5` | 780 | `rec.writer_start = None` → `rec.writer_start = ""` | **equivalent**: Same sanitizer as mutmut_4 for `writer_start=""` → forced `None` when `intent is None` before write. |
+| `xǁhigh_water_lockǁwrite_intent__mutmut_4` | 1491 | `rec.writer_pid = None` → `rec.writer_pid = ""` | **equivalent**: Mutates the creating-clear in `write_intent` (L1491); `_atomic_write_hw_record` then forces `writer_pid=None` when `intent is None` (L778–780) before MAC/serialize. |
+| `xǁhigh_water_lockǁwrite_intent__mutmut_5` | 1492 | `rec.writer_start = None` → `rec.writer_start = ""` | **equivalent**: Mutates the creating-clear in `write_intent` (L1492); same sanitizer as mutmut_4 for `writer_start=""` → forced `None` when `intent is None` before write. |
 | `xǁhigh_water_lockǁwrite_intent__mutmut_13` | 1497 | `"high-water intent already pending for "` → `"XXhigh-water intent already pending for XX"` | **killed** by `tests/test_mutmut_f7_killers.py::test_mut_write_intent_*` |
 | `xǁhigh_water_lockǁwrite_intent__mutmut_21` | 1503 | `"high-water intent must be confirmed+1 for "` → `"XXhigh-water intent must be confirmed+1 for XX"` | **killed** by `tests/test_mutmut_f7_killers.py::test_mut_write_intent_*` |
 | `xǁhigh_water_lockǁwrite_intent__mutmut_22` | 1503 | `"high-water intent must be confirmed+1 for "` → `"HIGH-WATER INTENT MUST BE CONFIRMED+1 FOR "` | **killed** by `tests/test_mutmut_f7_killers.py::test_mut_write_intent_*` |
@@ -112,9 +113,13 @@ Default `"XXXX"` unused when key is present (blank/invalid values come from the 
 
 ### `xǁhigh_water_lockǁwrite_intent__mutmut_4`
 
-Sets `writer_pid=""` while clearing creating (`intent=None`), but `_atomic_write_hw_record` immediately forces `writer_pid=None` when `intent is None` (L778–780) before MAC/serialize.
+Mutates `write_intent`'s creating-clear at L1491 (`writer_pid=None` → `""`). `_atomic_write_hw_record` immediately forces `writer_pid=None` when `intent is None` (L778–780) before MAC/serialize, so the empty-string assignment never reaches disk.
 
 ### `xǁhigh_water_lockǁwrite_intent__mutmut_5`
 
-Same sanitizer as mutmut_4 for `writer_start=""` → forced `None` when `intent is None` before write.
+Mutates `write_intent`'s creating-clear at L1492 (`writer_start=None` → `""`). Same sanitizer as mutmut_4: empty string forced to `None` when `intent is None` before write.
+
+### `sem_timeout_no_blank_check` (semantic)
+
+**Equivalent.** Removing the blank/`strip()` guard in `flock_timeout_s` does not admit a blank env value: `float("")` / `float("   ")` still raises `ValueError`, which the existing `except` turns into `RetryRateIntegrityError` (`… is not a finite float; refuse`). Same observable refusal as keeping the dedicated blank raise (cf. `x_flock_timeout_s__mutmut_9`).
 

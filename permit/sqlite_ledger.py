@@ -43,7 +43,6 @@ from .retry_rate_store import (
     clear_high_water_creating_intent,
     get_high_water,
     high_water_create,
-    high_water_root_lock,
     publish_rate_mac_to_anchor,
     rate_limited_mac,
     remove_high_water,
