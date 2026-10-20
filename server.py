@@ -499,6 +499,37 @@ class Handler(BaseHTTPRequestHandler):
 
 # ---------------------------------------------------------------- main
 
+def _verifier_kwargs(args):
+    """Acceptance-key kwargs for ReleaseVerifier (issue #53).
+
+    No --demo-key: no demo fallback at all; a configured key is required
+    and an invalid one is fatal. With --demo-key and --db, the generated
+    key persists in a 0600 sidecar file next to the db so it does not
+    change silently across a restart; without --db it is per-run.
+    """
+    if not args.demo_key:
+        return {}
+    if args.db and "PERMIT_ACCEPTANCE_KEY" not in os.environ:
+        from settlement.verifier import load_or_create_demo_key_file
+        try:
+            key = load_or_create_demo_key_file(args.db + ".demo-key")
+        except ValueError as e:
+            raise SystemExit(f"error: {e}") from None
+        return {"acceptance_key": key}
+    return {"allow_demo_key": True}
+
+
+def _make_verifier(pp, ps, lg, vkwargs):
+    try:
+        return ReleaseVerifier(pp, ps, ledger=lg, **vkwargs)
+    except ValueError as e:
+        raise SystemExit(
+            f"error: {e}\nFix: set PERMIT_ACCEPTANCE_KEY to a key of at "
+            "least 32 bytes, or pass --demo-key to opt in to a generated "
+            "demo key (issue #53)."
+        ) from None
+
+
 def main():
     global paypal, verifier, flow, MOCK_MODE, ledger, permits
     ap = argparse.ArgumentParser(description="Permit service")
@@ -508,7 +539,13 @@ def main():
                          " default is in-memory (no persistence)")
     ap.add_argument("--sandbox", action="store_true",
                     help="use the real sandbox rail (needs env creds + interactive payer approval)")
+    ap.add_argument("--demo-key", action="store_true",
+                    help="opt in to a generated demo acceptance key when "
+                         "PERMIT_ACCEPTANCE_KEY is unset (off by default, "
+                         "#53); with --db the key persists in a 0600 "
+                         "<db>.demo-key sidecar so it survives restarts")
     args = ap.parse_args()
+    vkwargs = _verifier_kwargs(args)
 
     if args.sandbox:
         from settlement.sandbox_client import SandboxPayPalClient
@@ -527,7 +564,7 @@ def main():
         paypal = MockPayPalClient()
         log.info("mock rail (no network, no credentials)")
 
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=MOCK_MODE)
+    verifier = _make_verifier(paypal, permits, ledger, vkwargs)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
 
     if args.db:
@@ -539,7 +576,7 @@ def main():
         folded = fold_receipts(db_ledger.receipts())
         folded.ledger = db_ledger
         ledger, permits = db_ledger, folded
-        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=MOCK_MODE)
+        verifier = _make_verifier(paypal, permits, ledger, vkwargs)
         flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
         log.info(f"durable ledger at {args.db}"
                  f" ({len(ledger)} receipts restored)")

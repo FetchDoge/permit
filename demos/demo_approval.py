@@ -40,7 +40,7 @@ from permit.flow import SpendPipeline
 from permit.ledger import Ledger
 from permit.permit import PermitStore
 from settlement.paypal_client import MockPayPalClient
-from settlement.verifier import ReleaseVerifier
+from settlement.verifier import entrypoint_verifier
 
 MERCHANT = "dataset_mart"
 CATALOG = {
@@ -99,12 +99,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--port", type=int, default=8474)
+    ap.add_argument("--demo-key", action="store_true",
+                    help="opt in to a per-run generated demo acceptance key when PERMIT_ACCEPTANCE_KEY is unset (off by default, #53)")
     args = ap.parse_args()
 
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     paypal = MockPayPalClient()
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=True)
+    verifier = entrypoint_verifier(paypal, permits, ledger=ledger, demo_key=args.demo_key)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
     dash = Dashboard(permits, ledger, flow, verifier, port=args.port).start()
     print(f"dashboard: http://127.0.0.1:{args.port}")

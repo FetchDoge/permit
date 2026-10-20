@@ -29,7 +29,7 @@ from permit.ledger import Ledger
 from permit.permit import PermitStore
 from permit.flow import SpendPipeline
 from settlement.paypal_client import MockPayPalClient
-from settlement.verifier import Evidence, PredicateType, ReleaseVerifier
+from settlement.verifier import Evidence, PredicateType, entrypoint_verifier
 
 
 def show(receipts, prefix=""):
@@ -47,17 +47,17 @@ def show(receipts, prefix=""):
         print(f"{prefix}#{r.seq:02d} {r.event_type:10s} {detail}")
 
 
-def build_pipeline():
+def build_pipeline(demo_key=False):
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     paypal = MockPayPalClient()
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=True)
+    verifier = entrypoint_verifier(paypal, permits, ledger=ledger, demo_key=demo_key)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
     return flow, paypal, permits, ledger
 
 
-def demo_mock():
-    flow, paypal, permits, ledger = build_pipeline()
+def demo_mock(demo_key=False):
+    flow, paypal, permits, ledger = build_pipeline(demo_key=demo_key)
     merchant = "demo_merchant"
 
     print("== 1. grant ==")
@@ -120,13 +120,16 @@ def demo_mock():
 def main():
     ap = argparse.ArgumentParser(description="Permit end-to-end demo")
     ap.add_argument("--sandbox", action="store_true", help="use the real sandbox rail")
+    ap.add_argument("--demo-key", action="store_true",
+                    help="opt in to a per-run generated demo acceptance key "
+                         "when PERMIT_ACCEPTANCE_KEY is unset (off by default, #53)")
     args = ap.parse_args()
     if args.sandbox:
         print("Sandbox mode needs PERMIT_PAYPAL_CLIENT_ID/SECRET and interactive")
         print("payer approval per order - run from a session with a browser tap.")
         print("Use mock mode for the scripted camera run.")
         return
-    demo_mock()
+    demo_mock(demo_key=args.demo_key)
 
 
 if __name__ == "__main__":

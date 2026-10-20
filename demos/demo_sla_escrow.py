@@ -52,12 +52,15 @@ def beat(n: int, title: str, fast: bool) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true")
+    ap.add_argument("--demo-key", action="store_true",
+                    help="opt in to a per-run generated demo acceptance key "
+                         "when PERMIT_ACCEPTANCE_KEY is unset (off by default, #53)")
     args = ap.parse_args()
 
     paypal = MockPayPalClient()
     ledger = Ledger()
     print("Running SLA escrow on the mock rail (no network, no credentials).")
-    t = run_sla_escrow(paypal, ledger=ledger)
+    t = run_sla_escrow(paypal, ledger=ledger, demo_key=args.demo_key)
 
     for i, b in enumerate(t["beats"], 1):
         beat(i, TITLES[b["beat"]], args.fast)

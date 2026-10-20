@@ -119,28 +119,84 @@ def _coerce_key(key: bytes | str | None) -> bytes | None:
     return key.encode() if isinstance(key, str) else bytes(key)
 
 
+def _validate_acceptance_key(resolved: bytes | None, source: str) -> bytes:
+    """Fail closed on any configured-but-unusable acceptance key (#53).
+
+    A key that is present but invalid (missing bytes, under the minimum
+    length, or whitespace-only) is a configuration error, never a cue to
+    fall back to a demo key: a whitespace-only key of 32+ bytes passes a
+    naive length check while being trivially guessable.
+    """
+    if resolved is None or len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
+        raise ValueError(
+            f"acceptance key from {source} is missing, empty, or under "
+            f"{MIN_ACCEPTANCE_KEY_BYTES} bytes (fail closed, issue #35/#53)"
+        )
+    if not resolved.strip():
+        raise ValueError(
+            f"acceptance key from {source} is whitespace-only "
+            "(fail closed, issue #53)"
+        )
+    return resolved
+
+
 def resolve_acceptance_key(
     key: bytes | str | None = None, *, allow_demo_key: bool = False
 ) -> bytes:
     """Resolve and validate the acceptance key, failing closed.
 
     Order: explicit ``key`` argument, then PERMIT_ACCEPTANCE_KEY.
-    Missing, empty, or short (under 32 byte) keys raise ValueError,
-    unless ``allow_demo_key`` is set, in which case a fresh per-call
-    random key is generated (demo use only, off by default).
+    A key that is configured but invalid (empty, under 32 bytes, or
+    whitespace-only) raises ValueError even when ``allow_demo_key`` is
+    set: the demo fallback applies only when NO key is configured at
+    all, in which case a fresh per-call random key is generated (demo
+    use only, off by default). (#35, #53)
     """
-    resolved = _coerce_key(key)
-    if resolved is None:
-        resolved = _coerce_key(_os.environ.get("PERMIT_ACCEPTANCE_KEY"))
-    if resolved is None or len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
-        if allow_demo_key:
-            return _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
-        raise ValueError(
-            "acceptance key missing, empty, or under "
-            f"{MIN_ACCEPTANCE_KEY_BYTES} bytes: pass acceptance_key or set "
-            "PERMIT_ACCEPTANCE_KEY (fail closed, issue #35)"
+    if key is not None:
+        return _validate_acceptance_key(_coerce_key(key), "the explicit argument")
+    if "PERMIT_ACCEPTANCE_KEY" in _os.environ:
+        return _validate_acceptance_key(
+            _coerce_key(_os.environ.get("PERMIT_ACCEPTANCE_KEY")),
+            "PERMIT_ACCEPTANCE_KEY",
         )
-    return resolved
+    if allow_demo_key:
+        return _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
+    raise ValueError(
+        "no acceptance key configured: pass acceptance_key or set "
+        "PERMIT_ACCEPTANCE_KEY (at least "
+        f"{MIN_ACCEPTANCE_KEY_BYTES} bytes), or opt in to a per-run demo "
+        "key with allow_demo_key=True (fail closed, issue #35/#53)"
+    )
+
+
+def load_or_create_demo_key_file(path) -> bytes:
+    """Load a persisted demo acceptance key, creating it on first use.
+
+    For durable demo runs (server.py --db --demo-key): the key must not
+    change silently across a restart, or acceptances signed before the
+    restart stop verifying. The key is stored hex-encoded in ``path``,
+    created with 0600 permissions; an existing file is tightened to
+    0600 on load. A configured-but-invalid file content raises.
+    """
+    p = _os.fspath(path)
+    if _os.path.exists(p):
+        _os.chmod(p, 0o600)
+        raw = open(p, encoding="ascii").read().strip()
+        try:
+            stored = bytes.fromhex(raw)
+        except ValueError:
+            raise ValueError(
+                f"demo key file {p} does not contain a hex key "
+                "(fail closed, issue #53)"
+            ) from None
+        return _validate_acceptance_key(stored, f"demo key file {p}")
+    key = _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
+    fd = _os.open(p, _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL, 0o600)
+    try:
+        _os.write(fd, (key.hex() + "\n").encode("ascii"))
+    finally:
+        _os.close(fd)
+    return key
 
 
 def sign_acceptance(
@@ -149,12 +205,33 @@ def sign_acceptance(
     """What the counterparty (acceptance key holder) does off-camera.
 
     The key is required: there is no module-level key to fall back to.
+    API change (#35): the ``key`` argument is mandatory; earlier code
+    signed with a module-level fallback key.
     """
-    resolved = _coerce_key(key)
-    if resolved is None or len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
-        raise ValueError("sign_acceptance requires a key of at least 32 bytes")
+    resolved = _validate_acceptance_key(_coerce_key(key), "sign_acceptance")
     msg = f"{escrow_id}|{artifact_hash}|{amount_cents}".encode()
     return hmac.new(resolved, msg, hashlib.sha256).hexdigest()
+
+
+def entrypoint_verifier(paypal, permits, ledger=None, *, demo_key: bool = False):
+    """Build a ReleaseVerifier for a CLI entry point (#53).
+
+    Entry points opt in to a per-run demo key only through their
+    explicit ``--demo-key`` flag. Without a configured key and without
+    the flag, this exits non-zero with the fix named, instead of
+    surfacing a traceback or silently generating a key.
+    """
+    try:
+        return ReleaseVerifier(
+            paypal, permits, ledger=ledger, allow_demo_key=demo_key
+        )
+    except ValueError as e:
+        raise SystemExit(
+            f"error: {e}\n"
+            "Fix: set PERMIT_ACCEPTANCE_KEY to a key of at least "
+            f"{MIN_ACCEPTANCE_KEY_BYTES} bytes, or pass --demo-key to opt "
+            "in to a per-run generated demo key (issue #53)."
+        ) from None
 
 
 class ReleaseVerifier:

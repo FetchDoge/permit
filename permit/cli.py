@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Sequence
 
 from settlement.paypal_client import MockPayPalClient
-from settlement.verifier import Evidence, PredicateType, ReleaseVerifier
+from settlement.verifier import Evidence, PredicateType, ReleaseVerifier, entrypoint_verifier
 
 from .flow import SpendPipeline
 from .ledger import Ledger
@@ -24,13 +24,13 @@ def _require(condition: bool, message: str) -> None:
         raise DemoInvariantError(message)
 
 
-def _pipeline() -> tuple[
+def _pipeline(demo_key: bool = False) -> tuple[
     SpendPipeline, MockPayPalClient, PermitStore, ReleaseVerifier, Ledger
 ]:
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     provider = MockPayPalClient()
-    verifier = ReleaseVerifier(provider, permits, ledger=ledger, allow_demo_key=True)
+    verifier = entrypoint_verifier(provider, permits, ledger=ledger, demo_key=demo_key)
     flow = SpendPipeline(permits, provider, verifier, ledger=ledger)
     return flow, provider, permits, verifier, ledger
 
@@ -44,9 +44,9 @@ def _grant(permits: PermitStore, cap_cents: int, merchant: str):
     )[0]
 
 
-def run_demo() -> None:
+def run_demo(demo_key: bool = False) -> None:
     """Exercise capture, cap blocking, and e-stop using only in-memory mocks."""
-    flow, provider, permits, _verifier, ledger = _pipeline()
+    flow, provider, permits, _verifier, ledger = _pipeline(demo_key=demo_key)
     merchant = "offline_demo_merchant"
     artifact = b"offline demo deliverable"
     digest = hashlib.sha256(artifact).hexdigest()
@@ -91,9 +91,9 @@ def run_demo() -> None:
     print("OFFLINE MOCK ONLY: no network, credentials, or real money were used")
 
 
-def run_recovery_demo() -> None:
+def run_recovery_demo(demo_key: bool = False) -> None:
     """Exercise dropped-response reconciliation using only the mock provider."""
-    flow, provider, permits, verifier, ledger = _pipeline()
+    flow, provider, permits, verifier, ledger = _pipeline(demo_key=demo_key)
     merchant = "offline_demo_merchant"
     artifact = b"offline recovery deliverable"
     digest = hashlib.sha256(artifact).hexdigest()
@@ -141,14 +141,16 @@ def _parser() -> argparse.ArgumentParser:
         description="Run credential-free, headless Permit mock demonstrations.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser(
-        "demo",
-        help="show mock capture, cap blocking, e-stop, and ledger verification",
-    )
-    commands.add_parser(
-        "demo-recovery",
-        help="show mock UNKNOWN-to-CAPTURED reconciliation without duplicate capture",
-    )
+    for name, help_text in (
+        ("demo", "show mock capture, cap blocking, e-stop, and ledger verification"),
+        ("demo-recovery", "show mock UNKNOWN-to-CAPTURED reconciliation without duplicate capture"),
+    ):
+        sub = commands.add_parser(name, help=help_text)
+        sub.add_argument(
+            "--demo-key", action="store_true",
+            help="opt in to a per-run generated demo acceptance key when "
+                 "PERMIT_ACCEPTANCE_KEY is unset (off by default, #53)",
+        )
     return parser
 
 
@@ -156,9 +158,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "demo":
-            run_demo()
+            run_demo(demo_key=args.demo_key)
         elif args.command == "demo-recovery":
-            run_recovery_demo()
+            run_recovery_demo(demo_key=args.demo_key)
     except DemoInvariantError as exc:
         print(f"DEMO FAILED: {exc}")
         return 1

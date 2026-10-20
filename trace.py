@@ -64,9 +64,23 @@ def show(tag, obj):
 
 
 def main():
+    demo_key = "--demo-key" in sys.argv[1:]
+    # Acceptance-key gate (#53): fail here, non-zero, before spawning a
+    # server that would die on the same check. Without a configured key
+    # the only opt-in is the explicit --demo-key flag.
+    from settlement.verifier import resolve_acceptance_key
+    try:
+        resolve_acceptance_key(allow_demo_key=demo_key)
+    except ValueError as e:
+        raise SystemExit(
+            f"error: {e}\nFix: set PERMIT_ACCEPTANCE_KEY to a key of at "
+            "least 32 bytes, or pass --demo-key (issue #53).")
     env = dict(os.environ, PERMIT_API_TOKEN=TRACE_TOKEN)
+    server_cmd = [sys.executable, str(HERE / "server.py"), "--port", str(PORT)]
+    if demo_key:
+        server_cmd.append("--demo-key")
     srv = subprocess.Popen(
-        [sys.executable, str(HERE / "server.py"), "--port", str(PORT)],
+        server_cmd,
         cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         env=env,
     )
@@ -151,7 +165,7 @@ def main():
         from permit.ledger import Ledger
         from permit.permit import PermitStore
         from settlement.paypal_client import PayPalClient
-        from settlement.verifier import PredicateType, ReleaseVerifier
+        from settlement.verifier import PredicateType, entrypoint_verifier
 
         class StrictSpy(PayPalClient):
             merchant_account_id = None
@@ -167,7 +181,7 @@ def main():
         lg = Ledger()
         ps = PermitStore(ledger=lg)
         spy = StrictSpy()
-        vf = ReleaseVerifier(spy, ps, ledger=lg, allow_demo_key=True)
+        vf = entrypoint_verifier(spy, ps, ledger=lg, demo_key=demo_key)
         fl = SpendPipeline(ps, spy, vf, ledger=lg)
         p2, _ = ps.grant("spy_agent", 1000, [merchant],
                          datetime.now(timezone.utc) + timedelta(hours=1))
