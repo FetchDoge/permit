@@ -135,7 +135,7 @@ jobs:
         run: echo "tag=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
       - name: Upload forge-wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: forge-wheel
           path: |
@@ -145,7 +145,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload forge-junit
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: forge-junit
           path: junit.xml
@@ -153,7 +153,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload forge-demos
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: forge-demos
           path: forge-demos/*.out
@@ -162,7 +162,7 @@ jobs:
 
       - name: Upload nightly bundle
         if: github.event_name == 'schedule'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nightly-${{ steps.nightly.outputs.tag }}
           path: |
