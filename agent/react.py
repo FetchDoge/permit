@@ -60,6 +60,12 @@ cannot outlive or outspend your permit.
 Args: {"approval_id": str}
 - complete_approved_spend: execute a principal-approved spend. \
 Args: {"approval_id": str}
+- tighten_permit: voluntarily surrender authority you do not need. \
+Args: {"cap_cents": int, "remove_merchants": [str], \
+"expiry_minutes": int, "approval_threshold_cents": int} - all \
+optional, at least one required. Tightening only narrows: a lower \
+cap, fewer merchants, a sooner expiry, or a lower approval \
+threshold. It is permanent; you cannot undo it.
 
 Rules:
 - Amounts are in cents (3000 = $30.00).
@@ -72,6 +78,8 @@ then deliver as usual. A denied approval is final: report it.
 the purchase, then report the capture id - unless the task says not to.
 - Delegation never increases total spending power: the carved cap is \
 reserved on your permit until the child spends or is revoked.
+- If your task needs less authority than your permit allows, use \
+tighten_permit to surrender the excess before you spend.
 - Keep reasoning short.
 
 Respond in exactly this format each turn:

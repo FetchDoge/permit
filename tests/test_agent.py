@@ -5,7 +5,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent.react import build_system, llm_preflight, parse_action, run_agent
+from agent.react import (
+    _execute_tool,
+    build_system,
+    llm_preflight,
+    parse_action,
+    run_agent,
+)
 from agent.tools import SpendTools
 from permit.flow import SpendPipeline
 from permit.ledger import Ledger
@@ -397,3 +403,25 @@ def test_agent_tighten_permit_narrows_allowlist():
     assert obs["decision"] == "BLOCKED"
     assert obs["reason"] == "merchant_not_allowed"
 
+
+
+def test_tighten_permit_listed_for_the_llm_agent():
+    """The ReAct system prompt is the agent's only tool-discovery
+    surface: tighten_permit must be listed there, or the live LLM
+    agent can never call the SpendTools method."""
+    assert "tighten_permit" in build_system(["widget"])
+
+
+def test_tighten_permit_dispatches_through_react_executor():
+    """The ReAct runner dispatches by getattr: a tighten_permit action
+    must execute through _execute_tool and bind immediately."""
+    tools, paypal, permits = _tools()
+    obs = json.loads(
+        _execute_tool(tools, "tighten_permit", {"cap_cents": 2000}))
+    assert obs["ok"] is True
+    assert obs["effective_cap_cents"] == 2000
+
+    obs = json.loads(tools.attempt_spend(2500, "widget"))
+    assert obs["decision"] == "BLOCKED"
+    assert obs["reason"] == "tightened_cap_exceeded"
+    assert paypal.authorizations == {}
