@@ -101,16 +101,145 @@ class ReconcileResult:
     receipt: Receipt | None = None
 
 
-# Acceptance key (issue #35): there is NO fallback key in library code.
-# A known fallback key lets anyone forge Type A acceptances in a default
-# deployment, so construction fails closed: the key must come from the
-# caller or from PERMIT_ACCEPTANCE_KEY, and must be at least 32 bytes.
-# Demo code opts in explicitly with allow_demo_key=True, which generates
-# a fresh random key per verifier instance (per run), never a constant.
+# Acceptance key (issues #35, #53): there is NO fallback key in library
+# code. A known fallback key lets anyone forge Type A acceptances in a
+# default deployment, so construction fails closed: the key must come
+# from the caller or from PERMIT_ACCEPTANCE_KEY, be exactly 32 bytes,
+# and must not be whitespace-only. Demo entry points opt in explicitly
+# with --allow-demo-key / allow_demo_key=True (off by default). When that
+# flag is set and no key is configured, a fresh random key is generated;
+# if a durable demo_key_path is also given (server --db), the key is
+# persisted as a regular file owned by the server euid with mode exactly
+# 0600 (O_NOFOLLOW; create uses O_CREAT|O_EXCL|O_NOFOLLOW + fsync). A key
+# that IS set (env or argument) but invalid always raises — the demo flag
+# never papered over a bad configured key. If the durable ledger already
+# has entries and the key file is missing, startup refuses rather than
+# silently regenerating. Durable ledgers also bind an HMAC commitment of
+# the key (SqliteLedger and DurableLedger); rotation refuses startup.
+import errno as _errno
 import os as _os
 import secrets as _secrets
+import stat as _stat
+from pathlib import Path as _Path
 
 MIN_ACCEPTANCE_KEY_BYTES = 32
+ACCEPTANCE_KEY_COMMITMENT_MSG = b"permit-acceptance-key-v1"
+
+
+def acceptance_key_commitment(key: bytes) -> str:
+    """HMAC(key, 'permit-acceptance-key-v1') as hex — durable binding (REA N-b)."""
+    return hmac.new(key, ACCEPTANCE_KEY_COMMITMENT_MSG, hashlib.sha256).hexdigest()
+
+
+_SILENT_REBIND_MSG = (
+    "acceptance key commitment missing on nonempty durable ledger: "
+    "refusing silent rebind (use rebind_acceptance_key_commitment "
+    "with the old key to migrate)"
+)
+_ROTATION_REFUSE_MSG = (
+    "acceptance key commitment mismatch with durable ledger: "
+    "rotating the acceptance key on an existing database refuses "
+    "startup (use rebind_acceptance_key_commitment with the old key)"
+)
+
+
+def ensure_acceptance_key_commitment(db_ledger, key: bytes) -> None:
+    """Bind ``key`` to a durable ledger on first use; refuse silent rebind.
+
+    Only an *empty* store may bind a key for the first time. A nonempty store
+    without a commitment refuses startup (no silent rebind). Concurrent
+    first-boot uses ``try_bind_meta`` (INSERT OR IGNORE + re-read/compare)
+    when available. Rotating the key without ``rebind_acceptance_key_commitment``
+    refuses startup (REA seq 1854 / 1888 / round 5).
+    """
+    # Imported here to keep settlement.verifier free of a hard sqlite import
+    # cycle at module load for callers that never touch durable mode.
+    from permit.sqlite_ledger import ACCEPTANCE_KEY_COMMITMENT_META
+
+    digest = acceptance_key_commitment(key)
+    stored = db_ledger.get_meta(ACCEPTANCE_KEY_COMMITMENT_META)
+    if stored is None:
+        if len(db_ledger) > 0:
+            raise ValueError(_SILENT_REBIND_MSG)
+        try_bind = getattr(db_ledger, "try_bind_meta", None)
+        if callable(try_bind):
+            bound = try_bind(ACCEPTANCE_KEY_COMMITMENT_META, digest)
+        else:
+            db_ledger.set_meta(ACCEPTANCE_KEY_COMMITMENT_META, digest)
+            bound = db_ledger.get_meta(ACCEPTANCE_KEY_COMMITMENT_META)
+        if bound is None or not hmac.compare_digest(str(bound), digest):
+            raise ValueError(_ROTATION_REFUSE_MSG)
+        return
+    if not hmac.compare_digest(stored, digest):
+        raise ValueError(_ROTATION_REFUSE_MSG)
+
+
+def rebind_acceptance_key_commitment(
+    db_ledger,
+    old_key: bytes | str,
+    new_key: bytes | str,
+) -> None:
+    """One-time migration: verify ``old_key``, then bind exact-32 ``new_key``.
+
+    Pre-exact-32 databases (e.g. bound at 19b62ce with ``token_hex(32)`` /
+    64 UTF-8 bytes) are locked out after the exact-32 upgrade. Operators pass
+    the OLD key (any non-empty length) plus a new exact-32-byte key. The OLD
+    key is checked against the stored commitment; on match the commitment is
+    replaced atomically via ``set_meta``.
+    """
+    from permit.sqlite_ledger import ACCEPTANCE_KEY_COMMITMENT_META
+
+    old = _coerce_key(old_key)
+    if old is None or old.strip() == b"":
+        raise ValueError("old acceptance key is empty or whitespace-only")
+    new = _coerce_key(new_key)
+    if new is None:
+        raise ValueError("new acceptance key is empty")
+    new = _require_valid_key(new, what="new acceptance key")
+
+    stored = db_ledger.get_meta(ACCEPTANCE_KEY_COMMITMENT_META)
+    if stored is None:
+        raise ValueError(
+            "no acceptance key commitment to rebind on this durable ledger"
+        )
+    if not hmac.compare_digest(stored, acceptance_key_commitment(old)):
+        raise ValueError(
+            "old acceptance key does not match stored commitment; "
+            "refusing rebind"
+        )
+    new_digest = acceptance_key_commitment(new)
+    db_ledger.set_meta(ACCEPTANCE_KEY_COMMITMENT_META, new_digest)
+    bound = db_ledger.get_meta(ACCEPTANCE_KEY_COMMITMENT_META)
+    if bound is None or not hmac.compare_digest(str(bound), new_digest):
+        raise RuntimeError("acceptance key rebind failed to persist")
+
+
+def _bind_ledger_acceptance_key_commitment(ledger, key: bytes) -> None:
+    """Enforce commitment unless the ledger is explicitly ephemeral (round 5).
+
+    Fail-closed default: commitment is *required*. Only ledgers marked
+    ``ephemeral_acceptance_key_commitment`` (in-memory ``Ledger``,
+    ``:memory:`` SqliteLedger, DurableLedger without ``durable_dir``) skip.
+    File-backed SqliteLedger cannot opt out (property with no setter).
+    """
+    ephemeral_prop = getattr(
+        type(ledger), "ephemeral_acceptance_key_commitment", None
+    )
+    if isinstance(ephemeral_prop, property) and ephemeral_prop.fget is not None:
+        ephemeral = bool(ephemeral_prop.fget(ledger))
+    else:
+        ephemeral = bool(
+            getattr(ledger, "ephemeral_acceptance_key_commitment", False)
+        )
+    if ephemeral:
+        return
+    has_meta = hasattr(ledger, "get_meta") and hasattr(ledger, "set_meta")
+    if not has_meta:
+        raise ValueError(
+            "durable ledger cannot store acceptance key commitment "
+            "(get_meta/set_meta required; refusing silent skip)"
+        )
+    ensure_acceptance_key_commitment(ledger, key)
 
 
 def _coerce_key(key: bytes | str | None) -> bytes | None:
@@ -119,28 +248,269 @@ def _coerce_key(key: bytes | str | None) -> bytes | None:
     return key.encode() if isinstance(key, str) else bytes(key)
 
 
+def _require_valid_key(resolved: bytes, *, what: str = "acceptance key") -> bytes:
+    """Reject empty, whitespace-only, and wrong-length keys (exactly 32 bytes)."""
+    if resolved.strip() == b"":
+        if len(resolved) == 0:
+            raise ValueError(f"{what} is empty")
+        raise ValueError(f"{what} is whitespace-only")
+    if len(resolved) != MIN_ACCEPTANCE_KEY_BYTES:
+        raise ValueError(
+            f"{what} must be exactly {MIN_ACCEPTANCE_KEY_BYTES} bytes "
+            f"(got {len(resolved)})"
+        )
+    return resolved
+
+
+def _key_oserror(key_path: _Path, exc: OSError) -> ValueError:
+    """Map any open/read OSError to a clean ValueError (no raw traceback)."""
+    err = _errno.errorcode.get(exc.errno, str(exc.errno))
+    if exc.errno in (
+        getattr(_errno, "ELOOP", -1),
+        getattr(_errno, "EMLINK", -1),
+    ):
+        return ValueError(
+            f"demo acceptance key at {key_path} must not be a symlink"
+        )
+    if exc.errno == _errno.EPERM and "symlink" in (exc.strerror or "").lower():
+        return ValueError(
+            f"demo acceptance key at {key_path} must not be a symlink"
+        )
+    return ValueError(
+        f"demo acceptance key at {key_path} cannot be opened "
+        f"({err}: {exc.strerror})"
+    )
+
+
+def _clear_nonblock(fd: int) -> None:
+    """Clear O_NONBLOCK so the subsequent read blocks normally on a regular file."""
+    try:
+        import fcntl as _fcntl
+    except ImportError:  # pragma: no cover - non-POSIX
+        return
+    flags = _fcntl.fcntl(fd, _fcntl.F_GETFL)
+    _fcntl.fcntl(fd, _fcntl.F_SETFL, flags & ~getattr(_os, "O_NONBLOCK", 0))
+
+
+def _reject_foreign_demo_key_owner(key_path: _Path) -> None:
+    """Refuse foreign-owned key paths before open.
+
+    A 0600 file owned by another uid yields EACCES on open for a non-root
+    euid, which would mask the ownership failure. Check ``lstat`` first so
+    a real ``chown`` foreign-owner case reaches the owner check. Symlinks are
+    rejected here too; ``O_NOFOLLOW`` remains on the subsequent open.
+    """
+    try:
+        st = _os.lstat(key_path)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise _key_oserror(key_path, exc) from None
+    if _stat.S_ISLNK(st.st_mode):
+        raise ValueError(
+            f"demo acceptance key at {key_path} must not be a symlink"
+        )
+    euid = _os.geteuid()
+    if st.st_uid != euid:
+        raise ValueError(
+            f"demo acceptance key at {key_path} must be owned by euid "
+            f"{euid} (got uid {st.st_uid})"
+        )
+
+
+def _open_demo_key_readonly(key_path: _Path) -> int:
+    """Open ``key_path`` with O_NOFOLLOW|O_NONBLOCK; map OSError → ValueError.
+
+    O_NONBLOCK keeps a FIFO (or other blocking special file) from hanging
+    startup forever; the regular-file check then rejects non-files.
+    Ownership is checked via ``lstat`` before open so foreign-owned 0600
+    files fail the owner check instead of masking as EACCES.
+    """
+    _reject_foreign_demo_key_owner(key_path)
+    flags = (
+        _os.O_RDONLY
+        | getattr(_os, "O_NOFOLLOW", 0)
+        | getattr(_os, "O_NONBLOCK", 0)
+    )
+    try:
+        return _os.open(key_path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise _key_oserror(key_path, exc) from None
+
+
+def _require_demo_key_fstat(fd: int, key_path: _Path) -> int:
+    """Require a regular file owned by euid with mode exactly 0600.
+
+    Returns the verified mode (always 0o600 on success).
+    """
+    try:
+        st = _os.fstat(fd)
+    except OSError as exc:
+        raise _key_oserror(key_path, exc) from None
+    if not _stat.S_ISREG(st.st_mode):
+        raise ValueError(
+            f"demo acceptance key at {key_path} must be a regular file"
+        )
+    mode = _stat.S_IMODE(st.st_mode)
+    if mode != 0o600:
+        raise ValueError(
+            f"demo acceptance key at {key_path} must have mode 0600 "
+            f"(got {mode:04o})"
+        )
+    euid = _os.geteuid()
+    if st.st_uid != euid:
+        raise ValueError(
+            f"demo acceptance key at {key_path} must be owned by euid "
+            f"{euid} (got uid {st.st_uid})"
+        )
+    return mode
+
+
+def _read_exact_demo_key(fd: int, key_path: _Path) -> bytes:
+    """Read exactly MIN_ACCEPTANCE_KEY_BYTES and require EOF (no trailing)."""
+    try:
+        data = _os.read(fd, MIN_ACCEPTANCE_KEY_BYTES + 1)
+    except OSError as exc:
+        raise _key_oserror(key_path, exc) from None
+    if len(data) < MIN_ACCEPTANCE_KEY_BYTES:
+        raise ValueError(
+            f"demo acceptance key at {key_path} is truncated "
+            f"({len(data)} bytes, need {MIN_ACCEPTANCE_KEY_BYTES})"
+        )
+    if len(data) > MIN_ACCEPTANCE_KEY_BYTES:
+        raise ValueError(
+            f"demo acceptance key at {key_path} has trailing bytes after "
+            f"{MIN_ACCEPTANCE_KEY_BYTES}-byte key"
+        )
+    return _require_valid_key(data, what=f"demo acceptance key at {key_path}")
+
+
+def _fsync_dir(dir_path: _Path) -> None:
+    try:
+        dir_fd = _os.open(
+            dir_path, _os.O_RDONLY | getattr(_os, "O_DIRECTORY", 0)
+        )
+    except OSError as exc:
+        raise _key_oserror(dir_path, exc) from None
+    try:
+        _os.fsync(dir_fd)
+    finally:
+        _os.close(dir_fd)
+
+
+def load_or_create_demo_key(
+    path: str | _os.PathLike[str],
+    *,
+    db_nonempty: bool = False,
+) -> tuple[bytes, int]:
+    """Load or create a durable demo acceptance key file.
+
+    Security posture (REA #54 / seq 1690 + seq 1801):
+    - Open existing files with ``O_NOFOLLOW|O_NONBLOCK``; refuse symlinks and
+      non-regular files (FIFOs must not hang startup).
+    - Map every open/read ``OSError`` (including EACCES) to ``ValueError``.
+    - Require a regular file owned by the process euid with mode exactly 0600.
+    - Clear O_NONBLOCK, then read exactly 32 bytes and require EOF.
+    - Create with ``O_CREAT|O_EXCL|O_NOFOLLOW`` at 0600, then ``fsync`` the
+      file and its directory.
+    - If ``db_nonempty`` and the key file is missing, refuse to regenerate.
+
+    Returns ``(key_bytes, verified_mode)`` so callers can log the mode only
+    after it has been checked — and without opening the file a second time.
+    """
+    key_path = _Path(path)
+    try:
+        fd = _open_demo_key_readonly(key_path)
+    except FileNotFoundError:
+        if db_nonempty:
+            raise ValueError(
+                f"demo acceptance key missing at {key_path} but the durable "
+                "ledger has entries; refusing to regenerate (issue #53)"
+            )
+        return _create_demo_key_file(key_path)
+
+    try:
+        # Reject FIFO/device/etc. before clearing NONBLOCK / reading.
+        mode = _require_demo_key_fstat(fd, key_path)
+        _clear_nonblock(fd)
+        key = _read_exact_demo_key(fd, key_path)
+        return key, mode
+    finally:
+        _os.close(fd)
+
+
+def _create_demo_key_file(key_path: _Path) -> tuple[bytes, int]:
+    key = _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = (
+        _os.O_WRONLY
+        | _os.O_CREAT
+        | _os.O_EXCL
+        | getattr(_os, "O_NOFOLLOW", 0)
+    )
+    try:
+        fd = _os.open(key_path, flags, 0o600)
+    except OSError as exc:
+        raise _key_oserror(key_path, exc) from None
+    try:
+        try:
+            _os.write(fd, key)
+            # umask may have cleared bits from the create mode; force 0600.
+            _os.fchmod(fd, 0o600)
+            _os.fsync(fd)
+        except OSError as exc:
+            raise _key_oserror(key_path, exc) from None
+        mode = _require_demo_key_fstat(fd, key_path)
+    finally:
+        _os.close(fd)
+    _fsync_dir(key_path.parent)
+    return key, mode
+
+
 def resolve_acceptance_key(
-    key: bytes | str | None = None, *, allow_demo_key: bool = False
+    key: bytes | str | None = None,
+    *,
+    allow_demo_key: bool = False,
+    demo_key_path: str | _os.PathLike[str] | None = None,
+    demo_key_db_nonempty: bool = False,
 ) -> bytes:
     """Resolve and validate the acceptance key, failing closed.
 
     Order: explicit ``key`` argument, then PERMIT_ACCEPTANCE_KEY.
-    Missing, empty, or short (under 32 byte) keys raise ValueError,
-    unless ``allow_demo_key`` is set, in which case a fresh per-call
-    random key is generated (demo use only, off by default).
+    A key that is set (argument or env) but empty, whitespace-only, or
+    short (under 32 bytes) always raises ValueError — even when
+    ``allow_demo_key`` is set (#53).
+
+    When no key is configured at all and ``allow_demo_key`` is set:
+    if ``demo_key_path`` is given, load or create a 0600 key file there
+    (see ``load_or_create_demo_key``); otherwise generate a fresh per-call
+    random key (ephemeral demos).
     """
-    resolved = _coerce_key(key)
-    if resolved is None:
+    if key is not None:
+        resolved = _coerce_key(key)
+        if resolved is None:
+            raise ValueError("acceptance key is empty")
+        return _require_valid_key(resolved)
+
+    if "PERMIT_ACCEPTANCE_KEY" in _os.environ:
         resolved = _coerce_key(_os.environ.get("PERMIT_ACCEPTANCE_KEY"))
-    if resolved is None or len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
-        if allow_demo_key:
-            return _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
-        raise ValueError(
-            "acceptance key missing, empty, or under "
-            f"{MIN_ACCEPTANCE_KEY_BYTES} bytes: pass acceptance_key or set "
-            "PERMIT_ACCEPTANCE_KEY (fail closed, issue #35)"
-        )
-    return resolved
+        return _require_valid_key(resolved if resolved is not None else b"")
+
+    if allow_demo_key:
+        if demo_key_path is not None:
+            key_bytes, _mode = load_or_create_demo_key(
+                demo_key_path, db_nonempty=demo_key_db_nonempty
+            )
+            return key_bytes
+        return _secrets.token_bytes(MIN_ACCEPTANCE_KEY_BYTES)
+
+    raise ValueError(
+        "acceptance key missing, empty, whitespace-only, or not exactly "
+        f"{MIN_ACCEPTANCE_KEY_BYTES} bytes: pass acceptance_key or set "
+        "PERMIT_ACCEPTANCE_KEY (fail closed, issues #35/#53)"
+    )
 
 
 def sign_acceptance(
@@ -149,10 +519,14 @@ def sign_acceptance(
     """What the counterparty (acceptance key holder) does off-camera.
 
     The key is required: there is no module-level key to fall back to.
+    Empty, whitespace-only, and wrong-length keys are rejected (#53 / seq 1888).
     """
     resolved = _coerce_key(key)
-    if resolved is None or len(resolved) < MIN_ACCEPTANCE_KEY_BYTES:
-        raise ValueError("sign_acceptance requires a key of at least 32 bytes")
+    if resolved is None:
+        raise ValueError(
+            "sign_acceptance requires a key of exactly 32 bytes"
+        )
+    resolved = _require_valid_key(resolved, what="sign_acceptance key")
     msg = f"{escrow_id}|{artifact_hash}|{amount_cents}".encode()
     return hmac.new(resolved, msg, hashlib.sha256).hexdigest()
 
@@ -166,17 +540,30 @@ class ReleaseVerifier:
         *,
         acceptance_key: bytes | str | None = None,
         allow_demo_key: bool = False,
+        demo_key_path: str | _os.PathLike[str] | None = None,
+        demo_key_db_nonempty: bool = False,
     ):
-        # Fail closed at construction (issue #35): no usable acceptance
-        # key, no verifier. Demo callers pass allow_demo_key=True and get
-        # a fresh random key for this instance only.
+        # Fail closed at construction (issues #35/#53): no usable
+        # acceptance key, no verifier. Demo callers pass
+        # allow_demo_key=True only when no key is configured.
         self._acceptance_key = resolve_acceptance_key(
-            acceptance_key, allow_demo_key=allow_demo_key
+            acceptance_key,
+            allow_demo_key=allow_demo_key,
+            demo_key_path=demo_key_path,
+            demo_key_db_nonempty=demo_key_db_nonempty,
+        )
+        self._demo_key_path = (
+            str(demo_key_path) if demo_key_path is not None else None
         )
         self.paypal = paypal
         self.permits = permits
         # NOTE: explicit None check — an empty Ledger is falsy via __len__.
         self.ledger = ledger if ledger is not None else Ledger()
+        # Durable ledgers (SqliteLedger --db, DurableLedger / harness) must
+        # bind/refuse the acceptance-key commitment; never skip silently.
+        _bind_ledger_acceptance_key_commitment(
+            self.ledger, self._acceptance_key
+        )
         self._escrows: dict[str, Escrow] = {}
         self._lock = threading.Lock()
 

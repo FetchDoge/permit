@@ -24,6 +24,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
+import argparse
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -37,11 +38,13 @@ MERCHANT = "coffee-shop"
 ARTIFACT_HASH = "ab" * 32
 
 
-def build(cap_cents):
+def build(cap_cents, *, allow_demo_key: bool = False):
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     paypal = MockPayPalClient()
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=True)
+    verifier = ReleaseVerifier(
+        paypal, permits, ledger=ledger, allow_demo_key=allow_demo_key
+    )
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
     permit, _ = permits.grant(
         agent_id="demo-agent",
@@ -59,9 +62,9 @@ def attempt(flow, permit_id, amount_cents):
     )
 
 
-def beat_runaway_loop():
+def beat_runaway_loop(*, allow_demo_key: bool = False):
     print("=== beat A: runaway loop refused at budget exhaustion ===")
-    flow, paypal, permits, permit = build(3000)
+    flow, paypal, permits, permit = build(3000, allow_demo_key=allow_demo_key)
     refused = 0
     for i in range(1, 7):
         a = attempt(flow, permit.permit_id, 1000)
@@ -76,9 +79,9 @@ def beat_runaway_loop():
     return permits
 
 
-def beat_concurrent_grab():
+def beat_concurrent_grab(*, allow_demo_key: bool = False):
     print("=== beat B: parallel overspend attempts cannot exceed the budget ===")
-    flow, paypal, permits, permit = build(5000)
+    flow, paypal, permits, permit = build(5000, allow_demo_key=allow_demo_key)
     outcomes = []
     lock = threading.Lock()
 
@@ -105,10 +108,24 @@ def beat_concurrent_grab():
 
 
 def main():
+    ap = argparse.ArgumentParser(description="Permit admission-gating demo")
+    ap.add_argument(
+        "--allow-demo-key",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to a generated acceptance key when PERMIT_ACCEPTANCE_KEY "
+            "is unset (demo only; off by default, #53)"
+        ),
+    )
+    args = ap.parse_args()
     print("Permit admission-gating demo (mock rail)")
-    permits = beat_runaway_loop()
-    print()
-    permits_b = beat_concurrent_grab()
+    try:
+        permits = beat_runaway_loop(allow_demo_key=args.allow_demo_key)
+        print()
+        permits_b = beat_concurrent_grab(allow_demo_key=args.allow_demo_key)
+    except ValueError as exc:
+        raise SystemExit(f"acceptance key error: {exc}") from exc
     print()
     for label, p in (("beat A", permits), ("beat B", permits_b)):
         ok, reason = p.ledger.verify_chain()

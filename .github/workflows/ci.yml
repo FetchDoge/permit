@@ -33,14 +33,22 @@ jobs:
         run: python -m pip install --upgrade pip "pytest>=8" "pytest-cov>=5"
       - name: tests
         if: matrix.python-version != '3.12'
-        run: python -m pytest -q
+        run: python -m pytest -q -rs
       - name: tests with coverage
         if: matrix.python-version == '3.12'
         run: >
-          python -m pytest -q
+          python -m pytest -q -rs
           --cov=permit --cov=settlement
           --cov-report=xml:coverage.xml
           --cov-report=term-missing:skip-covered
+      - name: key-file tests by name
+        if: matrix.python-version == '3.12'
+        # Named -v pass lines for REA (sudo chown foreign-owner must not skip).
+        run: >
+          python -m pytest -v -rs
+          tests/test_demo_key_rea_n_b.py::test_chmod_000_key_file_is_clean_valueerror
+          tests/test_demo_key_rea_n_b.py::test_chmod_000_server_exits_clean_no_traceback
+          tests/test_demo_key_rea_n_b.py::test_foreign_owner_real_chown_clean_valueerror
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.python-version == '3.12'
         with:
@@ -50,6 +58,9 @@ jobs:
           retention-days: 14
       - name: mock demo smoke
         if: matrix.python-version == '3.12'
+        env:
+          # Test-only key for the smoke path (#53: demo key is off by default).
+          PERMIT_ACCEPTANCE_KEY: permit-ci-only-key-32bytes!!!!!!
         run: python demo.py
 
   test-optimized:
@@ -64,7 +75,7 @@ jobs:
         run: python -m pip install --upgrade pip "pytest>=8"
       - name: tests under -O
         # Asserts are stripped under -O; suite must still pass (trust-boundary asserts are a known debt).
-        run: python -O -m pytest -q
+        run: python -O -m pytest -q -rs
 
   lint:
     name: ruff

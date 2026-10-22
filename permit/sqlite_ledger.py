@@ -64,13 +64,24 @@ ON receipts (json_extract(payload, '$.idempotency_key'))
 WHERE json_extract(payload, '$.idempotency_key') IS NOT NULL
 """
 
+_DDL_META = """
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+)
+"""
+
 _DDL = (
     _DDL_TABLE,
     _DDL_NO_UPDATE,
     _DDL_NO_DELETE,
     _DDL_LINK,
     _DDL_IDEMPOTENCY,
+    _DDL_META,
 )
+
+# HMAC(acceptance_key, b"permit-acceptance-key-v1") hex, bound on first use.
+ACCEPTANCE_KEY_COMMITMENT_META = "acceptance_key_commitment_v1"
 
 
 class SqliteLedger:
@@ -264,6 +275,50 @@ class SqliteLedger:
         with self._lock:
             receipts = list(self._receipts)
         return self._verify_receipts(receipts)
+
+    @property
+    def ephemeral_acceptance_key_commitment(self) -> bool:
+        """Only ``:memory:`` is ephemeral; file-backed cannot opt out (seq 1888)."""
+        return self._path == ":memory:"
+
+    @property
+    def requires_acceptance_key_commitment(self) -> bool:
+        return not self.ephemeral_acceptance_key_commitment
+
+    def get_meta(self, key: str) -> str | None:
+        """Return a meta value, or None if unset."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+            return None if row is None else str(row[0])
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Insert or replace a meta value (durable, same connection)."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    def try_bind_meta(self, key: str, value: str) -> str:
+        """Atomically bind ``key`` on first write (INSERT OR IGNORE), then re-read.
+
+        Concurrent first-boot: the winner's value sticks; losers re-read and
+        compare (REA seq round 5).
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
+                (key, value),
+            )
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"meta bind failed for key {key!r}")
+            return str(row[0])
 
     def close(self) -> None:
         """Close the database connection. The instance must not be used after."""

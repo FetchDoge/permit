@@ -47,17 +47,22 @@ def show(receipts, prefix=""):
         print(f"{prefix}#{r.seq:02d} {r.event_type:10s} {detail}")
 
 
-def build_pipeline():
+def build_pipeline(*, allow_demo_key: bool = False):
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     paypal = MockPayPalClient()
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=True)
+    try:
+        verifier = ReleaseVerifier(
+            paypal, permits, ledger=ledger, allow_demo_key=allow_demo_key
+        )
+    except ValueError as exc:
+        raise SystemExit(f"acceptance key error: {exc}") from exc
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
     return flow, paypal, permits, ledger
 
 
-def demo_mock():
-    flow, paypal, permits, ledger = build_pipeline()
+def demo_mock(*, allow_demo_key: bool = False):
+    flow, paypal, permits, ledger = build_pipeline(allow_demo_key=allow_demo_key)
     merchant = "demo_merchant"
 
     print("== 1. grant ==")
@@ -120,13 +125,22 @@ def demo_mock():
 def main():
     ap = argparse.ArgumentParser(description="Permit end-to-end demo")
     ap.add_argument("--sandbox", action="store_true", help="use the real sandbox rail")
+    ap.add_argument(
+        "--allow-demo-key",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to a generated acceptance key when PERMIT_ACCEPTANCE_KEY "
+            "is unset (demo only; off by default, #53)"
+        ),
+    )
     args = ap.parse_args()
     if args.sandbox:
         print("Sandbox mode needs PERMIT_PAYPAL_CLIENT_ID/SECRET and interactive")
         print("payer approval per order - run from a session with a browser tap.")
         print("Use mock mode for the scripted camera run.")
         return
-    demo_mock()
+    demo_mock(allow_demo_key=args.allow_demo_key)
 
 
 if __name__ == "__main__":

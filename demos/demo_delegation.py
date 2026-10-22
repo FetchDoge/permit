@@ -83,12 +83,26 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--port", type=int, default=8471)
+    ap.add_argument(
+        "--allow-demo-key",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to a generated acceptance key when PERMIT_ACCEPTANCE_KEY "
+            "is unset (demo only; off by default, #53)"
+        ),
+    )
     args = ap.parse_args()
 
     ledger = Ledger()
     permits = PermitStore(ledger=ledger)
     paypal = MockPayPalClient()
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=True)
+    try:
+        verifier = ReleaseVerifier(
+            paypal, permits, ledger=ledger, allow_demo_key=args.allow_demo_key
+        )
+    except ValueError as exc:
+        raise SystemExit(f"acceptance key error: {exc}") from exc
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
     dash = Dashboard(permits, ledger, flow, verifier, port=args.port).start()
     print(f"dashboard: http://127.0.0.1:{args.port}")

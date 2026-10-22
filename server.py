@@ -57,6 +57,9 @@ from settlement.verifier import (
     Evidence,
     PredicateType,
     ReleaseVerifier,
+    ensure_acceptance_key_commitment,
+    load_or_create_demo_key,
+    resolve_acceptance_key,
 )
 
 # ---------------------------------------------------------------- state
@@ -508,6 +511,18 @@ def main():
                          " default is in-memory (no persistence)")
     ap.add_argument("--sandbox", action="store_true",
                     help="use the real sandbox rail (needs env creds + interactive payer approval)")
+    ap.add_argument(
+        "--allow-demo-key",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to a generated acceptance key when PERMIT_ACCEPTANCE_KEY "
+            "is unset (mock/demo only; off by default). With --db, the key is "
+            "persisted as <db>.acceptance_key (regular file, euid-owned, mode "
+            "0600, O_NOFOLLOW, exact 32 bytes, fsynced). If the ledger already "
+            "has entries and the key file is missing, refuse to start (#53)."
+        ),
+    )
     args = ap.parse_args()
 
     if args.sandbox:
@@ -527,22 +542,80 @@ def main():
         paypal = MockPayPalClient()
         log.info("mock rail (no network, no credentials)")
 
-    verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=MOCK_MODE)
-    flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
-
+    # Demo key is an explicit opt-in (#53), not implied by mock mode.
+    # Open the durable ledger BEFORE resolving a demo key so a nonempty
+    # db with a missing key file refuses to start instead of regenerating.
+    # Key order (REA seq 1854 / regression from 2a1bbfe): whenever
+    # PERMIT_ACCEPTANCE_KEY is set, use that exact key (refuse empty /
+    # whitespace-only / wrong-length the same way 70b0fc6 did). Fall back
+    # to the durable key file only when the env var is unset. Load the
+    # file at most once, then pass the bytes into ReleaseVerifier.
+    demo_key_path = None
+    demo_key_bytes = None
+    demo_key_mode = None
+    demo_key_db_nonempty = False
     if args.db:
-        # Durable mode: open (verifying) the SQLite ledger, then fold the
-        # restored chain into the permit store. SqliteLedger.__init__
-        # raises instead of serving a corrupt chain — fail closed.
         from permit.sqlite_ledger import SqliteLedger, fold_receipts
         db_ledger = SqliteLedger(args.db)
         folded = fold_receipts(db_ledger.receipts())
         folded.ledger = db_ledger
         ledger, permits = db_ledger, folded
-        verifier = ReleaseVerifier(paypal, permits, ledger=ledger, allow_demo_key=MOCK_MODE)
-        flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
+        demo_key_db_nonempty = len(ledger) > 0
         log.info(f"durable ledger at {args.db}"
                  f" ({len(ledger)} receipts restored)")
+        if args.allow_demo_key:
+            demo_key_path = f"{args.db}.acceptance_key"
+
+    env_key_set = "PERMIT_ACCEPTANCE_KEY" in os.environ
+    if env_key_set:
+        # Env wins over the durable file; invalid values fail closed even
+        # with --allow-demo-key (#53 bar 3).
+        try:
+            demo_key_bytes = resolve_acceptance_key()
+        except ValueError as exc:
+            raise SystemExit(f"acceptance key error: {exc}") from None
+    elif demo_key_path is not None:
+        try:
+            demo_key_bytes, demo_key_mode = load_or_create_demo_key(
+                demo_key_path, db_nonempty=demo_key_db_nonempty
+            )
+        except ValueError as exc:
+            raise SystemExit(f"acceptance key error: {exc}") from None
+
+    def _build_verifier(active_permits, active_ledger):
+        try:
+            if demo_key_bytes is not None:
+                return ReleaseVerifier(
+                    paypal,
+                    active_permits,
+                    ledger=active_ledger,
+                    acceptance_key=demo_key_bytes,
+                )
+            return ReleaseVerifier(
+                paypal,
+                active_permits,
+                ledger=active_ledger,
+                allow_demo_key=args.allow_demo_key,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"acceptance key error: {exc}") from None
+
+    verifier = _build_verifier(permits, ledger)
+    flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
+
+    if args.db:
+        # Explicit --db entry point: bind/refuse commitment (also enforced
+        # inside ReleaseVerifier for any SqliteLedger consumer).
+        try:
+            ensure_acceptance_key_commitment(ledger, verifier._acceptance_key)
+        except ValueError as exc:
+            raise SystemExit(f"acceptance key error: {exc}") from None
+
+    if demo_key_path is not None and demo_key_mode is not None and not env_key_set:
+        log.info(
+            f"demo acceptance key persisted at {demo_key_path} "
+            f"(mode {demo_key_mode:04o})"
+        )
 
     # Reap TTL-expired payer-approval operations (daemon; 60s cadence).
     # /resume also reaps on hit, so an expired op never captures.

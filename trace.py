@@ -18,6 +18,7 @@ exits non-zero. Output doubles as the run's evidence log.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import json
@@ -42,10 +43,6 @@ def _free_port():
         return s.getsockname()[1]
 
 
-PORT = _free_port()
-BASE = f"http://127.0.0.1:{PORT}"
-
-
 TRACE_TOKEN = "trace-token-not-a-secret"
 
 
@@ -64,9 +61,33 @@ def show(tag, obj):
 
 
 def main():
+    ap = argparse.ArgumentParser(description="Permit evidence-trace runner")
+    ap.add_argument(
+        "--allow-demo-key",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to a generated acceptance key when PERMIT_ACCEPTANCE_KEY "
+            "is unset (demo only; off by default, #53). Forwarded to server.py."
+        ),
+    )
+    args = ap.parse_args()
+
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+
+    # Rebind module-level helpers used by req()/show path to this run's port.
+    global PORT, BASE
+    PORT, BASE = port, base
+
     env = dict(os.environ, PERMIT_API_TOKEN=TRACE_TOKEN)
+    server_cmd = [
+        sys.executable, str(HERE / "server.py"), "--port", str(port),
+    ]
+    if args.allow_demo_key:
+        server_cmd.append("--allow-demo-key")
     srv = subprocess.Popen(
-        [sys.executable, str(HERE / "server.py"), "--port", str(PORT)],
+        server_cmd,
         cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         env=env,
     )
@@ -167,7 +188,12 @@ def main():
         lg = Ledger()
         ps = PermitStore(ledger=lg)
         spy = StrictSpy()
-        vf = ReleaseVerifier(spy, ps, ledger=lg, allow_demo_key=True)
+        try:
+            vf = ReleaseVerifier(
+                spy, ps, ledger=lg, allow_demo_key=args.allow_demo_key
+            )
+        except ValueError as exc:
+            raise SystemExit(f"acceptance key error: {exc}") from exc
         fl = SpendPipeline(ps, spy, vf, ledger=lg)
         p2, _ = ps.grant("spy_agent", 1000, [merchant],
                          datetime.now(timezone.utc) + timedelta(hours=1))
