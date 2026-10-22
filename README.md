@@ -50,6 +50,7 @@ python demos/demo_six_beat.py          # LLM agent: grant → capture → over-c
 python demos/demo_delegation.py --fast # LLM agents: buyer and researcher, five beats, live dashboard
 python demos/demo_approval.py --fast   # LLM agent: auto-allow, approve, deny, fail-closed
 python demos/demo_admission.py         # offline: runaway loop refused at budget exhaustion, concurrent overspend cannot exceed cap
+python demos/demo_estop.py             # offline: e-stop wins the race before, inside, and after authorize; over-authority blocked rail-silent; audit shows $0 captured
 ```
 
 The three LLM demos call the runner set by `PERMIT_AGENT_CLI` (the older name `PERMIT_GROK_CLI` is still read as a deprecated alias when `PERMIT_AGENT_CLI` is unset). There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demos/demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl` (gitignored — your own recordings stay local). A fresh clone ships one recorded transcript as a fixture, so the judge path runs with no recording of your own: `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` (provenance: `demos/fixtures/README.md`).
