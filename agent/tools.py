@@ -185,6 +185,54 @@ class SpendTools:
             "amount_cents": approval.amount_cents,
         })
 
+    def tighten_permit(
+        self,
+        cap_cents: int | None = None,
+        remove_merchants: list[str] | None = None,
+        expiry_minutes: int | None = None,
+        approval_threshold_cents: int | None = None,
+    ) -> str:
+        """
+        Voluntarily narrow this permit's authority. Tighten-only: every
+        supplied parameter must strictly narrow current authority.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        permit = self.flow.permits.get(self.permit_id)
+        if permit is None:
+            return json.dumps({"ok": False, "error": "permit not found"})
+
+        expiry_dt = None
+        if expiry_minutes is not None:
+            if not isinstance(expiry_minutes, (int, float)) or expiry_minutes <= 0:
+                return json.dumps({"ok": False, "error": "expiry_minutes must be positive"})
+            expiry_dt = datetime.now(timezone.utc) + timedelta(minutes=expiry_minutes)
+
+        try:
+            tightened, receipt = self.flow.permits.tighten(
+                self.permit_id,
+                cap_cents=cap_cents,
+                remove_merchants=remove_merchants,
+                expiry=expiry_dt,
+                approval_threshold_cents=approval_threshold_cents,
+                actor=f"agent:{permit.agent_id}",
+            )
+            with tightened._lock:
+                eff_cap, _, eff_allow, eff_expiry, _ = self.flow.permits._effective(tightened)
+                eff_threshold = self.flow.permits._effective_threshold(tightened)
+            return json.dumps({
+                "ok": True,
+                "tightened": True,
+                "permit_id": tightened.permit_id,
+                "effective_cap_cents": eff_cap,
+                "remaining_cents": tightened.remaining_cents(),
+                "effective_allowlist": sorted(list(eff_allow)),
+                "effective_expiry": eff_expiry.isoformat(),
+                "effective_approval_threshold_cents": eff_threshold,
+            })
+        except Exception as err:
+            return json.dumps({"ok": False, "error": str(err)})
+
     # -- harness-only (NOT exposed to the LLM) ------------------------------
 
     def deliver_tampered(self, escrow_id: str) -> str:
