@@ -59,7 +59,7 @@ The recording has to say the camera run is the mock. It must not say the six bea
 
 | Requirement | Where it is met | Status |
 | --- | --- | --- |
-| PayPal developer platform, sandbox | `settlement/sandbox_client.py`, `python3 server.py --sandbox`, `docs/sandbox-runbook.md` | Partial. The six beats have not been run as one sandbox session. |
+| PayPal developer platform, sandbox | `settlement/sandbox_client.py`, `python3 server.py --sandbox`, `docs/sandbox-runbook.md`, `tests/test_agent_sandbox_live.py` | Partial. The six beats have not been run as one sandbox session. The agent loop has run on the live sandbox wire (2026-10-23, `sandbox_live` tier): over-cap blocked before any wire call; allowed spend created a real order and stopped at PayPal's payer-approval refusal, reservation held. Post-approval authorization and capture on the live wire still need the buyer's sign-in. |
 | AI in the product, not beside it | The spender in the demo beats is the agent. It has no PayPal credentials. The gate is the only way it spends. | Met. |
 | Working prototype a judge can run | `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` | Met on the mock rail. Includes carved sub-permits and the revoke cascade. |
 | Documentation a judge can grade | README, sandbox runbook, this checklist | Partial. Threat model and lifecycle docs still to write. |
