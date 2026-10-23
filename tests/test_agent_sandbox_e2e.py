@@ -21,9 +21,11 @@ above the wire is the real code - agent tools, pipeline, release
 verifier, and the sandbox client's own order/authorize/capture logic,
 including its trust binding against the GET order response.
 
-The live-wire version of this same path still needs sandbox credentials
-(PERMIT_PAYPAL_CLIENT_ID / PERMIT_PAYPAL_CLIENT_SECRET); it is the
-sandbox_live tier, not this file.
+The live-wire version of this same path is the sandbox_live tier
+(tests/test_agent_sandbox_live.py, credentials-gated, never in CI). It
+runs the agent loop against the real sandbox up to PayPal's
+payer-approval gate; the post-approval resume and capture below that
+gate remain proven here, at the transport boundary.
 """
 
 import io
