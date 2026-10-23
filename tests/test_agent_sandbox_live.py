@@ -26,6 +26,7 @@ boundary in tests/test_agent_sandbox_e2e.py.
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import pytest
 
@@ -107,7 +108,9 @@ def test_live_agent_spend_reaches_payer_approval_on_real_wire(live_tools):
         tools.attempt_spend(SPEND_CENTS, "widget")
     appr = exc_info.value
     assert appr.order_id
-    assert "sandbox.paypal.com" in appr.approval_url
+    assert urlparse(appr.approval_url).hostname in (
+        "www.sandbox.paypal.com", "sandbox.paypal.com"
+    )
 
     # The cap reservation stays held while approval is outstanding.
     permit_view = json.loads(tools.check_permit())
