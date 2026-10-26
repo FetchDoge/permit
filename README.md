@@ -4,28 +4,31 @@
 
 [![ci](https://github.com/FetchDoge/permit/actions/workflows/ci.yml/badge.svg)](https://github.com/FetchDoge/permit/actions/workflows/ci.yml) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 
-No spend without a permit. No timeout without a receipt.
-
-AI agents are getting wallets. The missing piece is the authority layer: what an agent may spend, on whose terms, and with what record. Permit answers that with a scoped permit (a budget, approved merchants, an expiry, revocation) and an e-stop. The agent never holds raw account access or credentials.
-
-Built for the [PayPal AI Hackathon](https://paypalaihackathon.devpost.com/) (Nov 12, 2026).
-
 ## Judges: run this
 
 No keys, no network, no PayPal. Python 3.11 or newer (CI tests 3.11 and 3.12). Mock rail only.
 
 ```bash
-python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl
+python3 demos/demo_six_beat.py --replay demos/fixtures/demo_transcript.jsonl
 ```
 
-Expected last lines (copied from a run at `f9f8c9c`):
+Expected last lines (copied from a run at `f9f8c9c`, without `--fast`):
 
 ```
 ledger chain: VERIFIED (26 receipts)
+transcript: demos/fixtures/demo_transcript.replay.jsonl
 dashboard: http://127.0.0.1:8471 (still live)
 ```
 
-This replays a recorded agent run on the mock rail. It does not move money or contact PayPal. Press Ctrl+C to stop the dashboard.
+`--fast` only skips the pauses between beats; the receipt count is the same 26.
+
+This replays a recorded agent run on the mock rail. It does not move money or contact PayPal.
+
+No spend without a permit. No timeout without a receipt.
+
+AI agents are getting wallets. The missing piece is the authority layer: what an agent may spend, on whose terms, and with what record. Permit answers that with a scoped permit (a budget, approved merchants, an expiry, revocation) and an e-stop. The agent never holds raw account access or credentials.
+
+Built for the [PayPal AI Hackathon](https://paypalaihackathon.devpost.com/) (Nov 12, 2026).
 
 ## What it guarantees
 
