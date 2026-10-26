@@ -31,7 +31,9 @@ PayPalClient implementation.
 | Direct | `PERMIT_PAYPAL_CLIENT_ID`, `PERMIT_PAYPAL_CLIENT_SECRET`, `PERMIT_PAYPAL_MERCHANT_ID` in the environment | those names |
 | `launch_sandbox.py` | `PAYPAL_SANDBOX_CLIENT_ID`, `PAYPAL_SANDBOX_SECRET` in a local `.env.sandbox` (gitignored, never committed) | the launcher copies them to `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET` |
 
-Note: `launch_sandbox.py` **overrides** `PERMIT_PAYPAL_MERCHANT_ID` with the hardcoded sandbox merchant `GVBH7M3B2KVPW`, and any `PERMIT_PAYPAL_CLIENT_ID` / `_SECRET` you set yourself is replaced by the `PAYPAL_SANDBOX_*` values (empty if those are missing, in which case it exits with `missing credentials`). Use the direct path to bind a different merchant.
+Note: `launch_sandbox.py` **overrides** `PERMIT_PAYPAL_MERCHANT_ID` with the hardcoded sandbox merchant `GVBH7M3B2KVPW`, and any `PERMIT_PAYPAL_CLIENT_ID` / `_SECRET` you set yourself is replaced by the `PAYPAL_SANDBOX_*` values (empty if neither `.env.sandbox` nor the shell sets them). Use the direct path to bind a different merchant.
+
+How the launcher fails (from reading `launch_sandbox.py`, not from running it): if `.env.sandbox` is absent, the unguarded `open()` raises `FileNotFoundError` with a traceback. If the file exists but `PAYPAL_SANDBOX_CLIENT_ID` or `PAYPAL_SANDBOX_SECRET` ends up empty (from the file or the shell environment, which the launcher starts from), it prints `missing credentials` and exits 1 before starting the server.
 
 ## The approval flow (what the service does)
 
