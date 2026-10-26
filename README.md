@@ -61,7 +61,7 @@ The AI is the *spender*, not the authority. `agent/react.py` runs a small ReAct 
 
 There is no default runner. If `PERMIT_AGENT_CLI` is unset, the LLM demos exit 1 with a `RuntimeError` that names the fix.
 
-**The judge path does not call an LLM.** `--replay demos/fixtures/demo_transcript.jsonl` replays recorded reasoning text verbatim and re-executes each recorded action against live tools on the mock rail, so the receipts are produced fresh, but the reasoning is a recording (made 2026-10-04; provenance in `demos/fixtures/README.md`). No PayPal call and no money movement happens on that path.
+**The judge path does not call an LLM.** `--replay demos/fixtures/demo_transcript.jsonl` replays recorded reasoning text verbatim and re-executes each recorded action against in-process tools on the mock rail, so the receipts are produced fresh, but the reasoning is a recording. Limit of that recording: it was made on 2026-10-04 against a sibling checkout (permit-converge), adopted on 2026-10-14 after a control replay on `d79be84`, and has not been re-recorded on this HEAD (see `demos/fixtures/README.md`). No PayPal call and no money movement happens on that path.
 
 ## How it fails
 
