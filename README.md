@@ -4,6 +4,26 @@
 
 [![ci](https://github.com/FetchDoge/permit/actions/workflows/ci.yml/badge.svg)](https://github.com/FetchDoge/permit/actions/workflows/ci.yml) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 
+## Judges: run this
+
+No keys, no network, no PayPal. Python 3.11 or newer (CI tests 3.11 and 3.12). Mock rail only.
+
+```bash
+python3 demos/demo_six_beat.py --replay demos/fixtures/demo_transcript.jsonl
+```
+
+Expected last lines (copied from a run at `f9f8c9c`, without `--fast`):
+
+```
+ledger chain: VERIFIED (26 receipts)
+transcript: demos/fixtures/demo_transcript.replay.jsonl
+dashboard: http://127.0.0.1:8471 (still live)
+```
+
+`--fast` only skips the pauses between beats; the receipt count is the same 26.
+
+This replays a recorded agent run on the mock rail. It does not move money or contact PayPal.
+
 No spend without a permit. No timeout without a receipt.
 
 AI agents are getting wallets. The missing piece is the authority layer: what an agent may spend, on whose terms, and with what record. Permit answers that with a scoped permit (a budget, approved merchants, an expiry, revocation) and an e-stop. The agent never holds raw account access or credentials.
@@ -104,8 +124,8 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 ## Evidence
 
-- **406 tests pass, 3 skipped (409 collected) with no sandbox credentials; 408 pass, 1 skipped with them:** `python -m pytest -q` verified locally 2026-10-23. The 2 extra skips are the `sandbox_live` tier (`tests/test_agent_sandbox_live.py`): with sandbox credentials set they run the agent loop on the real PayPal sandbox wire - an over-cap attempt blocked before any wire call, and an allowed spend that creates a real order and stops at PayPal's own payer-approval refusal, reservation held. CI runs the no-credential suite plus `python demo.py` on every push.
-- **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (16 receipts)` (run 2026-10-15 at `21d7d7c`).
+- **406 passed, 3 skipped, 0 failed. No sandbox credentials. Repo-bot measurement, 2026-10-26, `f9f8c9c` (`python -m pytest -q`).** Of the 3 skips, 2 are `sandbox_live` and 1 is `tests/test_rea_r2_pr26_attack.py` (no ReplayStore API to port). The 2026-10-23 credential run, 408 passed and 1 skipped, was not re-run. The 2 extra skips are the `sandbox_live` tier (`tests/test_agent_sandbox_live.py`): with sandbox credentials set they run the agent loop on the real PayPal sandbox wire - an over-cap attempt blocked before any wire call, and an allowed spend that creates a real order and stops at PayPal's own payer-approval refusal, reservation held. CI runs the no-credential suite plus `python demo.py` on every push.
+- **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (16 receipts)` (re-run 2026-10-26 at `f9f8c9c`).
 - **Mock rail vs sandbox, kept separate:**
   - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_AGENT_CLI` or a recorded transcript — one ships as `demos/fixtures/demo_transcript.jsonl` for the offline replay path.
   - The Oct 2 sandbox spike made real REST calls (OAuth, order, authorize, capture, void) against PayPal sandbox and verified merchant identity. Its report left the tree in `3f88feb`. Read it with `git show 3f88feb^:spike-report.md`.
