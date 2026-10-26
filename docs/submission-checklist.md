@@ -15,7 +15,7 @@ The live proof the judge must see, in one command, is: grant → allowed capture
 | `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl`, then open the printed URL | `demos/demo_six_beat.py`, `demos/fixtures/demo_transcript.jsonl`, `dashboard/index.html`, `dashboard/server.py` | The six beats on the mock rail, replayed from the shipped recorded transcript, including a $15 carved sub-permit and a parent revoke cascade. |
 | `python3 demo.py` | `demo.py` | Allow, block, delegate, cascade, chain verified. Exits. |
 | `python3 trace.py` | `trace.py`, `server.py` | The same gate over HTTP, including `POST /api/permits/<id>/delegate` and `POST /api/permits/<id>/revoke-cascade`. Starts its own server on port 8741. Do not leave `server.py` running on that port. |
-| Read the boundary | `docs/sandbox-runbook.md` | What the gate stops, and the sandbox procedure. Threat model and lifecycle docs are still to write. |
+| Read the boundary | `docs/sandbox-runbook.md`, `docs/threat-model.md`, `docs/lifecycle.md` | What the gate stops, the sandbox procedure, what is and is not mitigated, and the states a permit, a spend, and the ledger pass through. |
 
 This demo does **not** call PayPal. Saying that it does is off-arc.
 
@@ -62,7 +62,7 @@ The recording has to say the camera run is the mock. It must not say the six bea
 | PayPal developer platform, sandbox | `settlement/sandbox_client.py`, `python3 server.py --sandbox`, `docs/sandbox-runbook.md`, `tests/test_agent_sandbox_live.py` | Partial. The six beats have not been run as one sandbox session. The agent loop has run on the live sandbox wire (2026-10-23, `sandbox_live` tier): over-cap blocked before any wire call; allowed spend created a real order and stopped at PayPal's payer-approval refusal, reservation held. Post-approval authorization and capture on the live wire still need the buyer's sign-in. |
 | AI in the product, not beside it | The spender in the demo beats is the agent. It has no PayPal credentials. The gate is the only way it spends. | Met. |
 | Working prototype a judge can run | `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` | Met on the mock rail. Includes carved sub-permits and the revoke cascade. |
-| Documentation a judge can grade | README, sandbox runbook, this checklist | Partial. Threat model and lifecycle docs still to write. |
+| Documentation a judge can grade | README, sandbox runbook, threat model, lifecycle, this checklist | Met in this tree: `docs/threat-model.md` and `docs/lifecycle.md`. Both state their limits in writing, including the coalition gap and the open PR #55 acceptance-key hardening. |
 | English | All of the above | Met. |
 | New or significantly updated during Oct 1–Nov 12 | Initial commit Oct 2, 2026 | Met in this history. Say so on the form. |
 
