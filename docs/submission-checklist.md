@@ -8,7 +8,7 @@ The live proof the judge must see, in one command, is: grant → allowed capture
 
 ## Functional demo
 
-**Status: ready.** A judge can run it from a fresh checkout, fully offline. Python 3.10 or newer. No pip install, no API key, no `.env`, no network. Measured on this tree (2026-10-14): `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` reaches `VERIFIED` (26 receipts) in about a second; the receipt chain is deterministic. The cascade is included. A live run (no `--replay`) instead drives the real LLM agent and requires `PERMIT_AGENT_CLI` to be set; there is no `--hold` flag.
+**Status: ready.** A judge can run it from a fresh checkout, fully offline. Python 3.11 or newer (CI tests 3.11 and 3.12). No pip install, no API key, no `.env`, no network. Measured on this tree (2026-10-14): `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` reaches `VERIFIED` (26 receipts) in about a second; the receipt chain is deterministic. The cascade is included. A live run (no `--replay`) instead drives the real LLM agent and requires `PERMIT_AGENT_CLI` to be set; there is no `--hold` flag.
 
 | What the judge does | Where it lives | What it shows |
 | --- | --- | --- |
