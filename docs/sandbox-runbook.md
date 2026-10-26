@@ -24,6 +24,15 @@ PayPalClient implementation.
   the page can stall visually while the order is already APPROVED server-side).
 - The permit service: `python3 server.py --sandbox --port 8741`.
 
+**Two ways to set the credentials (same result):**
+
+| Path | Names you set | What `server.py` sees |
+|---|---|---|
+| Direct | `PERMIT_PAYPAL_CLIENT_ID`, `PERMIT_PAYPAL_CLIENT_SECRET`, `PERMIT_PAYPAL_MERCHANT_ID` in the environment | those names |
+| `launch_sandbox.py` | `PAYPAL_SANDBOX_CLIENT_ID`, `PAYPAL_SANDBOX_SECRET` in a local `.env.sandbox` (gitignored, never committed) | the launcher copies them to `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET` |
+
+Note: `launch_sandbox.py` **overrides** `PERMIT_PAYPAL_MERCHANT_ID` with the hardcoded sandbox merchant `GVBH7M3B2KVPW`, and any `PERMIT_PAYPAL_CLIENT_ID` / `_SECRET` you set yourself is replaced by the `PAYPAL_SANDBOX_*` values (empty if those are missing, in which case it exits with `missing credentials`). Use the direct path to bind a different merchant.
+
 ## The approval flow (what the service does)
 
 1. `POST /api/permits` → grant a permit (cap, allowlist, expiry). Receipt GRANTED.
