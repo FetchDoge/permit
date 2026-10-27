@@ -6,6 +6,12 @@ and IS covered here against the committed fixture transcript
 (demos/fixtures/demo_transcript.jsonl) — the absence of that coverage
 is what let a 0-byte transcript pass as "ready" before the 2026-10-14
 diagnosis (job-board ROI-02).
+
+The other offline judge demos are pinned here too: demo_admission.py
+(the M4 acceptance beats) and demo_sla_escrow.py. The e-stop demo has
+its own pin in test_estop_race.py. The LLM demos (demo_approval.py,
+demo_delegation.py) are not pinned: they need PERMIT_AGENT_CLI and are
+not offline paths.
 """
 
 import json
@@ -37,6 +43,27 @@ def test_mock_demo_exits_clean():
     assert "revoke parent cascades" in proc.stdout
     assert "parent remaining $50.00 (unspent carve released)" in proc.stdout
     assert "post-cascade release: released=False" in proc.stdout
+
+
+def test_admission_demo_exits_clean():
+    # M4 acceptance beats as a judge runs them: (a) a runaway loop is
+    # refused at budget exhaustion with zero rail calls for the refused
+    # attempts, (b) parallel overspend cannot exceed the cap.
+    proc = _run(["demos/demo_admission.py"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "try 4: BLOCKED  over_remaining_cap" in proc.stdout
+    assert "PayPal authorize calls: 3 for 3 admitted spends, 0 for 3 refusals" in proc.stdout
+    assert "admitted: 3 spends, $45.00 total (cap $50.00)" in proc.stdout
+    assert "refused:  13 at admission, 0 phantom PayPal calls" in proc.stdout
+    assert proc.stdout.count("VERIFIED") == 2  # one chain line per beat
+
+
+def test_sla_escrow_demo_exits_clean():
+    proc = _run(["demos/demo_sla_escrow.py"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "predicate:invalid_acceptance_signature" in proc.stdout
+    assert "PayPal captures: 1 (beat 3 only)" in proc.stdout
+    assert "Demo complete: every dollar is accounted for." in proc.stdout
 
 
 def test_trace_exits_clean():
