@@ -185,14 +185,15 @@ class Permit:
     # Least-privilege (opt-in): the only actor allowed to decide this
     # permit's approvals. None = any actor except agent_id.
     principal_id: str | None = None
-    # Approval-threshold semantics. "per_spend" (default): a single spend
-    # above the threshold needs a principal. "cumulative" (opt-in): the
-    # permit's lifetime total reserved + captured + amount is compared to
-    # the threshold, so split payments cannot dodge it.
-    approval_mode: str = "per_spend"
-    # Least-privilege (opt-in): when True, check()/spend() without a
-    # caller agent_id is denied (agent_id_required). Inherited by carves.
-    require_agent_id: bool = False
+    # Approval-threshold semantics. "cumulative" (default): the permit's
+    # lifetime total reserved + captured + amount is compared to the
+    # threshold, so split payments cannot dodge it. "per_spend" (explicit
+    # opt-out): only a single spend above the threshold needs a principal.
+    approval_mode: str = "cumulative"
+    # Least-privilege (default True): check()/spend() without a caller
+    # agent_id is denied (agent_id_required). Inherited by carves.
+    # Pass require_agent_id=False at grant to opt out.
+    require_agent_id: bool = True
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def remaining_cents(self) -> int:
@@ -236,8 +237,8 @@ class PermitStore:
         approval_threshold_cents: int | None = None,
         calibration_tau: float = TAU_DEFAULT,
         principal_id: str | None = None,
-        approval_mode: str = "per_spend",
-        require_agent_id: bool = False,
+        approval_mode: str = "cumulative",
+        require_agent_id: bool = True,
     ) -> tuple[Permit, Receipt]:
         _validate_amount(cap_cents)
         if approval_mode not in APPROVAL_MODES:
@@ -457,8 +458,8 @@ class PermitStore:
 
     @classmethod
     def _approval_needed(cls, permit: Permit, amount_cents: int) -> bool:
-        """Caller must hold permit._lock. Per-spend by default; the
-        opt-in cumulative mode counts the permit's lifetime holds."""
+        """Caller must hold permit._lock. Cumulative by default (the
+        permit's lifetime holds count); per_spend is an explicit opt-out."""
         threshold = cls._effective_threshold(permit)
         if threshold is None:
             return False

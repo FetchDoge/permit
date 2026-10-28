@@ -26,7 +26,7 @@ def _pending(fl, ps, **grant_kw):
     p, _ = ps.grant(agent_id="agent_a", cap_cents=5000, allowlist=[M],
                     expiry=datetime.now(timezone.utc) + timedelta(hours=1),
                     approval_threshold_cents=1000, **grant_kw)
-    a = fl.spend(p.permit_id, 1500, M, PT.D, DIG)
+    a = fl.spend(p.permit_id, 1500, M, PT.D, DIG, agent_id="agent_a")
     assert a.reason == "pending_principal_approval"
     return p, a.approval_id
 
