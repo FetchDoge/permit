@@ -28,9 +28,9 @@ def test_tighten_cap_narrows_and_blocks():
     assert p2.tighten_cap_cents == 2000
     assert receipt.event_type == "TIGHTEN"
     assert receipt.payload["changes"]["cap_cents"] == {"from": 5000, "to": 2000}
-    r = store.check(p.permit_id, 2500, "m1")
+    r = store.check(p.permit_id, 2500, "m1", agent_id=p.agent_id)
     assert not r.allowed and r.reason == "tightened_cap_exceeded"
-    r = store.check(p.permit_id, 1500, "m1")
+    r = store.check(p.permit_id, 1500, "m1", agent_id=p.agent_id)
     assert r.allowed
 
 
@@ -55,9 +55,9 @@ def test_tighten_allowlist_removes_merchant():
     p = grant(store)
     store.tighten(p.permit_id, remove_merchants=["m3"])
     assert store.get(p.permit_id).tighten_allowlist == ("m1", "m2")
-    r = store.check(p.permit_id, 100, "m3")
+    r = store.check(p.permit_id, 100, "m3", agent_id=p.agent_id)
     assert not r.allowed and r.reason == "merchant_not_allowed"
-    r = store.check(p.permit_id, 100, "m1")
+    r = store.check(p.permit_id, 100, "m1", agent_id=p.agent_id)
     assert r.allowed
 
 
@@ -82,9 +82,9 @@ def test_tighten_expiry_blocks_late_attempt():
     store.tighten(p.permit_id, expiry=new_exp)
     assert store.get(p.permit_id).tighten_expiry == new_exp
     future = new_exp + timedelta(seconds=1)
-    r = store.check(p.permit_id, 100, "m1", now=future)
+    r = store.check(p.permit_id, 100, "m1", now=future, agent_id=p.agent_id)
     assert not r.allowed and r.reason == "tightened_expiry_passed"
-    r = store.check(p.permit_id, 100, "m1")
+    r = store.check(p.permit_id, 100, "m1", agent_id=p.agent_id)
     assert r.allowed
 
 
@@ -128,7 +128,7 @@ def test_tighten_cascades_to_children():
     store.tighten(parent.permit_id, cap_cents=2000)
     # Child keeps the narrower of its own cap and the new parent bound.
     assert store.get(child.permit_id).tighten_cap_cents == 2000
-    r = store.check(child.permit_id, 2500, "m1")
+    r = store.check(child.permit_id, 2500, "m1", agent_id=child.agent_id)
     assert not r.allowed and r.reason == "tightened_cap_exceeded"
 
 
@@ -146,7 +146,7 @@ def test_tighten_cascade_skips_narrower_child():
     store.tighten(parent.permit_id, cap_cents=2000)
     # Child already narrower: untouched.
     assert store.get(child.permit_id).tighten_cap_cents is None
-    r = store.check(child.permit_id, 1400, "m1")
+    r = store.check(child.permit_id, 1400, "m1", agent_id=child.agent_id)
     assert r.allowed
 
 
@@ -166,9 +166,9 @@ def test_tighten_cascade_allowlist_and_expiry():
     cc = store.get(child.permit_id)
     assert set(cc.tighten_allowlist or ()) == {"m1", "m2"}
     assert cc.tighten_expiry == new_exp
-    r = store.check(child.permit_id, 100, "m3")
+    r = store.check(child.permit_id, 100, "m3", agent_id=child.agent_id)
     assert not r.allowed
-    r = store.check(child.permit_id, 100, "m1", now=new_exp + timedelta(seconds=1))
+    r = store.check(child.permit_id, 100, "m1", now=new_exp + timedelta(seconds=1), agent_id=child.agent_id)
     assert not r.allowed and r.reason == "tightened_expiry_passed"
 
 
@@ -199,12 +199,12 @@ def test_tighten_receipt_has_cascade_from():
 def test_tighten_does_not_touch_inflight_hold():
     store = make_store()
     p = grant(store)
-    r = store.check(p.permit_id, 4000, "m1")
+    r = store.check(p.permit_id, 4000, "m1", agent_id=p.agent_id)
     assert r.allowed
     store.tighten(p.permit_id, cap_cents=2000)
     # The 4000 hold stands; new attempts are capped at 2000.
     assert store.get(p.permit_id).reserved_cents == 4000
-    r = store.check(p.permit_id, 100, "m1")
+    r = store.check(p.permit_id, 100, "m1", agent_id=p.agent_id)
     assert not r.allowed and r.reason == "tightened_cap_exceeded"
 
 

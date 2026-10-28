@@ -107,7 +107,7 @@ def test_child_spend_and_capture_roll_up_to_parent():
     res = permits.delegate(parent.permit_id, "researcher", 2000, ["m"], EXP)
     child = res.permit
     _, digest = _artifact()
-    attempt = flow.spend(child.permit_id, 1200, "m", PredicateType.D, digest)
+    attempt = flow.spend(child.permit_id, 1200, "m", PredicateType.D, digest, agent_id=child.agent_id)
     assert attempt.allowed
     released = flow.release(
         attempt.escrow_id, Evidence(delivered_bytes=b"delegation work product"))
@@ -126,7 +126,7 @@ def test_child_void_does_not_touch_parent_carve():
     res = permits.delegate(parent.permit_id, "researcher", 2000, ["m"], EXP)
     child = res.permit
     _, digest = _artifact()
-    attempt = flow.spend(child.permit_id, 1200, "m", PredicateType.D, digest)
+    attempt = flow.spend(child.permit_id, 1200, "m", PredicateType.D, digest, agent_id=child.agent_id)
     assert attempt.allowed
     assert permits.get(child.permit_id).reserved_cents == 1200
     # Void the child's hold directly (settlement path).
@@ -144,7 +144,7 @@ def test_child_cannot_exceed_own_cap():
     res = permits.delegate(parent.permit_id, "researcher", 2000, ["m"], EXP)
     child = res.permit
     _, digest = _artifact()
-    attempt = flow.spend(child.permit_id, 2500, "m", PredicateType.D, digest)
+    attempt = flow.spend(child.permit_id, 2500, "m", PredicateType.D, digest, agent_id=child.agent_id)
     assert not attempt.allowed
     assert attempt.reason == "over_remaining_cap"
     assert paypal.authorizations == {}
@@ -157,7 +157,7 @@ def test_nested_delegation_rolls_up_two_levels():
     c2 = permits.delegate(
         c1.permit_id, "worker", 800, ["m"], EXP).permit
     _, digest = _artifact()
-    attempt = flow.spend(c2.permit_id, 500, "m", PredicateType.D, digest)
+    attempt = flow.spend(c2.permit_id, 500, "m", PredicateType.D, digest, agent_id=c2.agent_id)
     assert attempt.allowed
     released = flow.release(
         attempt.escrow_id, Evidence(delivered_bytes=b"delegation work product"))
@@ -179,7 +179,7 @@ def test_cascade_revoke_releases_unspent_carves():
     res = permits.delegate(parent.permit_id, "researcher", 2000, ["m"], EXP)
     child = res.permit
     _, digest = _artifact()
-    attempt = flow.spend(child.permit_id, 1200, "m", PredicateType.D, digest)
+    attempt = flow.spend(child.permit_id, 1200, "m", PredicateType.D, digest, agent_id=child.agent_id)
     released = flow.release(
         attempt.escrow_id, Evidence(delivered_bytes=b"delegation work product"))
     assert released.released
@@ -205,7 +205,7 @@ def test_cascade_revoke_voids_child_inflight_hold():
     res = permits.delegate(parent.permit_id, "researcher", 2000, ["m"], EXP)
     child = res.permit
     _, digest = _artifact()
-    attempt = flow.spend(child.permit_id, 500, "m", PredicateType.D, digest)
+    attempt = flow.spend(child.permit_id, 500, "m", PredicateType.D, digest, agent_id=child.agent_id)
     assert attempt.allowed
     escrow_id = attempt.escrow_id
 
@@ -251,12 +251,12 @@ def test_sibling_subpermits_cannot_overspend_parent():
     assert r1.ok and r2.ok
     c1, c2 = r1.permit, r2.permit
     assert permits.get(parent.permit_id).remaining_cents() == 0
-    assert permits.eligible(c1.permit_id, 2500, "m").allowed
-    assert permits.eligible(c2.permit_id, 2500, "m").allowed
+    assert permits.eligible(c1.permit_id, 2500, "m", agent_id=c1.agent_id).allowed
+    assert permits.eligible(c2.permit_id, 2500, "m", agent_id=c2.agent_id).allowed
     # a third carve, or any spend beyond the carves, is impossible
     r3 = permits.delegate(parent.permit_id, "a3", 1, ["m"], EXP)
     assert not r3.ok and r3.reason == "over_parent_remaining"
-    assert not permits.eligible(parent.permit_id, 1, "m").allowed
+    assert not permits.eligible(parent.permit_id, 1, "m", agent_id=parent.agent_id).allowed
 # -- convergence: depth bound + fail-closed lineage (from the level-up line)
 # ---------------------------------------------------------------------------
 # The carve-out semantic is main's (grant-time encumbrance closes the
@@ -323,7 +323,7 @@ def test_lineage_gate_blocks_spend_when_ancestor_revoked():
     child = r1.permit
     with parent._lock:
         parent.revoked = True
-    result = permits.check(child.permit_id, 100, "m")
+    result = permits.check(child.permit_id, 100, "m", agent_id=child.agent_id)
     assert not result.allowed
     assert result.reason == "ancestor_revoked"
     assert result.receipt.payload["reason"] == "ancestor_revoked"
@@ -334,7 +334,7 @@ def test_eligible_applies_lineage_gate_without_receipt():
     r1 = permits.delegate(parent.permit_id, "a1", 2000, ["m"], EXP)
     with parent._lock:
         parent.revoked = True
-    result = permits.eligible(r1.permit.permit_id, 100, "m")
+    result = permits.eligible(r1.permit.permit_id, 100, "m", agent_id=r1.permit.agent_id)
     assert not result.allowed
     assert result.reason == "ancestor_revoked"
     assert result.receipt is None

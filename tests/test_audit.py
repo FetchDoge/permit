@@ -50,13 +50,13 @@ def test_audit_empty_ledger_is_zeroed_and_chain_ok():
 def test_audit_allowed_and_blocked_rollup():
     flow, permits, ledger, permit = _pipeline()
     ok_attempt = flow.spend(
-        permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     assert ok_attempt.allowed
     blocked = flow.spend(
-        permit.permit_id, 999999, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 999999, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     assert not blocked.allowed and blocked.reason == "over_remaining_cap"
     wrong_merchant = flow.spend(
-        permit.permit_id, 100, "merchant_evil", PredicateType.D, "hash")
+        permit.permit_id, 100, "merchant_evil", PredicateType.D, "hash", agent_id=permit.agent_id)
     assert not wrong_merchant.allowed
     assert wrong_merchant.reason == "merchant_not_allowed"
 
@@ -120,7 +120,7 @@ def test_audit_capture_counted_once_despite_two_captured_receipts():
 def test_audit_reports_tampered_chain():
     flow, permits, ledger, permit = _pipeline()
     attempt = flow.spend(
-        permit.permit_id, 100, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 100, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     assert attempt.allowed
     assert audit_summary(ledger)["chain"]["ok"]
     # Tamper with a recorded payload in place; the chain must break and
@@ -134,7 +134,7 @@ def test_audit_reports_tampered_chain():
 def test_audit_is_read_only_and_served_by_dashboard():
     flow, permits, ledger, permit = _pipeline()
     attempt = flow.spend(
-        permit.permit_id, 700, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 700, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     assert attempt.allowed
     before = [(r.seq, r.hash) for r in ledger.receipts()]
 

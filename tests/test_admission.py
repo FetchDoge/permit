@@ -42,6 +42,7 @@ def _spend(flow, permit_id, amount_cents):
     return flow.spend(
         permit_id, amount_cents, MERCHANT,
         PredicateType.D, ARTIFACT_HASH,
+        agent_id=flow.permits.get(permit_id).agent_id,
     )
 
 

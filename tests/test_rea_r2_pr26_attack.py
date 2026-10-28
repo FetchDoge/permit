@@ -37,7 +37,7 @@ def _grant_check(tmp_path: Path, amount: int = 3000, cap: int = 5000):
         allowlist=["merchant_1"],
         expiry=_future(),
     )
-    result = permits.check(permit.permit_id, amount, "merchant_1")
+    result = permits.check(permit.permit_id, amount, "merchant_1", agent_id=permit.agent_id)
     assert result.allowed
     return ledger, permits, permit
 
@@ -117,7 +117,7 @@ def test_R2_A_forged_permits_json(tmp_path: Path):
     assert p2 is not None
     # Ledger fold restores the reservation — cap is not reopened.
     assert p2.reserved_cents == 3000
-    denied = permits2.check(pid, 3000, "merchant_1")
+    denied = permits2.check(pid, 3000, "merchant_1", agent_id=permits2.get(pid).agent_id)
     assert not denied.allowed
     assert denied.reason == "over_remaining_cap"
     ledger2.close()
@@ -227,7 +227,7 @@ def test_R2_E_ledger_ahead_of_permits(tmp_path: Path):
 
     permits._persist = boom  # type: ignore[method-assign]
     with pytest.raises(KeyboardInterrupt):
-        permits.check(pid, 3000, "merchant_1")
+        permits.check(pid, 3000, "merchant_1", agent_id=permits.get(pid).agent_id)
 
     # Ledger durable; permits.json still at post-grant binding.
     assert any(r.event_type == "ALLOWED" for r in ledger.receipts())
@@ -238,7 +238,7 @@ def test_R2_E_ledger_ahead_of_permits(tmp_path: Path):
     p2 = permits2.get(pid)
     assert p2 is not None
     assert p2.reserved_cents == 3000, "reservation must be rebuilt from ledger"
-    denied = permits2.check(pid, 3000, "merchant_1")
+    denied = permits2.check(pid, 3000, "merchant_1", agent_id=permits2.get(pid).agent_id)
     assert not denied.allowed
     assert denied.reason == "over_remaining_cap"
     ledger2.close()

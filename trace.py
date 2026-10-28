@@ -101,7 +101,7 @@ def main():
         show("grant", {"permit_id": pid, "receipt_seq": grant["receipt"]["seq"]})
 
         _, check = req("POST", f"/api/permits/{pid}/check",
-                       {"amount_cents": 3000, "merchant_id": merchant})
+                       {"agent_id": "trace_agent", "amount_cents": 3000, "merchant_id": merchant})
         show("check", {"allowed": check["allowed"], "reason": check["reason"]})
         assert check["allowed"] and check["reason"] == "allowed", "check should pass"
         # /check is read-only: it does not reserve cap and writes no receipt.
@@ -111,7 +111,7 @@ def main():
         assert after_check["remaining_cents"] == 10000
 
         _, spend = req("POST", f"/api/permits/{pid}/spend", {
-            "amount_cents": 3000, "merchant_id": merchant,
+            "agent_id": "trace_agent", "amount_cents": 3000, "merchant_id": merchant,
             "predicate": "delivery_hash", "artifact_hash": digest})
         show("spend", {"allowed": spend["allowed"], "reason": spend["reason"],
                        "escrow_id": spend["escrow_id"]})
@@ -134,7 +134,7 @@ def main():
         # $80 must block, and the PayPal client must not be called.
         _, paypal_before = req("GET", "/debug/paypal")
         _, blocked = req("POST", f"/api/permits/{pid}/spend", {
-            "amount_cents": 8000, "merchant_id": merchant,
+            "agent_id": "trace_agent", "amount_cents": 8000, "merchant_id": merchant,
             "predicate": "delivery_hash", "artifact_hash": digest})
         _, paypal_after = req("GET", "/debug/paypal")
         show("blocked", {"allowed": blocked["allowed"], "reason": blocked["reason"],
@@ -171,7 +171,7 @@ def main():
         fl = SpendPipeline(ps, spy, vf, ledger=lg)
         p2, _ = ps.grant("spy_agent", 1000, [merchant],
                          datetime.now(timezone.utc) + timedelta(hours=1))
-        attempt = fl.spend(p2.permit_id, 9999, merchant, PredicateType.D, digest)
+        attempt = fl.spend(p2.permit_id, 9999, merchant, PredicateType.D, digest, agent_id=p2.agent_id)
         assert not attempt.allowed and attempt.reason == "over_remaining_cap"
         assert attempt.escrow_id is None
         print("[proof] assertion-spy survived: blocked spend never called PayPal (authorize would have raised)")
@@ -195,7 +195,7 @@ def main():
         assert delegated["receipt"]["event"] == "DELEGATED"
 
         _, spend2 = req("POST", f"/api/permits/{child_id}/spend", {
-            "amount_cents": 1000, "merchant_id": merchant,
+            "agent_id": "buying_agent", "amount_cents": 1000, "merchant_id": merchant,
             "predicate": "delivery_hash", "artifact_hash": digest})
         assert spend2["allowed"]
         escrow2 = spend2["escrow_id"]
@@ -222,10 +222,10 @@ def main():
 
         # post-cascade checks must fail on both permits (revoked)
         _, check_child = req("POST", f"/api/permits/{child_id}/check",
-                             {"amount_cents": 100, "merchant_id": merchant})
+                             {"agent_id": "buying_agent", "amount_cents": 100, "merchant_id": merchant})
         assert not check_child["allowed"] and check_child["reason"] == "revoked"
         _, check_parent = req("POST", f"/api/permits/{parent_id}/check",
-                             {"amount_cents": 100, "merchant_id": merchant})
+                             {"agent_id": "budget_owner", "amount_cents": 100, "merchant_id": merchant})
         assert not check_parent["allowed"] and check_parent["reason"] == "revoked"
 
         _, child_state = req("GET", f"/api/permits/{child_id}")

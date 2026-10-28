@@ -48,7 +48,8 @@ def test_capture_rolls_up_through_delegation():
     child = dlg.permit
     artifact_hash = hashlib.sha256(b"Q3 revenue report: final").hexdigest()
     attempt = pipeline.spend(
-        child.permit_id, 4000, MERCHANT, PredicateType.A, artifact_hash
+        child.permit_id, 4000, MERCHANT, PredicateType.A, artifact_hash,
+        agent_id=child.agent_id,
     )
     assert attempt.allowed
     sig = verifier.sign_acceptance(attempt.escrow_id, artifact_hash, 4000)
@@ -71,7 +72,8 @@ def test_forged_acceptance_is_refused_and_released():
     child = dlg.permit
     artifact_hash = hashlib.sha256(b"appendix draft").hexdigest()
     attempt = pipeline.spend(
-        child.permit_id, 3000, MERCHANT, PredicateType.A, artifact_hash
+        child.permit_id, 3000, MERCHANT, PredicateType.A, artifact_hash,
+        agent_id=child.agent_id,
     )
     assert attempt.allowed
     forged = hashlib.sha256(b"worker says trust me").hexdigest()

@@ -68,7 +68,7 @@ def beat_revoked_before_spend():
     print("=== beat 1: revoked before the spend ===")
     flow, paypal, permits, verifier, permit = build()
     flow.estop(permit.permit_id)
-    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, ARTIFACT_HASH)
+    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, ARTIFACT_HASH, agent_id=permit.agent_id)
     require(not attempt.allowed and attempt.reason == "revoked",
             f"beat 1 expected BLOCKED/revoked, got {attempt.allowed}/{attempt.reason}")
     require(len(paypal.authorize_calls) == 0 and len(paypal.capture_calls) == 0,
@@ -90,7 +90,7 @@ def beat_estop_inside_authorize():
         return auth
 
     paypal.authorize = hostile_authorize
-    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, ARTIFACT_HASH)
+    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, ARTIFACT_HASH, agent_id=permit.agent_id)
     require(not attempt.allowed and attempt.reason == "revoked_during_auth",
             f"beat 2 expected revoked_during_auth, got {attempt.allowed}/{attempt.reason}")
     require(attempt.escrow_id is None and len(verifier._escrows) == 0,
@@ -109,7 +109,7 @@ def beat_estop_inside_authorize():
 def beat_estop_after_authorize():
     print("=== beat 3: e-stop voids an in-flight hold ===")
     flow, paypal, permits, verifier, permit = build()
-    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, ARTIFACT_HASH)
+    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, ARTIFACT_HASH, agent_id=permit.agent_id)
     require(attempt.allowed and attempt.escrow_id, "beat 3 setup spend was not allowed")
     result = flow.estop(permit.permit_id)
     require(result.voided == [attempt.escrow_id],
@@ -135,8 +135,8 @@ def beat_estop_after_authorize():
 def beat_over_authority():
     print("=== beat 4: over-authority attempts never reach the rail ===")
     flow, paypal, permits, verifier, permit = build()
-    over = flow.spend(permit.permit_id, 6000, MERCHANT, PredicateType.D, ARTIFACT_HASH)
-    wrong = flow.spend(permit.permit_id, 1000, "unknown-merchant", PredicateType.D, ARTIFACT_HASH)
+    over = flow.spend(permit.permit_id, 6000, MERCHANT, PredicateType.D, ARTIFACT_HASH, agent_id=permit.agent_id)
+    wrong = flow.spend(permit.permit_id, 1000, "unknown-merchant", PredicateType.D, ARTIFACT_HASH, agent_id=permit.agent_id)
     require(not over.allowed and over.reason == "over_remaining_cap",
             f"beat 4 over-cap attempt: {over.allowed}/{over.reason}")
     require(not wrong.allowed and wrong.reason == "merchant_not_allowed",
