@@ -2,11 +2,16 @@
 """
 Permit service: a minimal HTTP server exposing the core verbs.
 
-    issue permit      POST /api/permits            {agent_id, cap_cents, allowlist, expiry_hours}
+    issue permit      POST /api/permits            {agent_id, cap_cents, allowlist, expiry_hours,
+                                                    [approval_mode, require_agent_id, principal_id]}
+                      defaults: approval_mode "cumulative", require_agent_id true
     permit state      GET  /api/permits/<permit_id>
-    check authority   POST /api/permits/<permit_id>/check   {amount_cents, merchant_id}
+    check authority   POST /api/permits/<permit_id>/check   {amount_cents, merchant_id, agent_id}
                       (read-only: reserves nothing, writes no receipt)
-    spend (allowed)   POST /api/permits/<permit_id>/spend   {amount_cents, merchant_id, predicate, artifact_hash}
+    spend (allowed)   POST /api/permits/<permit_id>/spend   {amount_cents, merchant_id, predicate, artifact_hash, agent_id}
+                      agent_id is required unless the permit was granted
+                      with require_agent_id=false (else 200 allowed=false,
+                      reason agent_id_required / agent_mismatch)
                       sandbox mode may answer 202 approval_required with
                       {operation_id, order_id, approval_url}; the reservation
                       stays held and the SAME order is resumed via:
@@ -148,6 +153,17 @@ def _sweeper() -> None:
             pass
 
 
+def _caller_agent_id(body: dict):
+    """Optional caller identity on /check and /spend. Absent -> None (the
+    permit's require_agent_id decides); present must be a non-empty str."""
+    if "agent_id" not in body or body["agent_id"] is None:
+        return None, None
+    raw = body["agent_id"]
+    if not isinstance(raw, str) or not raw:
+        return None, "agent_id must be a non-empty string"
+    return raw, None
+
+
 def _authorized(handler: BaseHTTPRequestHandler) -> bool:
     """
     Bearer-token gate for mutating routes. Fail closed: when
@@ -248,6 +264,9 @@ class Handler(BaseHTTPRequestHandler):
                 "parent_id": p.parent_id,
                 # Advisory only (Sol 6.1): never an authority clause.
                 "calibration_tau": p.calibration_tau,
+                "approval_mode": p.approval_mode,
+                "require_agent_id": p.require_agent_id,
+                "principal_id": p.principal_id,
             })
         if self.path == "/api/ledger":
             ok, reason = ledger.verify_chain()
@@ -281,12 +300,25 @@ class Handler(BaseHTTPRequestHandler):
                 hours = float(body.get("expiry_hours", 1))
             except (KeyError, TypeError, ValueError):
                 return self._error(400, "need agent_id, cap_cents, allowlist, expiry_hours")
-            permit, receipt = permits.grant(
-                agent_id=agent_id,
-                cap_cents=cap_cents,
-                allowlist=allowlist,
-                expiry=datetime.now(timezone.utc) + timedelta(hours=hours),
-            )
+            grant_kwargs: dict = {}
+            if "approval_mode" in body:
+                grant_kwargs["approval_mode"] = body["approval_mode"]
+            if "require_agent_id" in body:
+                if not isinstance(body["require_agent_id"], bool):
+                    return self._error(400, "require_agent_id must be a boolean")
+                grant_kwargs["require_agent_id"] = body["require_agent_id"]
+            if "principal_id" in body:
+                grant_kwargs["principal_id"] = body["principal_id"]
+            try:
+                permit, receipt = permits.grant(
+                    agent_id=agent_id,
+                    cap_cents=cap_cents,
+                    allowlist=allowlist,
+                    expiry=datetime.now(timezone.utc) + timedelta(hours=hours),
+                    **grant_kwargs,
+                )
+            except ValueError as e:
+                return self._error(400, str(e))
             return self._send(201, {"permit_id": permit.permit_id, "receipt": receipt_summary(receipt)})
 
         m = re.fullmatch(r"/api/permits/([\w-]+)/delegate", self.path)
@@ -321,8 +353,11 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(raw_amount, bool) or not isinstance(raw_amount, int) or raw_amount <= 0:
                 return self._error(400, "amount_cents must be a positive integer")
             amount = raw_amount
+            caller, err = _caller_agent_id(body)
+            if err:
+                return self._error(400, err)
             # Read-only eligibility: no reservation, no receipt.
-            check = permits.eligible(m.group(1), amount, merchant)
+            check = permits.eligible(m.group(1), amount, merchant, agent_id=caller)
             return self._send(200, {
                 "allowed": check.allowed, "reason": check.reason,
             })
@@ -338,8 +373,14 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(raw_amount, bool) or not isinstance(raw_amount, int) or raw_amount <= 0:
                 return self._error(400, "amount_cents must be a positive integer")
             amount = raw_amount
+            caller, err = _caller_agent_id(body)
+            if err:
+                return self._error(400, err)
             try:
-                attempt = flow.spend(m.group(1), amount, merchant, predicate, artifact_hash)
+                attempt = flow.spend(
+                    m.group(1), amount, merchant, predicate, artifact_hash,
+                    agent_id=caller,
+                )
             except ApprovalRequired as appr:
                 # Buyer approval needed: the cap reservation stays held and
                 # the operation is retained for resume. 202, not an error.

@@ -452,6 +452,9 @@ class DurablePermitStore(PermitStore):
                         p.tighten_approval_threshold_cents
                     ),
                     "calibration_tau": p.calibration_tau,
+                    "principal_id": p.principal_id,
+                    "approval_mode": p.approval_mode,
+                    "require_agent_id": p.require_agent_id,
                 }
         envelope = {
             "permits": permits_body,
@@ -468,8 +471,11 @@ class DurablePermitStore(PermitStore):
         expiry: datetime,
         approval_threshold_cents: int | None = None,
         calibration_tau: float | None = None,
+        **lp_kwargs,
     ):
-        kwargs = {}
+        # lp_kwargs: principal_id / approval_mode / require_agent_id,
+        # forwarded unchanged so the base class validates and defaults.
+        kwargs = dict(lp_kwargs)
         if approval_threshold_cents is not None:
             kwargs["approval_threshold_cents"] = approval_threshold_cents
         if calibration_tau is not None:
@@ -480,8 +486,10 @@ class DurablePermitStore(PermitStore):
         self._persist()
         return permit, receipt
 
-    def check(self, permit_id: str, amount_cents: int, merchant_id: str, now: datetime | None = None):
-        result = super().check(permit_id, amount_cents, merchant_id, now=now)
+    def check(self, permit_id: str, amount_cents: int, merchant_id: str, now: datetime | None = None, *, agent_id: str | None = None):
+        result = super().check(
+            permit_id, amount_cents, merchant_id, now=now, agent_id=agent_id
+        )
         # Persist on ALLOWED (reservation) — ledger line is already durable.
         if result.allowed:
             self._persist()
@@ -749,10 +757,10 @@ class DurableSpendPipeline(SpendPipeline):
         super()._hold_for_cleanup(auth_id, permit_id, paypal_auth_id)
         self._persist()
 
-    def spend(self, permit_id: str, amount_cents: int, merchant_id: str, predicate_type, artifact_hash: str, approval_id: str | None = None):
+    def spend(self, permit_id: str, amount_cents: int, merchant_id: str, predicate_type, artifact_hash: str, approval_id: str | None = None, *, agent_id: str | None = None):
         return super().spend(
             permit_id, amount_cents, merchant_id, predicate_type, artifact_hash,
-            approval_id=approval_id,
+            approval_id=approval_id, agent_id=agent_id,
         )
 
     def register_escrow(self, permit_id: str, auth_id: str, paypal_auth_id: str, amount_cents: int, merchant_id: str, predicate_type, artifact_hash: str):
