@@ -56,7 +56,27 @@ def test_checklist_no_longer_lists_docs_as_to_write():
     assert "docs/lifecycle.md" in text
 
 
+def test_demo_video_script_exists_with_honesty_lines():
+    # The M5 recording script must keep the checklist's honesty rules
+    # in the spoken text itself: the camera run is the mock rail, it
+    # does not call PayPal, the six beats have not run as one live
+    # sandbox session, and VERIFIED is internal chain integrity only.
+    text = _read("demo-video-script.md")
+    for needle in (
+        "python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl",
+        "mock rail",
+        "It does not\ncall PayPal",
+        "over_remaining_cap",
+        "VERIFIED, twenty-six receipts",
+        "not a PayPal signature",
+        "docs/submission-checklist.md",
+    ):
+        assert needle in text, needle
+    checklist = _read("submission-checklist.md")
+    assert "docs/demo-video-script.md" in checklist
+
+
 def test_submission_docs_have_no_em_dashes():
     # Standing copy rule for user-facing text: no em dashes.
-    for name in ("threat-model.md", "lifecycle.md"):
+    for name in ("threat-model.md", "lifecycle.md", "demo-video-script.md"):
         assert "\u2014" not in _read(name), name
