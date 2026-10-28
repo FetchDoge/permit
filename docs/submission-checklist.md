@@ -25,7 +25,7 @@ A sub-permit is **carved** from the parent's remaining cap: the carve is reserve
 
 ## Demo video
 
-**Status: not submitted.** No public video URL is in this repo.
+**Status: not submitted.** No public video URL is in this repo. Recording script: `docs/demo-video-script.md` (timed narration, the exact on-screen commands, and the honesty lines, pinned by `tests/test_submission_docs.py`).
 
 Devpost asks for a demonstration video linked from the submission. Host it on YouTube, Vimeo, or Youku, and keep it public. Cut it under three minutes. Judges watch the opening, then the product moving.
 
