@@ -29,6 +29,7 @@ where `remaining(P) = cap(P) − reserved(P) − captured(P)`. Four clauses, no 
 - **Capture is single-flight and idempotent.** The key `{permit_id}:{auth_id}:capture` goes out as `PayPal-Request-Id`, so a retried capture after a timeout cannot double-charge.
 - **Delegation only subdivides.** A sub-permit cannot exceed the parent's remaining cap, add merchants beyond the parent's allowlist, or outlive the parent's expiry. The carved cap is reserved on the parent, so delegated budget cannot be double-spent. Captures roll up through every ancestor.
 - **Approval thresholds only tighten.** You can set or lower them on a live permit, but never raise them. Approved spends are single-use.
+- **Thresholds are per spend by default.** The threshold is compared to each single spend, so several spends at or under it (for example 3 × $20 under a $20 threshold) need no human. Grant with `approval_mode="cumulative"` to compare the permit's lifetime total (reserved + captured + this amount, delegation carves included) instead; the permit is the window. Whether per spend should stay the default is an open design question.
 - **Every decision writes a receipt** to a SHA-256 hash-chained claim ledger. `verify_chain()` runs before every capture (`settlement/verifier.py`).
 
 ## Quickstart

@@ -389,7 +389,7 @@ class SpendPipeline:
                 threshold is not None
                 and isinstance(amount_cents, int)
                 and not isinstance(amount_cents, bool)
-                and amount_cents > threshold
+                and self.permits.approval_needed(permit_id, amount_cents)
             ):
                 # The 4-clause check must pass first: no approval request
                 # for a spend the authority would refuse anyway.

@@ -129,6 +129,9 @@ class TauResult:
     receipt: Receipt
 
 
+APPROVAL_MODES = ("per_spend", "cumulative")
+
+
 @dataclass
 class PendingApproval:
     """A principal-approval request for an above-threshold spend."""
@@ -182,6 +185,11 @@ class Permit:
     # Least-privilege (opt-in): the only actor allowed to decide this
     # permit's approvals. None = any actor except agent_id.
     principal_id: str | None = None
+    # Approval-threshold semantics. "per_spend" (default): a single spend
+    # above the threshold needs a principal. "cumulative" (opt-in): the
+    # permit's lifetime total reserved + captured + amount is compared to
+    # the threshold, so split payments cannot dodge it.
+    approval_mode: str = "per_spend"
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def remaining_cents(self) -> int:
@@ -225,8 +233,11 @@ class PermitStore:
         approval_threshold_cents: int | None = None,
         calibration_tau: float = TAU_DEFAULT,
         principal_id: str | None = None,
+        approval_mode: str = "per_spend",
     ) -> tuple[Permit, Receipt]:
         _validate_amount(cap_cents)
+        if approval_mode not in APPROVAL_MODES:
+            raise ValueError("invalid_approval_mode")
         if principal_id is not None and (
             not isinstance(principal_id, str) or not principal_id
         ):
@@ -245,6 +256,7 @@ class PermitStore:
             approval_threshold_cents=approval_threshold_cents,
             calibration_tau=calibration_tau,
             principal_id=principal_id,
+            approval_mode=approval_mode,
         )
         with self._store_lock:
             self._permits[permit.permit_id] = permit
@@ -259,6 +271,7 @@ class PermitStore:
                 "approval_threshold_cents": approval_threshold_cents,
                 "calibration_tau": calibration_tau,
                 "principal_id": principal_id,
+                "approval_mode": approval_mode,
             },
         )
         return permit, receipt
@@ -434,6 +447,28 @@ class PermitStore:
             return t
         return min(t, o)
 
+    @classmethod
+    def _approval_needed(cls, permit: Permit, amount_cents: int) -> bool:
+        """Caller must hold permit._lock. Per-spend by default; the
+        opt-in cumulative mode counts the permit's lifetime holds."""
+        threshold = cls._effective_threshold(permit)
+        if threshold is None:
+            return False
+        if permit.approval_mode == "cumulative":
+            total = (permit.reserved_cents + permit.captured_cents
+                     + amount_cents)
+            return total > threshold
+        return amount_cents > threshold
+
+    def approval_needed(self, permit_id: str, amount_cents: int) -> bool:
+        """Whether this spend needs a principal's word (False if the
+        permit is unknown: check() then fails closed on it)."""
+        permit = self.get(permit_id)
+        if permit is None:
+            return False
+        with permit._lock:
+            return self._approval_needed(permit, amount_cents)
+
     def approval_threshold(self, permit_id: str) -> int | None:
         """Effective principal-approval threshold, or None if unset."""
         permit = self.get(permit_id)
@@ -467,7 +502,7 @@ class PermitStore:
             if self._evaluate(permit, amount_cents, merchant_id, now) is not None:
                 raise ValueError("authority_check_failed")
             threshold = self._effective_threshold(permit)
-            if threshold is None or amount_cents <= threshold:
+            if not self._approval_needed(permit, amount_cents):
                 raise ValueError("approval_not_required")
             approval = PendingApproval(
                 approval_id=f"apr_{uuid.uuid4().hex[:12]}",
@@ -492,6 +527,7 @@ class PermitStore:
                     "amount_cents": amount_cents,
                     "merchant_id": merchant_id,
                     "threshold_cents": threshold,
+                    "approval_mode": permit.approval_mode,
                     "expires_at": approval.expires_at,
                 },
             )
