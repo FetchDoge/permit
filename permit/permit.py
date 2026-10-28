@@ -143,6 +143,9 @@ class PendingApproval:
     status: str = "pending"
     created_at: str = ""
     expires_at: str = ""
+    # Least-privilege: the principal bound at grant (None = any actor
+    # other than the spending agent).
+    principal_id: str | None = None
 
 
 @dataclass
@@ -176,6 +179,9 @@ class Permit:
     # Advisory calibration tau (Sol 6.1). Raise-only after grant; never
     # read by the authority check.
     calibration_tau: float = TAU_DEFAULT
+    # Least-privilege (opt-in): the only actor allowed to decide this
+    # permit's approvals. None = any actor except agent_id.
+    principal_id: str | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def remaining_cents(self) -> int:
@@ -218,8 +224,15 @@ class PermitStore:
         expiry: datetime,
         approval_threshold_cents: int | None = None,
         calibration_tau: float = TAU_DEFAULT,
+        principal_id: str | None = None,
     ) -> tuple[Permit, Receipt]:
         _validate_amount(cap_cents)
+        if principal_id is not None and (
+            not isinstance(principal_id, str) or not principal_id
+        ):
+            raise ValueError("invalid_principal_id")
+        if principal_id is not None and principal_id == agent_id:
+            raise ValueError("principal_is_agent")
         if approval_threshold_cents is not None:
             _validate_amount(approval_threshold_cents)
         calibration_tau = validate_tau(calibration_tau)
@@ -231,6 +244,7 @@ class PermitStore:
             expiry=expiry,
             approval_threshold_cents=approval_threshold_cents,
             calibration_tau=calibration_tau,
+            principal_id=principal_id,
         )
         with self._store_lock:
             self._permits[permit.permit_id] = permit
@@ -244,6 +258,7 @@ class PermitStore:
                 "expiry": expiry.isoformat(),
                 "approval_threshold_cents": approval_threshold_cents,
                 "calibration_tau": calibration_tau,
+                "principal_id": principal_id,
             },
         )
         return permit, receipt
@@ -464,6 +479,7 @@ class PermitStore:
                 artifact_hash=artifact_hash,
                 created_at=now.isoformat(),
                 expires_at=(now + timedelta(minutes=ttl_minutes)).isoformat(),
+                principal_id=permit.principal_id,
             )
             with self._store_lock:
                 self._approvals[approval.approval_id] = approval
@@ -527,6 +543,30 @@ class PermitStore:
                 raise ValueError("approval_expired")
             if approval.status != "pending":
                 raise ValueError(f"approval_already_{approval.status}")
+            # Least-privilege: the spending agent can never decide its own
+            # request; a bound principal must be the actor. Fail closed:
+            # receipt, status stays pending, raise.
+            if actor == approval.agent_id:
+                refusal = "self_approval"
+            elif (
+                approval.principal_id is not None
+                and actor != approval.principal_id
+            ):
+                refusal = "principal_mismatch"
+            else:
+                refusal = None
+            if refusal is not None:
+                self.ledger.append(
+                    "APPROVAL_REFUSED",
+                    {
+                        "approval_id": approval.approval_id,
+                        "permit_id": approval.permit_id,
+                        "agent_id": approval.agent_id,
+                        "actor": actor,
+                        "reason": refusal,
+                    },
+                )
+                raise ValueError(refusal)
             approval.status = "approved" if approved else "denied"
             self.ledger.append(
                 "APPROVAL_DECIDED",
