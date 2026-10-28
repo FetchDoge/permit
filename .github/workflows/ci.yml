@@ -14,6 +14,9 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PYTHONDONTWRITEBYTECODE: "1"
 
+permissions:
+  contents: read
+
 jobs:
   # Matrix job id must not be `test` — the branch ruleset requires a check
   # named exactly "test", provided by the aggregate gate below.
@@ -130,6 +133,7 @@ jobs:
   # Required branch-ruleset check name. Aggregates pytest matrix, -O, and security.
   test:
     name: test
+    permissions: {}
     runs-on: ubuntu-latest
     needs: [pytest, test-optimized, security]
     if: always()
