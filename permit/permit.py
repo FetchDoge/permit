@@ -190,6 +190,9 @@ class Permit:
     # permit's lifetime total reserved + captured + amount is compared to
     # the threshold, so split payments cannot dodge it.
     approval_mode: str = "per_spend"
+    # Least-privilege (opt-in): when True, check()/spend() without a
+    # caller agent_id is denied (agent_id_required). Inherited by carves.
+    require_agent_id: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def remaining_cents(self) -> int:
@@ -234,6 +237,7 @@ class PermitStore:
         calibration_tau: float = TAU_DEFAULT,
         principal_id: str | None = None,
         approval_mode: str = "per_spend",
+        require_agent_id: bool = False,
     ) -> tuple[Permit, Receipt]:
         _validate_amount(cap_cents)
         if approval_mode not in APPROVAL_MODES:
@@ -257,6 +261,7 @@ class PermitStore:
             calibration_tau=calibration_tau,
             principal_id=principal_id,
             approval_mode=approval_mode,
+            require_agent_id=bool(require_agent_id),
         )
         with self._store_lock:
             self._permits[permit.permit_id] = permit
@@ -272,6 +277,7 @@ class PermitStore:
                 "calibration_tau": calibration_tau,
                 "principal_id": principal_id,
                 "approval_mode": approval_mode,
+                "require_agent_id": bool(require_agent_id),
             },
         )
         return permit, receipt
@@ -410,6 +416,8 @@ class PermitStore:
                     depth=parent.depth + 1,
                     # Advisory tau: a carve starts at the parent's tau.
                     calibration_tau=parent.calibration_tau,
+                    # Strict caller identity never loosens down a lineage.
+                    require_agent_id=parent.require_agent_id,
                 )
                 self._permits[child.permit_id] = child
                 self._children.setdefault(parent.permit_id, []).append(
@@ -1050,12 +1058,30 @@ class PermitStore:
                 "error": type(exc).__name__,
             }
 
+    @staticmethod
+    def _caller_block_reason(permit: Permit, agent_id) -> str | None:
+        """Least-privilege caller gate, evaluated BEFORE (never instead
+        of) the 4-clause check. None = caller acceptable."""
+        if agent_id is None:
+            return "agent_id_required" if permit.require_agent_id else None
+        if agent_id != permit.agent_id:
+            return "agent_mismatch"
+        return None
+
+    def caller_block_reason(self, permit_id: str, agent_id) -> str | None:
+        permit = self.get(permit_id)
+        if permit is None:
+            return None  # check() fails closed on unknown_permit
+        return self._caller_block_reason(permit, agent_id)
+
     def eligible(
         self,
         permit_id: str,
         amount_cents: int,
         merchant_id: str,
         now: datetime | None = None,
+        *,
+        agent_id: str | None = None,
     ) -> CheckResult:
         """
         READ-ONLY authority evaluation: the same 4-clause logic as check()
@@ -1071,6 +1097,9 @@ class PermitStore:
         permit = self.get(permit_id)
         if permit is None:
             return CheckResult(False, "unknown_permit")
+        caller = self._caller_block_reason(permit, agent_id)
+        if caller is not None:
+            return CheckResult(False, caller)
 
         chain = self.lineage(permit_id)
         with permit._lock:
@@ -1089,6 +1118,8 @@ class PermitStore:
         amount_cents: int,
         merchant_id: str,
         now: datetime | None = None,
+        *,
+        agent_id: str | None = None,
     ) -> CheckResult:
         """
         Evaluate a spend attempt: validate → eligible() → reserve + ALLOWED
@@ -1123,6 +1154,21 @@ class PermitStore:
                 {"permit_id": permit_id, "reason": "unknown_permit"},
             )
             return CheckResult(False, "unknown_permit", receipt)
+
+        caller = self._caller_block_reason(permit, agent_id)
+        if caller is not None:
+            receipt = self.ledger.append(
+                "BLOCKED",
+                {
+                    "permit_id": permit.permit_id,
+                    "agent_id": permit.agent_id,
+                    "caller_agent_id": agent_id,
+                    "amount_cents": amount_cents,
+                    "merchant_id": merchant_id,
+                    "reason": caller,
+                },
+            )
+            return CheckResult(False, caller, receipt)
 
         # Read-only authority evaluation first (no reservation, no receipt).
         # This is the shared logic the server's /check route also uses.
