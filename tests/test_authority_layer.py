@@ -139,7 +139,7 @@ def test_p1_1_estop_inside_authorize_voids_hold_and_blocks():
 
     paypal.authorize = hostile_authorize
 
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash")
+    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash", agent_id=permit.agent_id)
     assert not attempt.allowed
     assert attempt.reason == "revoked_during_auth"
     assert attempt.escrow_id is None
@@ -176,7 +176,7 @@ def test_p1_1_expiry_inside_authorize_voids_hold_and_blocks():
 
     paypal.authorize = expiring_authorize
 
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash")
+    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash", agent_id=permit.agent_id)
     assert not attempt.allowed
     assert attempt.reason == "expired_during_auth"
     assert paypal.void_calls == ["tiny_auth_expired"]
@@ -189,7 +189,7 @@ def test_p1_1_register_escrow_on_revoked_permit_raises_and_voids():
     instead of registering; the PayPal hold is voided and the reservation
     released — there is no escrow to release, so capture stays refused."""
     flow, paypal, permits, permit = _permit_layer()
-    check = permits.check(permit.permit_id, 3000, "merchant_1")
+    check = permits.check(permit.permit_id, 3000, "merchant_1", agent_id=permit.agent_id)
     auth_id = check.receipt.payload["auth_id"]
     pp_auth = paypal.authorize(3000, "merchant_1")
     flow.estop(permit.permit_id)
@@ -213,7 +213,7 @@ def test_p1_1_estop_voids_outstanding_unregistered_hold():
     """Threaded case: e-stop lands after authorize returned but before the
     escrow is registered. flow.estop() must void the outstanding hold."""
     flow, paypal, permits, permit = _permit_layer()
-    check = permits.check(permit.permit_id, 3000, "merchant_1")
+    check = permits.check(permit.permit_id, 3000, "merchant_1", agent_id=permit.agent_id)
     auth_id = check.receipt.payload["auth_id"]
     # Simulate post-authorize state before registration.
     flow._track_outstanding(auth_id, permit.permit_id)
@@ -236,12 +236,12 @@ def test_p1_3_negative_amount_blocked_never_reserves():
     """check(-1000) on a 5000-cap permit: BLOCKED invalid_amount, nothing
     reserved — the witness's budget-increase exploit is closed."""
     flow, paypal, permits, permit = _permit_layer(cap_cents=5000)
-    res = permits.check(permit.permit_id, -1000, "merchant_1")
+    res = permits.check(permit.permit_id, -1000, "merchant_1", agent_id=permit.agent_id)
     assert not res.allowed and res.reason == "invalid_amount"
     assert res.receipt.event_type == "BLOCKED"
     assert permit.reserved_cents == 0
     # ... so a follow-up +6000 is still over the untouched 5000 cap.
-    res2 = permits.check(permit.permit_id, 6000, "merchant_1")
+    res2 = permits.check(permit.permit_id, 6000, "merchant_1", agent_id=permit.agent_id)
     assert not res2.allowed and res2.reason == "over_remaining_cap"
     assert permit.remaining_cents() == 5000
 
@@ -250,7 +250,7 @@ def test_p1_3_negative_amount_blocked_never_reserves():
 def test_p1_3_non_positive_int_amounts_are_invalid(bad):
     _, _, permits, permit = _permit_layer()
     before = len(permits.ledger)
-    res = permits.check(permit.permit_id, bad, "merchant_1")
+    res = permits.check(permit.permit_id, bad, "merchant_1", agent_id=permit.agent_id)
     assert not res.allowed and res.reason == "invalid_amount"
     assert res.receipt.event_type == "BLOCKED"
     assert permit.reserved_cents == 0
@@ -281,7 +281,7 @@ def test_eligible_is_read_only():
     nothing and writes no receipt."""
     _, _, permits, permit = _permit_layer()
     before = len(permits.ledger)
-    res = permits.eligible(permit.permit_id, 3000, "merchant_1")
+    res = permits.eligible(permit.permit_id, 3000, "merchant_1", agent_id=permit.agent_id)
     assert res.allowed and res.reason == "allowed"
     assert res.receipt is None
     assert permit.reserved_cents == 0
@@ -291,13 +291,13 @@ def test_eligible_is_read_only():
 def test_eligible_reports_block_reasons_without_side_effects():
     _, _, permits, permit = _permit_layer()
     before = len(permits.ledger)
-    assert permits.eligible(permit.permit_id, 6000, "merchant_1").reason == (
+    assert permits.eligible(permit.permit_id, 6000, "merchant_1", agent_id=permit.agent_id).reason == (
         "over_remaining_cap"
     )
-    assert permits.eligible(permit.permit_id, 1000, "evil").reason == (
+    assert permits.eligible(permit.permit_id, 1000, "evil", agent_id=permit.agent_id).reason == (
         "merchant_not_allowed"
     )
-    assert permits.eligible(permit.permit_id, -5, "merchant_1").reason == (
+    assert permits.eligible(permit.permit_id, -5, "merchant_1", agent_id=permit.agent_id).reason == (
         "invalid_amount"
     )
     assert permits.eligible("prm_nope", 100, "merchant_1").reason == "unknown_permit"
@@ -308,8 +308,8 @@ def test_eligible_reports_block_reasons_without_side_effects():
 def test_eligible_then_check_reserves_once():
     """eligible() must not pre-consume: a later check() reserves exactly once."""
     _, _, permits, permit = _permit_layer()
-    assert permits.eligible(permit.permit_id, 3000, "merchant_1").allowed
-    res = permits.check(permit.permit_id, 3000, "merchant_1")
+    assert permits.eligible(permit.permit_id, 3000, "merchant_1", agent_id=permit.agent_id).allowed
+    res = permits.check(permit.permit_id, 3000, "merchant_1", agent_id=permit.agent_id)
     assert res.allowed
     assert permit.reserved_cents == 3000
 
@@ -327,7 +327,7 @@ def test_merchant_binding_blocks_unbound_payee():
     paypal.merchant_account_id = "ACCT_X"
     flow, _, permits, permit = _permit_layer(paypal=paypal, merchants=("ALLOWLISTED",))
 
-    attempt = flow.spend(permit.permit_id, 1000, "ALLOWLISTED", PRED, "hash")
+    attempt = flow.spend(permit.permit_id, 1000, "ALLOWLISTED", PRED, "hash", agent_id=permit.agent_id)
     assert not attempt.allowed
     assert attempt.reason == "merchant_not_bound"
     assert attempt.escrow_id is None
@@ -342,7 +342,7 @@ def test_merchant_binding_allows_bound_payee():
     paypal.merchant_account_id = "ACCT_X"
     flow, _, permits, permit = _permit_layer(paypal=paypal, merchants=("ACCT_X",))
 
-    attempt = flow.spend(permit.permit_id, 1000, "ACCT_X", PRED, "hash")
+    attempt = flow.spend(permit.permit_id, 1000, "ACCT_X", PRED, "hash", agent_id=permit.agent_id)
     assert attempt.allowed
     assert attempt.escrow_id is not None
     assert paypal.authorize_calls != []
@@ -354,7 +354,7 @@ def test_merchant_binding_absent_skips_check():
     assert not hasattr(paypal, "merchant_account_id") or (
         paypal.merchant_account_id is None
     )
-    attempt = flow.spend(permit.permit_id, 1000, "merchant_1", PRED, "hash")
+    attempt = flow.spend(permit.permit_id, 1000, "merchant_1", PRED, "hash", agent_id=permit.agent_id)
     assert attempt.allowed
 
 
@@ -368,7 +368,7 @@ def test_authorize_gets_idempotency_key_when_supported():
             return super().authorize(amount_cents, merchant_id)
 
     flow, _, permits, permit = _permit_layer(paypal=IdemPayPal())
-    attempt = flow.spend(permit.permit_id, 1000, "merchant_1", PRED, "hash")
+    attempt = flow.spend(permit.permit_id, 1000, "merchant_1", PRED, "hash", agent_id=permit.agent_id)
     auth_id = attempt.receipts[0].payload["auth_id"]
     assert seen["key"] == f"{permit.permit_id}:{auth_id}:authorize"
 
@@ -386,7 +386,7 @@ def test_spend_needs_payer_approval_raises_and_holds_reservation():
     flow, _, permits, permit = _permit_layer(paypal=paypal)
 
     with pytest.raises(ApprovalRequired) as exc_info:
-        flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "artifact_hash")
+        flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "artifact_hash", agent_id=permit.agent_id)
     appr = exc_info.value
     assert appr.permit_id == permit.permit_id
     assert appr.order_id == "ord_1"
@@ -409,7 +409,7 @@ def test_resume_operation_after_approval_completes_spend():
     flow, _, permits, permit = _permit_layer(paypal=paypal)
 
     with pytest.raises(ApprovalRequired) as exc_info:
-        flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash")
+        flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash", agent_id=permit.agent_id)
     appr = exc_info.value
 
     order_calls = []

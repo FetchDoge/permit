@@ -129,6 +129,9 @@ class TauResult:
     receipt: Receipt
 
 
+APPROVAL_MODES = ("per_spend", "cumulative")
+
+
 @dataclass
 class PendingApproval:
     """A principal-approval request for an above-threshold spend."""
@@ -143,6 +146,9 @@ class PendingApproval:
     status: str = "pending"
     created_at: str = ""
     expires_at: str = ""
+    # Least-privilege: the principal bound at grant (None = any actor
+    # other than the spending agent).
+    principal_id: str | None = None
 
 
 @dataclass
@@ -176,6 +182,18 @@ class Permit:
     # Advisory calibration tau (Sol 6.1). Raise-only after grant; never
     # read by the authority check.
     calibration_tau: float = TAU_DEFAULT
+    # Least-privilege (opt-in): the only actor allowed to decide this
+    # permit's approvals. None = any actor except agent_id.
+    principal_id: str | None = None
+    # Approval-threshold semantics. "cumulative" (default): the permit's
+    # lifetime total reserved + captured + amount is compared to the
+    # threshold, so split payments cannot dodge it. "per_spend" (explicit
+    # opt-out): only a single spend above the threshold needs a principal.
+    approval_mode: str = "cumulative"
+    # Least-privilege (default True): check()/spend() without a caller
+    # agent_id is denied (agent_id_required). Inherited by carves.
+    # Pass require_agent_id=False at grant to opt out.
+    require_agent_id: bool = True
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def remaining_cents(self) -> int:
@@ -218,8 +236,19 @@ class PermitStore:
         expiry: datetime,
         approval_threshold_cents: int | None = None,
         calibration_tau: float = TAU_DEFAULT,
+        principal_id: str | None = None,
+        approval_mode: str = "cumulative",
+        require_agent_id: bool = True,
     ) -> tuple[Permit, Receipt]:
         _validate_amount(cap_cents)
+        if approval_mode not in APPROVAL_MODES:
+            raise ValueError("invalid_approval_mode")
+        if principal_id is not None and (
+            not isinstance(principal_id, str) or not principal_id
+        ):
+            raise ValueError("invalid_principal_id")
+        if principal_id is not None and principal_id == agent_id:
+            raise ValueError("principal_is_agent")
         if approval_threshold_cents is not None:
             _validate_amount(approval_threshold_cents)
         calibration_tau = validate_tau(calibration_tau)
@@ -231,6 +260,9 @@ class PermitStore:
             expiry=expiry,
             approval_threshold_cents=approval_threshold_cents,
             calibration_tau=calibration_tau,
+            principal_id=principal_id,
+            approval_mode=approval_mode,
+            require_agent_id=bool(require_agent_id),
         )
         with self._store_lock:
             self._permits[permit.permit_id] = permit
@@ -244,6 +276,9 @@ class PermitStore:
                 "expiry": expiry.isoformat(),
                 "approval_threshold_cents": approval_threshold_cents,
                 "calibration_tau": calibration_tau,
+                "principal_id": principal_id,
+                "approval_mode": approval_mode,
+                "require_agent_id": bool(require_agent_id),
             },
         )
         return permit, receipt
@@ -382,6 +417,8 @@ class PermitStore:
                     depth=parent.depth + 1,
                     # Advisory tau: a carve starts at the parent's tau.
                     calibration_tau=parent.calibration_tau,
+                    # Strict caller identity never loosens down a lineage.
+                    require_agent_id=parent.require_agent_id,
                 )
                 self._permits[child.permit_id] = child
                 self._children.setdefault(parent.permit_id, []).append(
@@ -419,6 +456,28 @@ class PermitStore:
             return t
         return min(t, o)
 
+    @classmethod
+    def _approval_needed(cls, permit: Permit, amount_cents: int) -> bool:
+        """Caller must hold permit._lock. Cumulative by default (the
+        permit's lifetime holds count); per_spend is an explicit opt-out."""
+        threshold = cls._effective_threshold(permit)
+        if threshold is None:
+            return False
+        if permit.approval_mode == "cumulative":
+            total = (permit.reserved_cents + permit.captured_cents
+                     + amount_cents)
+            return total > threshold
+        return amount_cents > threshold
+
+    def approval_needed(self, permit_id: str, amount_cents: int) -> bool:
+        """Whether this spend needs a principal's word (False if the
+        permit is unknown: check() then fails closed on it)."""
+        permit = self.get(permit_id)
+        if permit is None:
+            return False
+        with permit._lock:
+            return self._approval_needed(permit, amount_cents)
+
     def approval_threshold(self, permit_id: str) -> int | None:
         """Effective principal-approval threshold, or None if unset."""
         permit = self.get(permit_id)
@@ -452,7 +511,7 @@ class PermitStore:
             if self._evaluate(permit, amount_cents, merchant_id, now) is not None:
                 raise ValueError("authority_check_failed")
             threshold = self._effective_threshold(permit)
-            if threshold is None or amount_cents <= threshold:
+            if not self._approval_needed(permit, amount_cents):
                 raise ValueError("approval_not_required")
             approval = PendingApproval(
                 approval_id=f"apr_{uuid.uuid4().hex[:12]}",
@@ -464,6 +523,7 @@ class PermitStore:
                 artifact_hash=artifact_hash,
                 created_at=now.isoformat(),
                 expires_at=(now + timedelta(minutes=ttl_minutes)).isoformat(),
+                principal_id=permit.principal_id,
             )
             with self._store_lock:
                 self._approvals[approval.approval_id] = approval
@@ -476,6 +536,7 @@ class PermitStore:
                     "amount_cents": amount_cents,
                     "merchant_id": merchant_id,
                     "threshold_cents": threshold,
+                    "approval_mode": permit.approval_mode,
                     "expires_at": approval.expires_at,
                 },
             )
@@ -527,6 +588,30 @@ class PermitStore:
                 raise ValueError("approval_expired")
             if approval.status != "pending":
                 raise ValueError(f"approval_already_{approval.status}")
+            # Least-privilege: the spending agent can never decide its own
+            # request; a bound principal must be the actor. Fail closed:
+            # receipt, status stays pending, raise.
+            if actor == approval.agent_id:
+                refusal = "self_approval"
+            elif (
+                approval.principal_id is not None
+                and actor != approval.principal_id
+            ):
+                refusal = "principal_mismatch"
+            else:
+                refusal = None
+            if refusal is not None:
+                self.ledger.append(
+                    "APPROVAL_REFUSED",
+                    {
+                        "approval_id": approval.approval_id,
+                        "permit_id": approval.permit_id,
+                        "agent_id": approval.agent_id,
+                        "actor": actor,
+                        "reason": refusal,
+                    },
+                )
+                raise ValueError(refusal)
             approval.status = "approved" if approved else "denied"
             self.ledger.append(
                 "APPROVAL_DECIDED",
@@ -974,12 +1059,30 @@ class PermitStore:
                 "error": type(exc).__name__,
             }
 
+    @staticmethod
+    def _caller_block_reason(permit: Permit, agent_id) -> str | None:
+        """Least-privilege caller gate, evaluated BEFORE (never instead
+        of) the 4-clause check. None = caller acceptable."""
+        if agent_id is None:
+            return "agent_id_required" if permit.require_agent_id else None
+        if agent_id != permit.agent_id:
+            return "agent_mismatch"
+        return None
+
+    def caller_block_reason(self, permit_id: str, agent_id) -> str | None:
+        permit = self.get(permit_id)
+        if permit is None:
+            return None  # check() fails closed on unknown_permit
+        return self._caller_block_reason(permit, agent_id)
+
     def eligible(
         self,
         permit_id: str,
         amount_cents: int,
         merchant_id: str,
         now: datetime | None = None,
+        *,
+        agent_id: str | None = None,
     ) -> CheckResult:
         """
         READ-ONLY authority evaluation: the same 4-clause logic as check()
@@ -995,6 +1098,9 @@ class PermitStore:
         permit = self.get(permit_id)
         if permit is None:
             return CheckResult(False, "unknown_permit")
+        caller = self._caller_block_reason(permit, agent_id)
+        if caller is not None:
+            return CheckResult(False, caller)
 
         chain = self.lineage(permit_id)
         with permit._lock:
@@ -1013,6 +1119,8 @@ class PermitStore:
         amount_cents: int,
         merchant_id: str,
         now: datetime | None = None,
+        *,
+        agent_id: str | None = None,
     ) -> CheckResult:
         """
         Evaluate a spend attempt: validate → eligible() → reserve + ALLOWED
@@ -1047,6 +1155,21 @@ class PermitStore:
                 {"permit_id": permit_id, "reason": "unknown_permit"},
             )
             return CheckResult(False, "unknown_permit", receipt)
+
+        caller = self._caller_block_reason(permit, agent_id)
+        if caller is not None:
+            receipt = self.ledger.append(
+                "BLOCKED",
+                {
+                    "permit_id": permit.permit_id,
+                    "agent_id": permit.agent_id,
+                    "caller_agent_id": agent_id,
+                    "amount_cents": amount_cents,
+                    "merchant_id": merchant_id,
+                    "reason": caller,
+                },
+            )
+            return CheckResult(False, caller, receipt)
 
         # Read-only authority evaluation first (no reservation, no receipt).
         # This is the shared logic the server's /check route also uses.

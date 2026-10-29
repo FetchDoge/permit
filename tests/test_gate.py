@@ -72,7 +72,7 @@ def test_gate_invalid_amount():
     flow, paypal, permits, permit = _pipeline()
     for bad in (-100, 0, "100", 10.5, True, None):
         attempt = flow.spend(
-            permit.permit_id, bad, "merchant_1", PredicateType.D, "hash")
+            permit.permit_id, bad, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
         _assert_gate_closed(flow, paypal, attempt, "invalid_amount")
 
 
@@ -87,7 +87,7 @@ def test_gate_revoked():
     flow, paypal, permits, permit = _pipeline()
     flow.estop(permit.permit_id)
     attempt = flow.spend(
-        permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     _assert_gate_closed(flow, paypal, attempt, "revoked")
 
 
@@ -95,7 +95,7 @@ def test_gate_expired():
     flow, paypal, permits, permit = _pipeline()
     _expire_under_lock(permits, permit.permit_id)
     attempt = flow.spend(
-        permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     _assert_gate_closed(flow, paypal, attempt, "expired")
 
 
@@ -112,21 +112,21 @@ def test_gate_tightened_expiry_passed():
     with target._lock:
         target.tighten_expiry = datetime.now(timezone.utc) - timedelta(seconds=1)
     attempt = flow.spend(
-        permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     _assert_gate_closed(flow, paypal, attempt, "tightened_expiry_passed")
 
 
 def test_gate_merchant_not_allowed():
     flow, paypal, permits, permit = _pipeline()
     attempt = flow.spend(
-        permit.permit_id, 1000, "evil_merchant", PredicateType.D, "hash")
+        permit.permit_id, 1000, "evil_merchant", PredicateType.D, "hash", agent_id=permit.agent_id)
     _assert_gate_closed(flow, paypal, attempt, "merchant_not_allowed")
 
 
 def test_gate_over_remaining_cap():
     flow, paypal, permits, permit = _pipeline()
     attempt = flow.spend(
-        permit.permit_id, 99999, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 99999, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     _assert_gate_closed(flow, paypal, attempt, "over_remaining_cap")
 
 
@@ -136,7 +136,7 @@ def test_gate_tightened_cap_exceeded():
     # 3000 is inside the granted 5000 cap but above the tightened 2000:
     # the min-gate, not the grant, decides.
     attempt = flow.spend(
-        permit.permit_id, 3000, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 3000, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     _assert_gate_closed(flow, paypal, attempt, "tightened_cap_exceeded")
 
 
@@ -154,7 +154,7 @@ def test_gate_ancestor_revoked():
     with permit._lock:
         permit.revoked = True
     attempt = flow.spend(
-        child.permit_id, 100, "merchant_1", PredicateType.D, "hash")
+        child.permit_id, 100, "merchant_1", PredicateType.D, "hash", agent_id=child.agent_id)
     _assert_gate_closed(flow, paypal, attempt, "ancestor_revoked")
 
 
@@ -169,7 +169,7 @@ def test_gate_ancestor_expired():
     ).permit
     _expire_under_lock(permits, permit.permit_id)
     attempt = flow.spend(
-        child.permit_id, 100, "merchant_1", PredicateType.D, "hash")
+        child.permit_id, 100, "merchant_1", PredicateType.D, "hash", agent_id=child.agent_id)
     _assert_gate_closed(flow, paypal, attempt, "ancestor_expired")
 
 
@@ -179,7 +179,7 @@ def test_gate_merchant_not_bound():
     flow, paypal, permits, permit = _pipeline(
         merchant_account_id="acct_bound_paypal")
     attempt = flow.spend(
-        permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     _assert_gate_closed(flow, paypal, attempt, "merchant_not_bound")
 
 
@@ -188,6 +188,7 @@ def test_gate_invalid_approval():
     attempt = flow.spend(
         permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash",
         approval_id="apr_bogus",
+        agent_id=permit.agent_id,
     )
     _assert_gate_closed(flow, paypal, attempt, "invalid_approval")
 
@@ -197,7 +198,7 @@ def test_gate_approval_pending_never_touches_paypal():
     # the principal's word must not reach PayPal before that word lands.
     flow, paypal, permits, permit = _pipeline(approval_threshold_cents=1000)
     attempt = flow.spend(
-        permit.permit_id, 1500, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 1500, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     assert not attempt.allowed
     assert attempt.reason == "pending_principal_approval"
     assert attempt.approval_id is not None
@@ -218,7 +219,7 @@ def test_gate_allowed_spend_touches_paypal_once():
     # the rail exactly once and carries an ALLOWED receipt.
     flow, paypal, permits, permit = _pipeline()
     attempt = flow.spend(
-        permit.permit_id, 3000, "merchant_1", PredicateType.D, "hash")
+        permit.permit_id, 3000, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     assert attempt.allowed
     assert len(paypal.authorize_calls) == 1
     assert attempt.receipts[0].event_type == "ALLOWED"

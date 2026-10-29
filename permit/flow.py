@@ -321,6 +321,8 @@ class SpendPipeline:
         predicate_type,
         artifact_hash: str,
         approval_id: str | None = None,
+        *,
+        agent_id: str | None = None,
     ) -> SpendAttempt:
         """
         One spend attempt. Returns ALLOWED + escrow_id on success, or
@@ -357,6 +359,24 @@ class SpendPipeline:
             )
             return SpendAttempt(False, "merchant_not_bound", None, (receipt,))
 
+        # (6a1) Least-privilege caller gate: before the approval gate, so
+        # a wrong caller cannot even open an approval request.
+        caller = self.permits.caller_block_reason(permit_id, agent_id)
+        if caller is not None:
+            receipt = self.ledger.append(
+                "BLOCKED",
+                {
+                    "permit_id": permit_id,
+                    "caller_agent_id": agent_id,
+                    "amount_cents": amount_cents
+                    if isinstance(amount_cents, int)
+                    else repr(amount_cents),
+                    "merchant_id": merchant_id,
+                    "reason": caller,
+                },
+            )
+            return SpendAttempt(False, caller, None, (receipt,))
+
         # (6a2) Principal-approval gate. Runs BEFORE check() so a pending
         # request never reserves cap. claim_approval() is atomic under
         # _store_lock (approved → claimed) so two concurrent spends cannot
@@ -389,12 +409,12 @@ class SpendPipeline:
                 threshold is not None
                 and isinstance(amount_cents, int)
                 and not isinstance(amount_cents, bool)
-                and amount_cents > threshold
+                and self.permits.approval_needed(permit_id, amount_cents)
             ):
                 # The 4-clause check must pass first: no approval request
                 # for a spend the authority would refuse anyway.
                 probe = self.permits.eligible(
-                    permit_id, amount_cents, merchant_id
+                    permit_id, amount_cents, merchant_id, agent_id=agent_id
                 )
                 if probe.allowed:
                     predicate_value = (
@@ -430,7 +450,9 @@ class SpendPipeline:
                 # else: fall through to check() for the authoritative BLOCKED.
 
         # (6b) check() as before (ALLOWED reserves cap).
-        check = self.permits.check(permit_id, amount_cents, merchant_id)
+        check = self.permits.check(
+            permit_id, amount_cents, merchant_id, agent_id=agent_id
+        )
         if not check.allowed:
             # BLOCKED: receipt written by check(). PayPal is never called.
             # Restore a claimed approval so the principal's word stands;
@@ -702,6 +724,8 @@ class SpendPipeline:
             PredicateType(approval.predicate_type),
             approval.artifact_hash,
             approval_id=approval_id,
+            # The approval was bound to the permit's agent at request time.
+            agent_id=approval.agent_id,
         )
 
     def delegate(

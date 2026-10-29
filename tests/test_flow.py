@@ -35,7 +35,7 @@ def _artifact():
 
 def test_blocked_spend_never_touches_paypal():
     flow, paypal, permits, permit = _pipeline()
-    attempt = flow.spend(permit.permit_id, 99999, "merchant_1", PredicateType.D, "hash")
+    attempt = flow.spend(permit.permit_id, 99999, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     assert not attempt.allowed
     assert attempt.reason == "over_remaining_cap"
     assert attempt.escrow_id is None
@@ -47,7 +47,7 @@ def test_blocked_spend_never_touches_paypal():
 
 def test_blocked_wrong_merchant_never_touches_paypal():
     flow, paypal, permits, permit = _pipeline()
-    attempt = flow.spend(permit.permit_id, 1000, "evil_merchant", PredicateType.D, "hash")
+    attempt = flow.spend(permit.permit_id, 1000, "evil_merchant", PredicateType.D, "hash", agent_id=permit.agent_id)
     assert not attempt.allowed
     assert attempt.reason == "merchant_not_allowed"
     assert len(paypal.authorizations) == 0
@@ -56,7 +56,7 @@ def test_blocked_wrong_merchant_never_touches_paypal():
 def test_allowed_spend_registers_escrow():
     flow, paypal, permits, permit = _pipeline()
     _, digest = _artifact()
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest)
+    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest, agent_id=permit.agent_id)
     assert attempt.allowed
     assert attempt.escrow_id is not None
     assert [r.event_type for r in attempt.receipts] == ["ALLOWED", "AUTHORIZED"]
@@ -68,7 +68,7 @@ def test_allowed_spend_registers_escrow():
 def test_happy_path_release_captures():
     flow, paypal, permits, permit = _pipeline()
     artifact, digest = _artifact()
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest)
+    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest, agent_id=permit.agent_id)
     result = flow.release(attempt.escrow_id, Evidence(delivered_bytes=artifact))
     assert result.released
     assert result.capture.status == "COMPLETED"
@@ -79,7 +79,7 @@ def test_happy_path_release_captures():
 def test_bad_evidence_refuses_and_never_captures():
     flow, paypal, permits, permit = _pipeline()
     _, digest = _artifact()
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest)
+    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest, agent_id=permit.agent_id)
     result = flow.release(attempt.escrow_id, Evidence(delivered_bytes=b"wrong bytes"))
     assert not result.released
     assert result.reason.startswith("predicate:")
@@ -91,7 +91,7 @@ def test_bad_evidence_refuses_and_never_captures():
 def test_estop_voids_in_flight_escrow():
     flow, paypal, permits, permit = _pipeline()
     _, digest = _artifact()
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest)
+    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest, agent_id=permit.agent_id)
     receipt, voided = flow.estop(permit.permit_id)
     assert receipt.event_type == "E-STOP"
     assert voided == [attempt.escrow_id]
@@ -107,7 +107,7 @@ def test_estop_voids_in_flight_escrow():
 def test_spend_after_estop_blocked():
     flow, paypal, permits, permit = _pipeline()
     flow.estop(permit.permit_id)
-    attempt = flow.spend(permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash")
+    attempt = flow.spend(permit.permit_id, 1000, "merchant_1", PredicateType.D, "hash", agent_id=permit.agent_id)
     assert not attempt.allowed
     assert attempt.reason == "revoked"
     assert len(paypal.authorizations) == 0
@@ -119,7 +119,7 @@ def test_register_escrow_resume_does_not_double_reserve():
     _, digest = _artifact()
     # Simulate: check() passed, PayPal hold taken, spend() raised before
     # registration. Resume registers the escrow directly.
-    check = permits.check(permit.permit_id, 3000, "merchant_1")
+    check = permits.check(permit.permit_id, 3000, "merchant_1", agent_id=permit.agent_id)
     auth_id = check.receipt.payload["auth_id"]
     pp_auth = paypal.authorize(3000, "merchant_1")
     escrow_id, receipt = flow.register_escrow(
@@ -158,7 +158,7 @@ def test_parent_estop_voids_in_flight_child_hold():
     flow, paypal, permits, parent = _pipeline()
     child = _child(flow, permits, parent)
     artifact, digest = _artifact()
-    attempt = flow.spend(child.permit_id, 200, "merchant_1", PredicateType.D, digest)
+    attempt = flow.spend(child.permit_id, 200, "merchant_1", PredicateType.D, digest, agent_id=child.agent_id)
     assert attempt.allowed
     receipt, voided = flow.estop(parent.permit_id)
     assert receipt.event_type == "E-STOP"
@@ -180,7 +180,7 @@ def test_release_refused_when_ancestor_revoked():
     flow, paypal, permits, parent = _pipeline()
     child = _child(flow, permits, parent)
     artifact, digest = _artifact()
-    attempt = flow.spend(child.permit_id, 200, "merchant_1", PredicateType.D, digest)
+    attempt = flow.spend(child.permit_id, 200, "merchant_1", PredicateType.D, digest, agent_id=child.agent_id)
     parent.revoked = True  # ancestor dead, child flag untouched
     result = flow.release(attempt.escrow_id, Evidence(delivered_bytes=artifact))
     assert not result.released
@@ -197,7 +197,8 @@ def test_release_refused_after_tightened_expiry():
     flow, paypal, permits, permit = _pipeline(hours=2)
     artifact, digest = _artifact()
     attempt = flow.spend(
-        permit.permit_id, 500, "merchant_1", PredicateType.D, digest
+        permit.permit_id, 500, "merchant_1", PredicateType.D, digest,
+        agent_id=permit.agent_id,
     )
     assert attempt.allowed
     permits.tighten(
@@ -218,7 +219,8 @@ def test_release_refused_after_ancestor_tightened_expiry():
     child = _child(flow, permits, parent)
     artifact, digest = _artifact()
     attempt = flow.spend(
-        child.permit_id, 200, "merchant_1", PredicateType.D, digest
+        child.permit_id, 200, "merchant_1", PredicateType.D, digest,
+        agent_id=child.agent_id,
     )
     assert attempt.allowed
     permits.tighten(
@@ -242,7 +244,7 @@ def test_estop_between_admission_and_capture_refuses_capture():
     admitted (here: during predicate evaluation) still stops the capture."""
     flow, paypal, permits, permit = _pipeline()
     artifact, digest = _artifact()
-    attempt = flow.spend(permit.permit_id, 500, "merchant_1", PredicateType.D, digest)
+    attempt = flow.spend(permit.permit_id, 500, "merchant_1", PredicateType.D, digest, agent_id=permit.agent_id)
     verifier = flow.verifier
     real_predicate = verifier._predicate_passes
 
@@ -269,7 +271,7 @@ def test_estop_during_capture_is_ordered_after_captured():
 
     flow, paypal, permits, permit = _pipeline()
     artifact, digest = _artifact()
-    attempt = flow.spend(permit.permit_id, 500, "merchant_1", PredicateType.D, digest)
+    attempt = flow.spend(permit.permit_id, 500, "merchant_1", PredicateType.D, digest, agent_id=permit.agent_id)
     in_capture, finish = threading.Event(), threading.Event()
     real_capture = paypal.capture
 
