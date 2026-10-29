@@ -5,7 +5,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent.react import build_system, llm_preflight, parse_action, run_agent
+from agent.react import (
+    _execute_tool,
+    build_system,
+    llm_preflight,
+    parse_action,
+    run_agent,
+)
 from agent.tools import SpendTools
 from permit.flow import SpendPipeline
 from permit.ledger import Ledger
@@ -327,3 +333,95 @@ def test_agent_merchant_binding_holds_at_loop_boundary(tmp_path):
     assert blocked, "no BLOCKED receipt for the out-of-allowlist merchant"
     ok, msg = tools.flow.ledger.verify_chain()
     assert ok, msg
+
+
+def test_agent_tighten_permit_narrows_cap_and_records_receipt():
+    """An agent can voluntarily narrow its own permit cap; writes a TIGHTEN
+    receipt and subsequent spends above the tightened cap are BLOCKED."""
+    tools, paypal, permits = _tools()
+    p_init = permits.get(tools.permit_id)
+    assert p_init.cap_cents == 5000
+
+    res = json.loads(tools.tighten_permit(cap_cents=2000))
+    assert res["ok"] is True
+    assert res["tightened"] is True
+    assert res["effective_cap_cents"] == 2000
+    assert res["remaining_cents"] == 2000
+
+    assert permits.get(tools.permit_id).remaining_cents() == 2000
+
+    tighten_receipts = [
+        r for r in tools.flow.ledger.receipts()
+        if r.event_type == "TIGHTEN"
+    ]
+    assert len(tighten_receipts) == 1
+    assert tighten_receipts[0].payload["actor"] == "agent:t"
+    assert tighten_receipts[0].payload["changes"]["cap_cents"] == {
+        "from": 5000,
+        "to": 2000,
+    }
+    ok, msg = tools.flow.ledger.verify_chain()
+    assert ok, msg
+
+    obs = json.loads(tools.attempt_spend(2500, "widget"))
+    assert obs["decision"] == "BLOCKED"
+    assert obs["reason"] == "tightened_cap_exceeded"
+    assert obs["paypal_called"] is False
+
+
+def test_agent_tighten_permit_rejects_widening_attempt():
+    """Tighten is strictly narrowing: attempting to increase cap or leave
+    all fields empty fails closed without mutating the permit."""
+    tools, paypal, permits = _tools()
+    res_empty = json.loads(tools.tighten_permit())
+    assert res_empty["ok"] is False
+    assert "tighten requires at least one of" in res_empty["error"]
+
+    res_widen = json.loads(tools.tighten_permit(cap_cents=10000))
+    assert res_widen["ok"] is False
+    assert permits.get(tools.permit_id).remaining_cents() == 5000
+
+
+def test_agent_tighten_permit_narrows_allowlist():
+    """Agent can voluntarily drop merchants from its allowlist."""
+    ledger = Ledger()
+    permits = PermitStore(ledger=ledger)
+    paypal = MockPayPalClient()
+    verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
+    flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
+    permit, _ = permits.grant(
+        agent_id="t", cap_cents=5000, allowlist=["m1", "m2"],
+        expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    tools = SpendTools(flow, permit.permit_id, "m2", {"widget": b"widget-bytes"})
+
+    res = json.loads(tools.tighten_permit(remove_merchants=["m2"]))
+    assert res["ok"] is True
+    assert res["effective_allowlist"] == ["m1"]
+
+    obs = json.loads(tools.attempt_spend(1000, "widget"))
+    assert obs["decision"] == "BLOCKED"
+    assert obs["reason"] == "merchant_not_allowed"
+
+
+
+def test_tighten_permit_listed_for_the_llm_agent():
+    """The ReAct system prompt is the agent's only tool-discovery
+    surface: tighten_permit must be listed there, or the live LLM
+    agent can never call the SpendTools method."""
+    assert "tighten_permit" in build_system(["widget"])
+
+
+def test_tighten_permit_dispatches_through_react_executor():
+    """The ReAct runner dispatches by getattr: a tighten_permit action
+    must execute through _execute_tool and bind immediately."""
+    tools, paypal, permits = _tools()
+    obs = json.loads(
+        _execute_tool(tools, "tighten_permit", {"cap_cents": 2000}))
+    assert obs["ok"] is True
+    assert obs["effective_cap_cents"] == 2000
+
+    obs = json.loads(tools.attempt_spend(2500, "widget"))
+    assert obs["decision"] == "BLOCKED"
+    assert obs["reason"] == "tightened_cap_exceeded"
+    assert paypal.authorizations == {}
