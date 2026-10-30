@@ -24,6 +24,17 @@ PayPalClient implementation.
   the page can stall visually while the order is already APPROVED server-side).
 - The permit service: `python3 server.py --sandbox --port 8741`.
 
+**Two ways to set the credentials (same result):**
+
+| Path | Names you set | What `server.py` sees |
+|---|---|---|
+| Direct | `PERMIT_PAYPAL_CLIENT_ID`, `PERMIT_PAYPAL_CLIENT_SECRET`, `PERMIT_PAYPAL_MERCHANT_ID` in the environment | those names |
+| `launch_sandbox.py` | `PAYPAL_SANDBOX_CLIENT_ID`, `PAYPAL_SANDBOX_SECRET` in a local `.env.sandbox` (gitignored, never committed) | the launcher copies them to `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET` |
+
+Note: `launch_sandbox.py` **overrides** `PERMIT_PAYPAL_MERCHANT_ID` with the hardcoded sandbox merchant `GVBH7M3B2KVPW`, and any `PERMIT_PAYPAL_CLIENT_ID` / `_SECRET` you set yourself is replaced by the `PAYPAL_SANDBOX_*` values (empty if neither `.env.sandbox` nor the shell sets them). Use the direct path to bind a different merchant.
+
+How the launcher fails (pinned by `tests/test_launch_sandbox.py`): if `.env.sandbox` is absent, the unguarded `open()` raises `FileNotFoundError` with a traceback. If the file exists but `PAYPAL_SANDBOX_CLIENT_ID` or `PAYPAL_SANDBOX_SECRET` ends up empty (from the file or the shell environment, which the launcher starts from), it prints `missing credentials` and exits 1 before starting the server.
+
 ## The approval flow (what the service does)
 
 1. `POST /api/permits` → grant a permit (cap, allowlist, expiry). Receipt GRANTED.
