@@ -35,6 +35,12 @@ Note: `launch_sandbox.py` **overrides** `PERMIT_PAYPAL_MERCHANT_ID` with the har
 
 How the launcher fails (pinned by `tests/test_launch_sandbox.py`): if `.env.sandbox` is absent, the unguarded `open()` raises `FileNotFoundError` with a traceback. If the file exists but `PAYPAL_SANDBOX_CLIENT_ID` or `PAYPAL_SANDBOX_SECRET` ends up empty (from the file or the shell environment, which the launcher starts from), it prints `missing credentials` and exits 1 before starting the server.
 
+## Rail smoke check
+
+Before the integrated beats, `python3 scripts/sandbox_smoke.py` proves the rail itself in one command: OAuth, a $1.00 CAD AUTHORIZE-intent order, an order state read, and, only if the order is already payer-approved, authorize plus an immediate void of the same hold. It never captures, so no money moves.
+
+Exit codes (pinned by `tests/test_sandbox_smoke.py`): exit 0 means the rail is live through at least order creation and order reads (an unapproved order passes at that point, with the approval URL printed); exit 1 means the rail is broken (OAuth, order creation, order read, authorize, or void failed, with the failing step named); exit 2 means `PERMIT_PAYPAL_CLIENT_ID` or `PERMIT_PAYPAL_CLIENT_SECRET` is not set, and no network is touched. Set `PERMIT_SMOKE_WAIT_S` above 0 to wait that many seconds for payer approval before reporting; on timeout the smoke still exits 0 with the approval URL.
+
 ## The approval flow (what the service does)
 
 1. `POST /api/permits` → grant a permit (cap, allowlist, expiry). Receipt GRANTED.
