@@ -104,7 +104,7 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 ## Evidence
 
-- **413 tests pass, 3 skipped (416 collected) with no sandbox credentials:** `python -m pytest -q` verified locally 2026-10-29 on main at `3280b92`. Two of the skips are the `sandbox_live` tier (`tests/test_agent_sandbox_live.py`): with sandbox credentials set they run the agent loop on the real PayPal sandbox wire - an over-cap attempt blocked before any wire call, and an allowed spend that creates a real order and stops at PayPal's own payer-approval refusal, reservation held (live-verified 2026-10-23 at 408 pass, 1 skipped, before the M4 submission-docs, demo-path and demo-video-script tests landed). CI runs the no-credential suite plus `python demo.py` on every push.
+- **425 tests pass, 3 skipped (428 collected) with no sandbox credentials:** `python -m pytest -q` verified locally 2026-11-03 on main at `20c74bf`. Two of the skips are the `sandbox_live` tier (`tests/test_agent_sandbox_live.py`): with sandbox credentials set they run the agent loop on the real PayPal sandbox wire - an over-cap attempt blocked before any wire call, and an allowed spend that creates a real order and stops at PayPal's own payer-approval refusal, reservation held (live-verified 2026-10-23 at 408 pass, 1 skipped, before the M4 submission-docs, demo-path and demo-video-script tests landed). CI runs the no-credential suite plus `python demo.py` on every push.
 - **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (16 receipts)` (run 2026-10-15 at `21d7d7c`).
 - **Mock rail vs sandbox, kept separate:**
   - `demos/demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_AGENT_CLI` or a recorded transcript — one ships as `demos/fixtures/demo_transcript.jsonl` for the offline replay path.
@@ -115,7 +115,7 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 The project builds in the open toward the Nov 12, 2026 hackathon deadline.
 - **Implemented and tested:** permit core, 4-clause authority gate, spend pipeline, release verifier with UNKNOWN → reconcile, PayPal sandbox client with merchant binding and idempotent capture, e-stop with in-flight handling, delegation with cascade revoke, principal approvals, the agent spender, and the six-beat mock demo.
-- **Remaining:** the integrated sandbox run, the video (by Nov 8), and the Devpost package (by Nov 10).
+- **Remaining:** the integrated sandbox run, the video (by Nov 6), and the Devpost package (submission-ready by Nov 9).
 
 ## Acknowledgments
 
