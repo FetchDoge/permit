@@ -80,3 +80,14 @@ def test_submission_docs_have_no_em_dashes():
     # Standing copy rule for user-facing text: no em dashes.
     for name in ("threat-model.md", "lifecycle.md", "demo-video-script.md"):
         assert "\u2014" not in _read(name), name
+
+
+def test_checklist_names_public_repo():
+    # The checklist lives in the published repo, so it must name that
+    # repo and must not claim publishing has not happened. A judge
+    # reading it on GitHub would otherwise be told the page they are
+    # reading does not exist.
+    text = _read("submission-checklist.md")
+    assert "https://github.com/FetchDoge/permit" in text
+    assert "git remote | None" not in text
+    assert "Publishing is not done here" not in text

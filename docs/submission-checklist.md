@@ -8,7 +8,7 @@ The live proof the judge must see, in one command, is: grant → allowed capture
 
 ## Functional demo
 
-**Status: ready.** A judge can run it from a fresh checkout, fully offline. Python 3.10 or newer. No pip install, no API key, no `.env`, no network. Measured on this tree (2026-10-14): `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` reaches `VERIFIED` (26 receipts) in about a second; the receipt chain is deterministic. The cascade is included. A live run (no `--replay`) instead drives the real LLM agent and requires `PERMIT_AGENT_CLI` to be set; there is no `--hold` flag.
+**Status: ready.** A judge can run it from a fresh checkout, fully offline. Python 3.10 or newer. No pip install, no API key, no `.env`, no network. Measured on this tree (2026-11-04, on main at `33a3694b`): `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` reaches `VERIFIED` (26 receipts) in about a second; the receipt chain is deterministic. The cascade is included. A live run (no `--replay`) instead drives the real LLM agent and requires `PERMIT_AGENT_CLI` to be set; there is no `--hold` flag.
 
 | What the judge does | Where it lives | What it shows |
 | --- | --- | --- |
@@ -47,13 +47,13 @@ The recording has to say the camera run is the mock. It must not say the six bea
 
 ## Public code repository
 
-**Status: the tree is the submission. Publishing is not done here.**
+**Status: published.** The public repo is https://github.com/FetchDoge/permit. That URL is the repo field for the Devpost form; the form itself is filled at submission time, and a local branch is not the published remote.
 
 | Artifact | Status |
 | --- | --- |
 | `LICENSE` (Apache-2.0) and `NOTICE` | In the repo. |
 | README cold-start | In the repo. One command, stdlib only, reaches the running dashboard. |
-| This checkout's git remote | None. The public GitHub URL is a Devpost field still to fill. Do not treat a local branch as the published remote. |
+| Public GitHub repo | https://github.com/FetchDoge/permit, public. Verified 2026-11-04: the LICENSE file reads back as Apache-2.0 and main is at `33a3694b`. |
 
 ## Project requirements, checked against the rules
 
