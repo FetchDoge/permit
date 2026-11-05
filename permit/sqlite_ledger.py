@@ -312,6 +312,11 @@ def fold_receipts(receipts: list[Receipt]) -> "PermitStore":
                 allowlist=tuple(pl["allowlist"]),
                 expiry=datetime.fromisoformat(pl["expiry"]),
                 approval_threshold_cents=pl.get("approval_threshold_cents"),
+                # Least-privilege fields. A GRANTED receipt written before
+                # these existed folds to the current (strict) defaults.
+                principal_id=pl.get("principal_id"),
+                approval_mode=pl.get("approval_mode", "cumulative"),
+                require_agent_id=bool(pl.get("require_agent_id", True)),
             )
             store._permits[p.permit_id] = p
         elif et == "ALLOWED":
@@ -329,6 +334,7 @@ def fold_receipts(receipts: list[Receipt]) -> "PermitStore":
                 expiry=datetime.fromisoformat(pl["expiry"]),
                 parent_id=parent.permit_id,
                 depth=pl.get("depth", parent.depth + 1),
+                require_agent_id=parent.require_agent_id,
             )
             parent.reserved_cents += pl["cap_cents"]
             store._permits[child.permit_id] = child

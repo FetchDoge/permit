@@ -100,7 +100,7 @@ def test_type_a_release_uses_configured_key(monkeypatch):
         allowlist=["merchant_1"],
         expiry=datetime.now(timezone.utc) + timedelta(hours=1),
     )
-    check = permits.check(permit.permit_id, 3000, "merchant_1")
+    check = permits.check(permit.permit_id, 3000, "merchant_1", agent_id=permit.agent_id)
     assert check.allowed
     pp_auth = paypal.authorize(3000, "merchant_1")
     artifact_hash = hashlib.sha256(b"work").hexdigest()

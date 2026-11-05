@@ -72,14 +72,14 @@ def demo_mock():
     print("== 2. ALLOWED spend $30, release with valid evidence ==")
     artifact = b"demo deliverable"
     digest = hashlib.sha256(artifact).hexdigest()
-    attempt = flow.spend(permit.permit_id, 3000, merchant, PredicateType.D, digest)
+    attempt = flow.spend(permit.permit_id, 3000, merchant, PredicateType.D, digest, agent_id=permit.agent_id)
     show(attempt.receipts)
     result = flow.release(attempt.escrow_id, Evidence(delivered_bytes=artifact))
     show((ledger.receipts()[-1],))
     print(f"   released={result.released} capture={result.capture.capture_id}")
 
     print("== 3. BLOCKED spend $30 (only $20 left of the $50 cap) ==")
-    attempt = flow.spend(permit.permit_id, 3000, merchant, PredicateType.D, digest)
+    attempt = flow.spend(permit.permit_id, 3000, merchant, PredicateType.D, digest, agent_id=permit.agent_id)
     show(attempt.receipts)
     print(f"   PayPal authorize calls after block: {len(paypal.authorizations)} (unchanged)")
 
@@ -98,7 +98,7 @@ def demo_mock():
     child = res.permit
     print(f"   parent {parent.permit_id} cap $50.00")
     print(f"   child  {child.permit_id} cap $15.00 (carved from parent remaining)")
-    attempt2 = flow.spend(child.permit_id, 1000, merchant, PredicateType.D, digest)
+    attempt2 = flow.spend(child.permit_id, 1000, merchant, PredicateType.D, digest, agent_id=child.agent_id)
     assert attempt2.allowed, "child spend should be allowed"
     receipt, voided = flow.revoke_cascade(parent.permit_id)
     show((receipt,) + tuple(r for r in ledger.receipts() if r.event_type == "REVOKED_CASCADE"))

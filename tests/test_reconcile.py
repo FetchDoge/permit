@@ -31,7 +31,7 @@ def _setup(amount_cents=3000):
         allowlist=["merchant_1"],
         expiry=datetime.now(timezone.utc) + timedelta(hours=1),
     )
-    check = permits.check(permit.permit_id, amount_cents, "merchant_1")
+    check = permits.check(permit.permit_id, amount_cents, "merchant_1", agent_id=permit.agent_id)
     assert check.allowed
     auth_id = check.receipt.payload["auth_id"]
     pp_auth = paypal.authorize(amount_cents, "merchant_1")

@@ -135,7 +135,7 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
 
             flow_c._track_outstanding = patched_track
             try:
-                flow_c.spend(permit_id, 3000, "merchant_1", PredicateType.D, digest)
+                flow_c.spend(permit_id, 3000, "merchant_1", PredicateType.D, digest, agent_id=flow_c.permits.get(permit_id).agent_id)
             except Exception as e:
                 q.put(("error", f"K1 child exception: {e}"))
                 return
@@ -153,7 +153,7 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
 
             paypal_c.authorize = patched_authorize
             try:
-                flow_c.spend(permit_id, 3000, "merchant_1", PredicateType.D, digest)
+                flow_c.spend(permit_id, 3000, "merchant_1", PredicateType.D, digest, agent_id=flow_c.permits.get(permit_id).agent_id)
             except Exception as e:
                 q.put(("error", f"K2 child exception: {e}"))
                 return
@@ -171,7 +171,7 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
 
             verifier_c.register = patched_register
             try:
-                flow_c.spend(permit_id, 3000, "merchant_1", PredicateType.D, digest)
+                flow_c.spend(permit_id, 3000, "merchant_1", PredicateType.D, digest, agent_id=flow_c.permits.get(permit_id).agent_id)
             except Exception as e:
                 q.put(("error", f"K3 child exception: {e}"))
                 return
@@ -181,7 +181,7 @@ def _run_kill_point(kill_point: str, durable_dir: Path, verbose: bool = False) -
             # Drive to UNKNOWN then sentinel
             paypal_c.inject_capture_timeout = "after_apply"
             paypal_c._persist()
-            attempt = flow_c.spend(permit_id, 3000, "merchant_1", PredicateType.D, digest)
+            attempt = flow_c.spend(permit_id, 3000, "merchant_1", PredicateType.D, digest, agent_id=flow_c.permits.get(permit_id).agent_id)
             escrow_id = attempt.escrow_id
             # Now trigger UNKNOWN via verify_and_capture
             try:

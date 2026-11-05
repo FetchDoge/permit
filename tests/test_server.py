@@ -68,12 +68,12 @@ def test_issue_check_spend_release(live_server):
                      "allowlist": ["m"], "expiry_hours": 1})
     pid = grant["permit_id"]
     _, check = call(base, "POST", f"/api/permits/{pid}/check",
-                    {"amount_cents": 1000, "merchant_id": "m"})
+                    {"agent_id": "a", "amount_cents": 1000, "merchant_id": "m"})
     assert check["allowed"]
     artifact = b"bytes"
     digest = hashlib.sha256(artifact).hexdigest()
     _, spend = call(base, "POST", f"/api/permits/{pid}/spend",
-                    {"amount_cents": 1000, "merchant_id": "m",
+                    {"agent_id": "a", "amount_cents": 1000, "merchant_id": "m",
                      "predicate": "delivery_hash", "artifact_hash": digest})
     assert spend["allowed"] and spend["escrow_id"]
     _, rel = call(base, "POST", f"/api/escrows/{spend['escrow_id']}/release",
@@ -89,7 +89,7 @@ def test_blocked_never_touches_paypal(live_server):
     pid = grant["permit_id"]
     before = dict(paypal.authorizations)
     _, blocked = call(base, "POST", f"/api/permits/{pid}/spend",
-                      {"amount_cents": 9999, "merchant_id": "m",
+                      {"agent_id": "a", "amount_cents": 9999, "merchant_id": "m",
                        "predicate": "delivery_hash", "artifact_hash": "x" * 64})
     assert not blocked["allowed"] and blocked["reason"] == "over_remaining_cap"
     assert blocked["escrow_id"] is None
@@ -103,7 +103,7 @@ def test_estop_voids_in_flight(live_server):
                      "allowlist": ["m"], "expiry_hours": 1})
     pid = grant["permit_id"]
     _, spend = call(base, "POST", f"/api/permits/{pid}/spend",
-                    {"amount_cents": 1000, "merchant_id": "m",
+                    {"agent_id": "a", "amount_cents": 1000, "merchant_id": "m",
                      "predicate": "delivery_hash", "artifact_hash": "y" * 64})
     escrow_id = spend["escrow_id"]
     _, estop = call(base, "POST", f"/api/permits/{pid}/estop", {})
@@ -112,7 +112,7 @@ def test_estop_voids_in_flight(live_server):
                       {"delivered_bytes_b64": base64.b64encode(b"nope").decode()})
     assert not refused["released"]
     _, check = call(base, "POST", f"/api/permits/{pid}/check",
-                    {"amount_cents": 100, "merchant_id": "m"})
+                    {"agent_id": "a", "amount_cents": 100, "merchant_id": "m"})
     assert not check["allowed"] and check["reason"] == "revoked"
     assert len(paypal.voids) == 1
 
@@ -151,7 +151,7 @@ def test_check_is_read_only(live_server):
     pid = grant["permit_id"]
     _, led_before = call(base, "GET", "/api/ledger")
     _, check = call(base, "POST", f"/api/permits/{pid}/check",
-                    {"amount_cents": 1000, "merchant_id": "m"})
+                    {"agent_id": "a", "amount_cents": 1000, "merchant_id": "m"})
     assert check["allowed"] and check["reason"] == "allowed"
     _, led_after = call(base, "GET", "/api/ledger")
     assert len(led_after["receipts"]) == len(led_before["receipts"]), \
@@ -169,10 +169,10 @@ def test_http_rejects_non_positive_amounts(live_server):
                      "allowlist": ["m"], "expiry_hours": 1})
     pid = grant["permit_id"]
     err = call_expect_error(base, "POST", f"/api/permits/{pid}/check",
-                            {"amount_cents": -1000, "merchant_id": "m"}, 400)
+                            {"agent_id": "a", "amount_cents": -1000, "merchant_id": "m"}, 400)
     assert "positive integer" in err["error"]
     err = call_expect_error(base, "POST", f"/api/permits/{pid}/spend",
-                            {"amount_cents": 0, "merchant_id": "m",
+                            {"agent_id": "a", "amount_cents": 0, "merchant_id": "m",
                              "predicate": "delivery_hash",
                              "artifact_hash": "x" * 64}, 400)
     assert "positive integer" in err["error"]
@@ -190,7 +190,7 @@ def test_reconcile_route_converges_unknown(live_server):
     artifact = b"goods"
     digest = hashlib.sha256(artifact).hexdigest()
     _, spend = call(base, "POST", f"/api/permits/{pid}/spend",
-                    {"amount_cents": 2500, "merchant_id": "m",
+                    {"agent_id": "a", "amount_cents": 2500, "merchant_id": "m",
                      "predicate": "delivery_hash", "artifact_hash": digest})
     escrow_id = spend["escrow_id"]
     paypal.inject_capture_timeout = "after_apply"  # response lost on the wire
@@ -215,7 +215,7 @@ def test_retry_cleanup_route_clears_stranded_void(live_server):
     pid = grant["permit_id"]
     digest = hashlib.sha256(b"goods").hexdigest()
     _, spend = call(base, "POST", f"/api/permits/{pid}/spend",
-                    {"amount_cents": 3000, "merchant_id": "m",
+                    {"agent_id": "a", "amount_cents": 3000, "merchant_id": "m",
                      "predicate": "delivery_hash", "artifact_hash": digest})
     escrow_id = spend["escrow_id"]
     paypal.inject_void_timeout = True
@@ -244,7 +244,7 @@ def test_delegate_and_parent_revoke_cascades(live_server):
     assert child["receipt"]["event"] == "DELEGATED"
     child_id = child["permit_id"]
     _, spend = call(base, "POST", f"/api/permits/{child_id}/spend",
-                    {"amount_cents": 1000, "merchant_id": "m",
+                    {"agent_id": "buying_agent", "amount_cents": 1000, "merchant_id": "m",
                      "predicate": "delivery_hash", "artifact_hash": "y" * 64})
     assert spend["allowed"]
     escrow_id = spend["escrow_id"]
@@ -343,7 +343,7 @@ def test_expired_pending_op_releases_reservation(approval_server):
                      "allowlist": ["m"], "expiry_hours": 1})
     pid = grant["permit_id"]
     _, spend = call(base, "POST", f"/api/permits/{pid}/spend",
-                    {"amount_cents": 3000, "merchant_id": "m",
+                    {"agent_id": "a", "amount_cents": 3000, "merchant_id": "m",
                      "predicate": "delivery_hash",
                      "artifact_hash": "ab" * 32})
     assert spend["status"] == "approval_required"
@@ -376,7 +376,7 @@ def test_sweep_reaps_without_resume_hit(approval_server):
                      "allowlist": ["m"], "expiry_hours": 1})
     pid = grant["permit_id"]
     _, spend = call(base, "POST", f"/api/permits/{pid}/spend",
-                    {"amount_cents": 2000, "merchant_id": "m",
+                    {"agent_id": "a", "amount_cents": 2000, "merchant_id": "m",
                      "predicate": "delivery_hash",
                      "artifact_hash": "cd" * 32})
     op_id = spend["operation_id"]
@@ -400,7 +400,7 @@ def test_advisory_calibration_visible_read_only_and_spend_unblocked(live_server)
     _, permit = call(base, "GET", f"/api/permits/{pid}")
     assert permit["calibration_tau"] == 0.70
     _, spend = call(base, "POST", f"/api/permits/{pid}/spend",
-                    {"amount_cents": 1000, "merchant_id": "m",
+                    {"agent_id": "a", "amount_cents": 1000, "merchant_id": "m",
                      "predicate": "delivery_hash", "artifact_hash": "x" * 64})
     assert spend["allowed"] and spend["reason"] == "allowed"
     _, led = call(base, "GET", "/api/ledger")
@@ -409,3 +409,78 @@ def test_advisory_calibration_visible_read_only_and_spend_unblocked(live_server)
     assert len(allowed) == 1
     cal = allowed[0]["payload"]["calibration"]
     assert cal["advisory"] is True and cal["S"] == 0.0 and cal["verdict"] == "BELOW"
+
+
+# -- least-privilege defaults over HTTP ------------------------------------
+
+def _lp_grant(base, **extra):
+    body = {"agent_id": "a", "cap_cents": 5000, "allowlist": ["m"],
+            "expiry_hours": 1}
+    body.update(extra)
+    return call(base, "POST", "/api/permits", body)
+
+
+def test_http_defaults_require_agent_id(live_server):
+    base, paypal = live_server
+    status, grant = _lp_grant(base)
+    assert status == 201
+    pid = grant["permit_id"]
+    _, state = call(base, "GET", f"/api/permits/{pid}")
+    assert state["require_agent_id"] is True
+    assert state["approval_mode"] == "cumulative"
+    assert state["principal_id"] is None
+    before = dict(paypal.authorizations)
+    status, check = call(base, "POST", f"/api/permits/{pid}/check",
+                         {"amount_cents": 100, "merchant_id": "m"})
+    assert status == 200
+    assert not check["allowed"] and check["reason"] == "agent_id_required"
+    status, spend = call(base, "POST", f"/api/permits/{pid}/spend",
+                         {"amount_cents": 100, "merchant_id": "m",
+                          "predicate": "delivery_hash", "artifact_hash": "x" * 64})
+    assert status == 200
+    assert not spend["allowed"] and spend["reason"] == "agent_id_required"
+    assert spend["receipts"][0]["event"] == "BLOCKED"
+    status, spend = call(base, "POST", f"/api/permits/{pid}/spend",
+                         {"agent_id": "b", "amount_cents": 100, "merchant_id": "m",
+                          "predicate": "delivery_hash", "artifact_hash": "x" * 64})
+    assert not spend["allowed"] and spend["reason"] == "agent_mismatch"
+    assert paypal.authorizations == before
+    _, state = call(base, "GET", f"/api/permits/{pid}")
+    assert state["reserved_cents"] == 0
+
+
+def test_http_agent_id_type_checked(live_server):
+    base, _ = live_server
+    _, grant = _lp_grant(base)
+    pid = grant["permit_id"]
+    for bad in ("", 7, ["a"]):
+        err = call_expect_error(base, "POST", f"/api/permits/{pid}/check",
+                                {"agent_id": bad, "amount_cents": 100,
+                                 "merchant_id": "m"}, 400)
+        assert "agent_id" in err["error"]
+
+
+def test_http_grant_opt_outs_and_validation(live_server):
+    base, _ = live_server
+    status, grant = _lp_grant(base, require_agent_id=False,
+                              approval_mode="per_spend")
+    assert status == 201
+    pid = grant["permit_id"]
+    _, state = call(base, "GET", f"/api/permits/{pid}")
+    assert state["require_agent_id"] is False
+    assert state["approval_mode"] == "per_spend"
+    _, check = call(base, "POST", f"/api/permits/{pid}/check",
+                    {"amount_cents": 100, "merchant_id": "m"})
+    assert check["allowed"]
+    err = call_expect_error(base, "POST", "/api/permits",
+                            {"agent_id": "a", "cap_cents": 5000,
+                             "allowlist": ["m"], "approval_mode": "sometimes"}, 400)
+    assert err["error"] == "invalid_approval_mode"
+    err = call_expect_error(base, "POST", "/api/permits",
+                            {"agent_id": "a", "cap_cents": 5000,
+                             "allowlist": ["m"], "require_agent_id": "no"}, 400)
+    assert "require_agent_id" in err["error"]
+    err = call_expect_error(base, "POST", "/api/permits",
+                            {"agent_id": "a", "cap_cents": 5000,
+                             "allowlist": ["m"], "principal_id": "a"}, 400)
+    assert err["error"] == "principal_is_agent"

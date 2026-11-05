@@ -50,7 +50,7 @@ def _build(cap_cents=5000):
 def test_revoked_before_spend_never_reaches_rail():
     flow, paypal, permits, verifier, permit = _build()
     flow.estop(permit.permit_id)
-    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, HASH)
+    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, HASH, agent_id=permit.agent_id)
     assert not attempt.allowed
     assert attempt.reason == "revoked"
     assert attempt.escrow_id is None
@@ -70,7 +70,7 @@ def test_estop_inside_authorize_wins_the_race():
         return auth
 
     paypal.authorize = hostile_authorize
-    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, HASH)
+    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, HASH, agent_id=permit.agent_id)
     assert not attempt.allowed
     assert attempt.reason == "revoked_during_auth"
     assert attempt.escrow_id is None
@@ -87,7 +87,7 @@ def test_estop_inside_authorize_wins_the_race():
 
 def test_estop_after_authorize_voids_inflight_and_refuses_release():
     flow, paypal, permits, verifier, permit = _build()
-    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, HASH)
+    attempt = flow.spend(permit.permit_id, 3000, MERCHANT, PredicateType.D, HASH, agent_id=permit.agent_id)
     assert attempt.allowed and attempt.escrow_id
 
     result = flow.estop(permit.permit_id)

@@ -77,7 +77,8 @@ def _run(ledger_factory=Ledger):
     )
     data = b"artifact"
     attempt = flow.spend(
-        permit.permit_id, 1_000, "m", PredicateType.D, hashlib.sha256(data).hexdigest()
+        permit.permit_id, 1_000, "m", PredicateType.D, hashlib.sha256(data).hexdigest(),
+        agent_id=permit.agent_id,
     )
     assert attempt.allowed
 

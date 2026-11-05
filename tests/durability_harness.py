@@ -53,7 +53,7 @@ def test_reload_preserves_ledger_chain(tmp_path: Path):
         agent_id="a1", cap_cents=5000, allowlist=["merchant_1"], expiry=datetime.now(timezone.utc) + timedelta(hours=1)
     )
     _, digest = _artifact()
-    flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest)
+    flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest, agent_id=permit.agent_id)
     ok, reason = ledger.verify_chain()
     assert ok, reason
     n = len(ledger)
@@ -105,7 +105,7 @@ def test_fresh_process_resume_via_reloaded_state(tmp_path: Path):
         agent_id="a1", cap_cents=5000, allowlist=["merchant_1"], expiry=datetime.now(timezone.utc) + timedelta(hours=1)
     )
     _, digest = _artifact()
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest)
+    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest, agent_id=permit.agent_id)
     escrow_id = attempt.escrow_id
     # Simulate restart: new objects, same dir (release writer lock first)
     from harness.durability_harness import _close_ledger
