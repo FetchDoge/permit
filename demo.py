@@ -23,6 +23,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import secrets
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 from permit.ledger import Ledger
@@ -117,10 +119,23 @@ def demo_mock():
     print(f"== ledger chain: {'VERIFIED' if ok else 'BROKEN: ' + reason} ({len(ledger)} receipts)")
 
 
+def _ensure_demo_retry_rate_key() -> None:
+    """Generate a random per-run MAC key + temp HW dir inside demo.py only."""
+    if not os.environ.get("PERMIT_RETRY_RATE_MAC_KEY") and not os.environ.get(
+        "PERMIT_RETRY_RATE_MAC_KEY_FILE"
+    ):
+        os.environ["PERMIT_RETRY_RATE_MAC_KEY"] = secrets.token_hex(32)
+    if not os.environ.get("PERMIT_RETRY_RATE_MAC_HW_FILE"):
+        hw_dir = tempfile.mkdtemp(prefix="permit-demo-hw-")
+        os.chmod(hw_dir, 0o700)
+        os.environ["PERMIT_RETRY_RATE_MAC_HW_FILE"] = hw_dir
+
+
 def main():
     ap = argparse.ArgumentParser(description="Permit end-to-end demo")
     ap.add_argument("--sandbox", action="store_true", help="use the real sandbox rail")
     args = ap.parse_args()
+    _ensure_demo_retry_rate_key()
     if args.sandbox:
         print("Sandbox mode needs PERMIT_PAYPAL_CLIENT_ID/SECRET and interactive")
         print("payer approval per order - run from a session with a browser tap.")

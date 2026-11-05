@@ -54,6 +54,17 @@ class Receipt:
         object.__setattr__(self, "hash", h)
 
 
+def _rate_tally_key(payload: dict) -> tuple[str, str] | None:
+    """(escrow_id, window_id) for a rate_limited tally payload, else None."""
+    if payload.get("reason") != "rate_limited":
+        return None
+    eid = payload.get("escrow_id")
+    wid = payload.get("window_id")
+    if isinstance(eid, str) and isinstance(wid, str):
+        return eid, wid
+    return None
+
+
 class Ledger:
     """Thread-safe append-only receipt log with chain verification."""
 
@@ -64,9 +75,15 @@ class Ledger:
         # ledger is append-only (entries are never removed), so the index
         # cannot go stale. Replaces the old O(n) scan per lookup.
         self._allowed_by_auth: dict[str, Receipt] = {}
+        # F7: at most one rate_limited tally per (escrow_id, window_id).
+        self._rate_tally_by_window: dict[tuple[str, str], Receipt] = {}
 
     def append(self, event_type: str, payload: dict) -> Receipt:
         with self._lock:
+            if event_type == "REFUSED":
+                key = _rate_tally_key(payload)
+                if key is not None and key in self._rate_tally_by_window:
+                    return self._rate_tally_by_window[key]
             prev_hash = self._receipts[-1].hash if self._receipts else GENESIS_HASH
             receipt = Receipt(
                 seq=len(self._receipts),
@@ -81,7 +98,18 @@ class Ledger:
                 auth_id = payload.get("auth_id")
                 if isinstance(auth_id, str):
                     self._allowed_by_auth[auth_id] = receipt
+            if event_type == "REFUSED":
+                key = _rate_tally_key(payload)
+                if key is not None:
+                    self._rate_tally_by_window[key] = receipt
             return receipt
+
+    def find_rate_limited_tally(
+        self, escrow_id: str, window_id: str
+    ) -> Receipt | None:
+        """Existing rate_limited tally for (escrow_id, window_id), if any."""
+        with self._lock:
+            return self._rate_tally_by_window.get((escrow_id, window_id))
 
     def allowed_receipt(self, auth_id: str) -> Receipt | None:
         """The ALLOWED receipt for an auth_id, if any. O(1)."""
