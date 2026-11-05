@@ -55,6 +55,14 @@ python demos/demo_estop.py             # offline: e-stop wins the race before, i
 
 The three LLM demos call the runner set by `PERMIT_AGENT_CLI` (the older name `PERMIT_GROK_CLI` is still read as a deprecated alias when `PERMIT_AGENT_CLI` is unset). There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demos/demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl` (gitignored — your own recordings stay local). A fresh clone ships one recorded transcript as a fixture, so the judge path runs with no recording of your own: `python3 demos/demo_six_beat.py --fast --replay demos/fixtures/demo_transcript.jsonl` (provenance: `demos/fixtures/README.md`).
 
+## How the AI is used
+
+The AI is the *spender*, not the authority. `agent/react.py` runs a small ReAct loop: each turn it calls the runner named by `PERMIT_AGENT_CLI` (deprecated alias `PERMIT_GROK_CLI`, read only when the new name is unset) as a subprocess, `python <runner> chat <history> --system <prompt> --temperature 0.3 --max-tokens 400`, and parses an action from the reply. Actions are tool calls in `agent/tools.py` (for example `attempt_spend`, `deliver`) that go through the same four-clause gate as any other caller. The model can ask; it cannot raise a cap, add a merchant, extend an expiry or undo a revoke.
+
+There is no default runner. If `PERMIT_AGENT_CLI` is unset, the LLM demos exit 1 with a `RuntimeError` that names the fix.
+
+**The judge path does not call an LLM.** `--replay demos/fixtures/demo_transcript.jsonl` replays recorded reasoning text verbatim and re-executes each recorded action against in-process tools on the mock rail, so the receipts are produced fresh, but the reasoning is a recording. Limit of that recording: it was made on 2026-10-04 against a sibling checkout (permit-converge), adopted on 2026-10-14 after a control replay on `d79be84`, and has not been re-recorded on this HEAD (see `demos/fixtures/README.md`). No PayPal call and no money movement happens on that path.
+
 ## How it fails
 
 Permit fails closed. When state is uncertain, money does not move.
