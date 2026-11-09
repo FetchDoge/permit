@@ -43,11 +43,14 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+logger = logging.getLogger(__name__)
 
 from permit.flow import ApprovalRequired, SpendPipeline
 from permit.ledger import Ledger
@@ -102,8 +105,13 @@ def _pending_expired(operation_id: str) -> bool:
 
 def sweep_expired_pending() -> int:
     """
-    Reap TTL-expired payer-approval operations: void the PayPal hold
-    best-effort, release the cap reservation, receipt the expiry.
+    Reap TTL-expired payer-approval operations: attempt to void/cancel the
+    provider order, release the cap reservation, receipt the expiry.
+
+    Payer-approval ops hold a local reservation before any PayPal auth
+    exists, so a void miss (unknown order/auth) is logged — not swallowed
+    silently — and the local reservation is still released. Leaving the
+    reservation forever after TTL would fail open on resource exhaustion.
     Returns the number of operations reaped.
     """
     cutoff = time.monotonic() - _PENDING_OPS_TTL_S
@@ -118,7 +126,14 @@ def sweep_expired_pending() -> int:
         try:
             paypal.void(appr.order_id)
         except Exception:
-            pass  # best-effort; the order expires provider-side anyway
+            logger.exception(
+                "void failed sweeping expired op %s (permit_id=%s order_id=%s); "
+                "releasing local reservation (no auth hold yet / order expires "
+                "provider-side)",
+                oid,
+                appr.permit_id,
+                appr.order_id,
+            )
         try:
             permits.settle_void(appr.permit_id, appr.auth_id)
         except (UnknownPermit, UnknownAuthId):
@@ -145,7 +160,8 @@ def _sweeper() -> None:
         try:
             sweep_expired_pending()
         except Exception:
-            pass
+            # Keep the daemon alive, but never swallow silently.
+            logger.exception("sweep_expired_pending crashed; will retry")
 
 
 def _authorized(handler: BaseHTTPRequestHandler) -> bool:
@@ -165,8 +181,6 @@ def _authorized(handler: BaseHTTPRequestHandler) -> bool:
 
 
 # ---------------------------------------------------------------- logging
-
-import logging
 
 
 class _JsonFormatter(logging.Formatter):

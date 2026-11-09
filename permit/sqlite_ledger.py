@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 
 from .ledger import GENESIS_HASH, Receipt, _canonical, _utcnow_iso
+
+logger = logging.getLogger(__name__)
 
 
 _DDL_TABLE = """
@@ -233,7 +236,12 @@ class SqliteLedger:
                 try:
                     self._conn.execute("ROLLBACK")
                 except Exception:
-                    pass
+                    # Cleanup must not swallow the original write failure:
+                    # log the rollback error, then re-raise the append cause.
+                    logger.exception(
+                        "ROLLBACK failed after ledger append error; "
+                        "re-raising original write failure"
+                    )
                 raise
             # Cache and index update only after commit.
             self._receipts.append(receipt)
