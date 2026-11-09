@@ -28,11 +28,20 @@ class SpendTools:
         permit_id: str,
         merchant_id: str,
         catalog: dict[str, bytes],
+        agent_id: str | None = None,
     ):
         self.flow = flow
         self.permit_id = permit_id
         self.merchant_id = merchant_id
         self.catalog = catalog
+        # Caller identity for the least-privilege gate. Bound by the
+        # trusted harness that builds the toolset, never by the LLM. If
+        # not given, it is the agent the permit was granted to (read once
+        # here, at construction).
+        if agent_id is None:
+            permit = flow.permits.get(permit_id)
+            agent_id = permit.agent_id if permit is not None else None
+        self.agent_id = agent_id
         self._escrow_purpose: dict[str, str] = {}
 
     # -- tools the LLM may call -------------------------------------------
@@ -44,6 +53,7 @@ class SpendTools:
         attempt = self.flow.spend(
             self.permit_id, amount_cents, self.merchant_id,
             PredicateType.D, artifact_hash,
+            agent_id=self.agent_id,
         )
         if not attempt.allowed:
             if attempt.reason == "pending_principal_approval":

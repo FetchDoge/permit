@@ -67,7 +67,8 @@ def test_repro_unconfirmed_void_retains_cap_and_identity():
     _void_returning(paypal, TimeoutError("offline unconfirmed void"))
 
     attempt = flow.spend(
-        permit.permit_id, 3000, "merchant_1", "delivery_hash", "hash"
+        permit.permit_id, 3000, "merchant_1", "delivery_hash", "hash",
+        agent_id=permit.agent_id,
     )
 
     assert observed["reserved"] == 3000
@@ -102,7 +103,7 @@ def test_non_voided_responses_retain_cap(result):
     _revoking_authorize(flow, paypal, permit, "repro_external_hold")
     _void_returning(paypal, result)
 
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash")
+    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash", agent_id=permit.agent_id)
 
     assert attempt.reason == "revoked_during_auth"
     assert permit.reserved_cents == 3000
@@ -121,7 +122,7 @@ def test_matching_voided_releases_cap_once():
         return SimpleNamespace(auth_id=auth_id, status="VOIDED")
 
     paypal.void = void
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash")
+    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash", agent_id=permit.agent_id)
     assert attempt.reason == "revoked_during_auth"
     assert permit.reserved_cents == 0
     assert permit.remaining_cents() == 5000
@@ -141,7 +142,7 @@ def test_retry_cleanup_same_identity_is_idempotent_after_success():
         return SimpleNamespace(auth_id=auth_id, status="VOIDED")
 
     paypal.void = void
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash")
+    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash", agent_id=permit.agent_id)
     auth_id = _auth_id_from(attempt)
     assert permit.reserved_cents == 3000
     assert flow.retry_cleanup(auth_id) is False
@@ -165,7 +166,7 @@ def test_resume_cleanup_pending_does_not_reauthorize():
     paypal.raise_on_authorize = NeedsPayerApproval("ord_1", "https://approve/1")
     flow, paypal, _permits, permit = _permit_layer(paypal=paypal)
     with pytest.raises(ApprovalRequired) as exc_info:
-        flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash")
+        flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash", agent_id=permit.agent_id)
     appr = exc_info.value
     order_calls = []
     mode = {"fail": True}
@@ -214,7 +215,7 @@ def test_resume_cleanup_pending_does_not_reauthorize():
 
 def test_register_escrow_rejection_tracks_identity_before_void():
     flow, paypal, permits, permit = _permit_layer()
-    check = permits.check(permit.permit_id, 3000, "merchant_1")
+    check = permits.check(permit.permit_id, 3000, "merchant_1", agent_id=permit.agent_id)
     auth_id = check.receipt.payload["auth_id"]
     seen = {}
 
@@ -260,7 +261,7 @@ def test_spend_does_not_drop_pending_entry_when_registration_rejects():
 
     flow.register_escrow = revoke_then_register
     with pytest.raises(RuntimeError, match="revoked/expired during registration"):
-        flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash")
+        flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash", agent_id=permit.agent_id)
     assert permit.reserved_cents == 3000
     assert len(flow._outstanding) == 1
     entry = next(iter(flow._outstanding.values()))
@@ -277,7 +278,7 @@ def _track(flow, permit, auth_id, provider_auth_id=None):
 
 def test_estop_unconfirmed_outstanding_is_unresolved():
     flow, paypal, permits, permit = _permit_layer()
-    check = permits.check(permit.permit_id, 3000, "merchant_1")
+    check = permits.check(permit.permit_id, 3000, "merchant_1", agent_id=permit.agent_id)
     auth_id = check.receipt.payload["auth_id"]
     _track(flow, permit, auth_id, "hold_unconfirmed")
 
@@ -298,7 +299,7 @@ def test_estop_unconfirmed_outstanding_is_unresolved():
 
 def test_estop_unknown_provider_id_is_unresolved():
     flow, paypal, permits, permit = _permit_layer()
-    check = permits.check(permit.permit_id, 3000, "merchant_1")
+    check = permits.check(permit.permit_id, 3000, "merchant_1", agent_id=permit.agent_id)
     auth_id = check.receipt.payload["auth_id"]
     _track(flow, permit, auth_id)
 
@@ -315,7 +316,7 @@ def test_estop_unknown_provider_id_is_unresolved():
 
 
 def _registered(flow, paypal, permit):
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash")
+    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PRED, "hash", agent_id=permit.agent_id)
     escrow_id = attempt.escrow_id
     flow.verifier.get_escrow = lambda eid: flow.verifier.escrows.get(eid)
     return attempt, escrow_id

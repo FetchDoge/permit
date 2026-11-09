@@ -206,15 +206,15 @@ def test_fold_equivalence_live_vs_replay():
 
     p1, _ = store.grant("agent1", 10000, ["m1", "m2"], exp)
     p2, _ = store.grant("agent2", 5000, ["m1"], exp)
-    c1 = store.check(p1.permit_id, 3000, "m1")  # ALLOWED, reserves
+    c1 = store.check(p1.permit_id, 3000, "m1", agent_id=p1.agent_id)  # ALLOWED, reserves
     assert c1.allowed
-    c2 = store.check(p1.permit_id, 2000, "m1")  # ALLOWED, reserves
+    c2 = store.check(p1.permit_id, 2000, "m1", agent_id=p1.agent_id)  # ALLOWED, reserves
     assert c2.allowed
-    store.check(p1.permit_id, 99999, "m1")  # BLOCKED, no state change
+    store.check(p1.permit_id, 99999, "m1", agent_id=p1.agent_id)  # BLOCKED, no state change
     d = store.delegate(p1.permit_id, "agent3", 1000, ["m1"], exp)
     assert d.ok
     child = d.permit
-    cc = store.check(child.permit_id, 400, "m1")  # child ALLOWED
+    cc = store.check(child.permit_id, 400, "m1", agent_id=child.agent_id)  # child ALLOWED
     assert cc.allowed
     store.tighten(p2.permit_id, cap_cents=4000, actor="test")
     # Settle one hold to captured, void the other.
@@ -264,7 +264,7 @@ def test_fold_durable_roundtrip(tmp_path):
     store = PermitStore(ledger=db)
     exp = datetime.now(timezone.utc) + timedelta(hours=1)
     p, _ = store.grant("a1", 8000, ["m"], exp)
-    c = store.check(p.permit_id, 1500, "m")
+    c = store.check(p.permit_id, 1500, "m", agent_id=p.agent_id)
     assert c.allowed
     live_reserved = p.reserved_cents
     db.close()

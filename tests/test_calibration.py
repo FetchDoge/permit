@@ -331,9 +331,9 @@ def test_tau_change_never_changes_authority_decision():
     """Raising tau to 1.0 (the max) leaves the 4-clause decision untouched."""
     store, p, _ = _store_and_permit()
     assert store.raise_calibration_tau(p.permit_id, 1.0).ok
-    r = store.check(p.permit_id, 500, "m1")
+    r = store.check(p.permit_id, 500, "m1", agent_id=p.agent_id)
     assert r.allowed and r.reason == "allowed"
-    r = store.check(p.permit_id, 500, "evil")
+    r = store.check(p.permit_id, 500, "evil", agent_id=p.agent_id)
     assert not r.allowed and r.reason == "merchant_not_allowed"
 
 
@@ -368,7 +368,7 @@ def _scenarios(store):
         return store.grant("agent-1", kw.pop("cap", 10_000), **kw)[0]
 
     def attempt(pid, amount, merchant):
-        r = store.check(pid, amount, merchant)
+        r = store.check(pid, amount, merchant, agent_id=getattr(store.get(pid), "agent_id", None))
         p = store.get(pid)
         out.append((r.allowed, r.reason,
                     None if p is None else (p.reserved_cents, p.remaining_cents()),
@@ -432,7 +432,7 @@ def test_zero_score_spend_gets_identical_authority_decision(monkeypatch):
 def test_zero_score_recorded_on_allowed_receipt_and_spend_still_allowed():
     store = PermitStore(ledger=Ledger())
     p, _ = store.grant("a", 10_000, ["m1"], datetime.now(timezone.utc) + timedelta(hours=24))
-    r = store.check(p.permit_id, 500, "m1")
+    r = store.check(p.permit_id, 500, "m1", agent_id=p.agent_id)
     assert r.allowed and r.reason == "allowed"
     cal = r.receipt.payload["calibration"]
     assert cal["advisory"] is True
@@ -444,7 +444,7 @@ def test_zero_score_recorded_on_allowed_receipt_and_spend_still_allowed():
 def test_tampered_chain_recorded_as_zero_score_without_new_block():
     store = _tampered_store()
     p, _ = store.grant("a", 10_000, ["m1"], datetime.now(timezone.utc) + timedelta(hours=24))
-    r = store.check(p.permit_id, 500, "m1")
+    r = store.check(p.permit_id, 500, "m1", agent_id=p.agent_id)
     assert r.allowed and r.reason == "allowed"
     cal = r.receipt.payload["calibration"]
     assert cal["S"] == 0.0 and cal["chain_ok"] is False
@@ -453,7 +453,7 @@ def test_tampered_chain_recorded_as_zero_score_without_new_block():
 def test_blocked_receipt_carries_advisory_score_and_original_reason():
     store = PermitStore(ledger=Ledger())
     p, _ = store.grant("a", 1_000, ["m1"], datetime.now(timezone.utc) + timedelta(hours=24))
-    r = store.check(p.permit_id, 5_000, "m1")
+    r = store.check(p.permit_id, 5_000, "m1", agent_id=p.agent_id)
     assert not r.allowed and r.reason == "over_remaining_cap"
     blocked = [x for x in store.ledger.receipts() if x.event_type == "BLOCKED"]
     assert blocked == [r.receipt]
@@ -467,7 +467,7 @@ def test_calibration_failure_never_blocks_a_spend(monkeypatch):
     monkeypatch.setattr(permit_module._calibration, "score", boom)
     store = PermitStore(ledger=Ledger())
     p, _ = store.grant("a", 10_000, ["m1"], datetime.now(timezone.utc) + timedelta(hours=24))
-    r = store.check(p.permit_id, 500, "m1")
+    r = store.check(p.permit_id, 500, "m1", agent_id=p.agent_id)
     assert r.allowed and r.reason == "allowed"
     assert r.receipt.payload["calibration"] == {
         "advisory": True, "status": "unavailable", "error": "RuntimeError",
@@ -480,7 +480,7 @@ def test_eligible_stays_read_only_with_calibration():
     store = PermitStore(ledger=Ledger())
     p, _ = store.grant("a", 10_000, ["m1"], datetime.now(timezone.utc) + timedelta(hours=24))
     before = len(store.ledger)
-    assert store.eligible(p.permit_id, 500, "m1").allowed
+    assert store.eligible(p.permit_id, 500, "m1", agent_id=p.agent_id).allowed
     assert len(store.ledger) == before
 
 
@@ -506,10 +506,10 @@ def test_score_counts_verified_captures_through_mock_pipeline():
     artifact = b"deliverable"
     digest = hashlib.sha256(artifact).hexdigest()
     for _ in range(N_MIN):
-        a = flow.spend(p.permit_id, 100, merchant, PredicateType.D, digest)
+        a = flow.spend(p.permit_id, 100, merchant, PredicateType.D, digest, agent_id=p.agent_id)
         assert a.allowed
         assert flow.release(a.escrow_id, Evidence(delivered_bytes=artifact)).released
-    r = store.check(p.permit_id, 100, merchant)
+    r = store.check(p.permit_id, 100, merchant, agent_id=p.agent_id)
     cal = r.receipt.payload["calibration"]
     assert cal["n_receipts"] == N_MIN and cal["chain_ok"] is True
     assert 0.9 < cal["S"] <= 1.0 and cal["verdict"] == MEETS

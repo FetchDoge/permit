@@ -83,7 +83,8 @@ def run_sla_escrow(paypal, ledger: Ledger | None = None) -> dict:
     # -- Beat 3: happy path — deliver, hold, accept, capture ---------------
     artifact_hash = hashlib.sha256(DELIVERABLE).hexdigest()
     attempt = pipeline.spend(
-        worker_permit.permit_id, 4000, MERCHANT, PredicateType.A, artifact_hash
+        worker_permit.permit_id, 4000, MERCHANT, PredicateType.A, artifact_hash,
+        agent_id=worker_permit.agent_id,
     )
     assert attempt.allowed, f"spend blocked: {attempt.reason}"
     escrow_id = attempt.escrow_id
@@ -107,7 +108,8 @@ def run_sla_escrow(paypal, ledger: Ledger | None = None) -> dict:
     worker2 = dlg2.permit
     artifact2 = hashlib.sha256(b"appendix draft").hexdigest()
     attempt2 = pipeline.spend(
-        worker2.permit_id, 3000, MERCHANT, PredicateType.A, artifact2
+        worker2.permit_id, 3000, MERCHANT, PredicateType.A, artifact2,
+        agent_id=worker2.agent_id,
     )
     assert attempt2.allowed, f"second spend blocked: {attempt2.reason}"
     forged = hashlib.sha256(b"worker says trust me").hexdigest()

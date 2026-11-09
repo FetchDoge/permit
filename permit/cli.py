@@ -53,7 +53,8 @@ def run_demo() -> None:
 
     permit = _grant(permits, 5_000, merchant)
     allowed = flow.spend(
-        permit.permit_id, 3_000, merchant, PredicateType.D, digest
+        permit.permit_id, 3_000, merchant, PredicateType.D, digest,
+        agent_id=permit.agent_id,
     )
     _require(allowed.allowed and allowed.escrow_id is not None, "spend was not allowed")
     released = flow.release(allowed.escrow_id, Evidence(delivered_bytes=artifact))
@@ -63,7 +64,8 @@ def run_demo() -> None:
 
     authorizations_before = len(provider.authorize_calls)
     blocked = flow.spend(
-        permit.permit_id, 3_000, merchant, PredicateType.D, digest
+        permit.permit_id, 3_000, merchant, PredicateType.D, digest,
+        agent_id=permit.agent_id,
     )
     _require(not blocked.allowed, "over-cap spend was unexpectedly allowed")
     _require(blocked.reason == "over_remaining_cap", "wrong cap-block reason")
@@ -75,7 +77,8 @@ def run_demo() -> None:
 
     stopped_permit = _grant(permits, 5_000, merchant)
     pending = flow.spend(
-        stopped_permit.permit_id, 1_000, merchant, PredicateType.D, digest
+        stopped_permit.permit_id, 1_000, merchant, PredicateType.D, digest,
+        agent_id=stopped_permit.agent_id,
     )
     _require(pending.allowed and pending.escrow_id is not None, "e-stop setup failed")
     stop = flow.estop(stopped_permit.permit_id)
@@ -100,7 +103,8 @@ def run_recovery_demo() -> None:
     permit = _grant(permits, 5_000, merchant)
 
     attempt = flow.spend(
-        permit.permit_id, 2_500, merchant, PredicateType.D, digest
+        permit.permit_id, 2_500, merchant, PredicateType.D, digest,
+        agent_id=permit.agent_id,
     )
     _require(attempt.allowed and attempt.escrow_id is not None, "spend was not allowed")
 

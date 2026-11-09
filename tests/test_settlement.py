@@ -27,7 +27,7 @@ def _setup(predicate=PredicateType.D, amount_cents=3000):
         allowlist=["merchant_1"],
         expiry=datetime.now(timezone.utc) + timedelta(hours=1),
     )
-    check = permits.check(permit.permit_id, amount_cents, "merchant_1")
+    check = permits.check(permit.permit_id, amount_cents, "merchant_1", agent_id=permit.agent_id)
     assert check.allowed
     auth_id = check.receipt.payload["auth_id"]
     pp_auth = paypal.authorize(amount_cents, "merchant_1")
@@ -414,7 +414,7 @@ def test_slow_capture_does_not_stall_other_escrow_ops():
 
     verifier, paypal, permits, escrow1, artifact = _setup(PredicateType.D)
     # Second escrow on the same permit.
-    check = permits.check(escrow1.permit_id, 1000, "merchant_1")
+    check = permits.check(escrow1.permit_id, 1000, "merchant_1", agent_id=permits.get(escrow1.permit_id).agent_id)
     assert check.allowed
     auth2 = check.receipt.payload["auth_id"]
     pp_auth2 = paypal.authorize(1000, "merchant_1")
